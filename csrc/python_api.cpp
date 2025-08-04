@@ -523,7 +523,7 @@ torch::Tensor transform_sf_into_required_layout_wrapper(
 // ----------------------------------------------------------------------------
 // This is the new binding interface, which uses the wrapper functions above
 // and fixes all integer type issues.
-TORCH_LIBRARY(deepgemm_ops, m) {
+TORCH_LIBRARY(deep_gemm_cpp, m) {
     // --- Runtime Functions ---
     m.def("set_num_sms(int new_num_sms) -> ()");
     m.impl("set_num_sms", [](int64_t new_num_sms) {
