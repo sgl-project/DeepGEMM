@@ -5,6 +5,7 @@
 #include <optional>
 #include <tuple>
 #include <numeric> // For std::accumulate
+#include <Python.h>
 
 // Assuming these are your project headers and they do not include pybind11
 #include "jit/compiler.hpp"
@@ -14,6 +15,12 @@
 #include "jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
 #include "jit_kernels/impls/sm100_fp8_gemm_1d2d.hpp"
 #include "jit_kernels/impls/smxx_layout.hpp"
+
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
 
 // ----------------------------------------------------------------------------
 // Section 1: Core C++ Logic (Your original code)
@@ -609,3 +616,5 @@ TORCH_LIBRARY(deep_gemm_cpp, m) {
         return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(a, ks_tensor, ks_vec);
     });
 }
+
+REGISTER_EXTENSION(deep_gemm_cpp)
