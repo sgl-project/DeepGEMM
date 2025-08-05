@@ -19,13 +19,11 @@ torch.ops.deep_gemm.init(
     torch.utils.cpp_extension.CUDA_HOME         # CUDA home
 )
 
-# Configs - 创建便捷的别名
 set_num_sms = torch.ops.deep_gemm.set_num_sms
 get_num_sms = torch.ops.deep_gemm.get_num_sms
 set_tc_util = torch.ops.deep_gemm.set_tc_util
 get_tc_util = torch.ops.deep_gemm.get_tc_util
 
-# Kernels - 创建便捷的别名
 fp8_gemm_nt = torch.ops.deep_gemm.fp8_gemm_nt
 fp8_gemm_nn = torch.ops.deep_gemm.fp8_gemm_nn
 fp8_gemm_tn = torch.ops.deep_gemm.fp8_gemm_tn
