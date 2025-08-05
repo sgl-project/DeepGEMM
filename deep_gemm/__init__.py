@@ -13,7 +13,7 @@ except ImportError:
     pass
 
 # Import functions from the CPP module
-import deep_gemm_cpp
+from deep_gemm import deep_gemm_cpp
 deep_gemm_cpp.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     torch.utils.cpp_extension.CUDA_HOME         # CUDA home
