@@ -1,11 +1,10 @@
-from deep_gemm_cpp import (
-    get_tma_aligned_size,
-    get_mk_alignment_for_contiguous_layout,
-    get_mn_major_tma_aligned_tensor,
-    get_mn_major_tma_aligned_packed_ue8m0_tensor,
-    get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor
-)
+import torch
 
-# Some alias
-get_m_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
-get_k_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
+get_tma_aligned_size = torch.ops.deep_gemm.get_tma_aligned_size
+get_mk_alignment_for_contiguous_layout = torch.ops.deep_gemm.get_mk_alignment_for_contiguous_layout
+get_mn_major_tma_aligned_tensor = torch.ops.deep_gemm.get_mn_major_tma_aligned_tensor
+get_mn_major_tma_aligned_packed_ue8m0_tensor = torch.ops.deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor
+get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor = torch.ops.deep_gemm.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor
+
+get_m_alignment_for_contiguous_layout = torch.ops.deep_gemm.get_mk_alignment_for_contiguous_layout
+get_k_alignment_for_contiguous_layout = torch.ops.deep_gemm.get_mk_alignment_for_contiguous_layout
