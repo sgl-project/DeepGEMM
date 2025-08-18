@@ -48,6 +48,20 @@ std::tuple<int, int, int> to_recipe_tuple_default(c10::IntArrayRef recipe_ref) {
     return std::make_tuple(static_cast<int>(recipe_ref[0]), static_cast<int>(recipe_ref[1]), static_cast<int>(recipe_ref[2]));
 }
 
+// Accept either Tensor or (Tensor, Tensor) tuple; return (tensor, scale)
+std::pair<at::Tensor, at::Tensor> parse_tensor_or_tuple(const c10::IValue& input) {
+    if (input.isTuple()) {
+        auto tuple = input.toTuple();
+        TORCH_CHECK(tuple->elements().size() >= 2, "Expected (Tensor, Tensor) tuple");
+        return {tuple->elements()[0].toTensor(), tuple->elements()[1].toTensor()};
+    } else if (input.isTensor()) {
+        auto tensor = input.toTensor();
+        auto scale = at::ones({1}, tensor.options().dtype(at::kFloat));
+        return {tensor, scale};
+    }
+    TORCH_CHECK(false, "Expected Tensor or (Tensor, Tensor) tuple");
+}
+
 } // anonymous namespace
 
 namespace deep_gemm_wrappers {
@@ -214,47 +228,51 @@ TORCH_LIBRARY(deep_gemm, m) {
     });
 
     // gemm APIs (explicit schema + impl)
-    m.def(R"(fp8_gemm_nt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("fp8_gemm_nt", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                            const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(fp8_gemm_nt(Any a, Any b, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("fp8_gemm_nt", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                             const torch::Tensor& d,
                                             const c10::optional<torch::Tensor>& c,
                                             const c10::optional<c10::IntArrayRef>& recipe,
                                             const std::string& compiled_dims,
                                             bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::fp8_gemm_nt_wrapper(a_val, a_scale, b_val, b_scale, d, c, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(fp8_gemm_nn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("fp8_gemm_nn", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                            const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(fp8_gemm_nn(Any a, Any b, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("fp8_gemm_nn", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                             const torch::Tensor& d,
                                             const c10::optional<torch::Tensor>& c,
                                             const c10::optional<c10::IntArrayRef>& recipe,
                                             const std::string& compiled_dims,
                                             bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::fp8_gemm_nn_wrapper(a_val, a_scale, b_val, b_scale, d, c, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(fp8_gemm_tn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="mn", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("fp8_gemm_tn", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                            const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(fp8_gemm_tn(Any a, Any b, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="mn", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("fp8_gemm_tn", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                             const torch::Tensor& d,
                                             const c10::optional<torch::Tensor>& c,
                                             const c10::optional<c10::IntArrayRef>& recipe,
                                             const std::string& compiled_dims,
                                             bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::fp8_gemm_tn_wrapper(a_val, a_scale, b_val, b_scale, d, c, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(fp8_gemm_tt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="mn", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("fp8_gemm_tt", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                            const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(fp8_gemm_tt(Any a, Any b, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims="mn", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("fp8_gemm_tt", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                             const torch::Tensor& d,
                                             const c10::optional<torch::Tensor>& c,
                                             const c10::optional<c10::IntArrayRef>& recipe,
                                             const std::string& compiled_dims,
                                             bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::fp8_gemm_tt_wrapper(a_val, a_scale, b_val, b_scale, d, c, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
