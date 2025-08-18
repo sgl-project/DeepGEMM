@@ -30,7 +30,8 @@ fp8_gemm_tn = torch.ops.deep_gemm.fp8_gemm_tn
 fp8_gemm_tt = torch.ops.deep_gemm.fp8_gemm_tt
 m_grouped_fp8_gemm_nt_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_contiguous
 m_grouped_fp8_gemm_nn_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nn_contiguous
-fp8_m_grouped_gemm_nt_masked = torch.ops.deep_gemm.fp8_m_grouped_gemm_nt_masked
+# Keep backward-compat alias to the registered op name
+fp8_m_grouped_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_masked
 k_grouped_fp8_gemm_tn_contiguous = torch.ops.deep_gemm.k_grouped_fp8_gemm_tn_contiguous
 
 # Layout kernels
@@ -53,7 +54,7 @@ def _verify_ops_loaded():
         'init', 'set_num_sms', 'get_num_sms', 'set_tc_util', 'get_tc_util',
         'fp8_gemm_nt', 'fp8_gemm_nn', 'fp8_gemm_tn', 'fp8_gemm_tt',
         'm_grouped_fp8_gemm_nt_contiguous', 'm_grouped_fp8_gemm_nn_contiguous',
-        'fp8_m_grouped_gemm_nt_masked', 'k_grouped_fp8_gemm_tn_contiguous',
+        'm_grouped_fp8_gemm_nt_masked', 'k_grouped_fp8_gemm_tn_contiguous',
         'transform_sf_into_required_layout', 'get_tma_aligned_size',
         'get_mk_alignment_for_contiguous_layout', 'get_mn_major_tma_aligned_tensor',
         'get_mn_major_tma_aligned_packed_ue8m0_tensor',
