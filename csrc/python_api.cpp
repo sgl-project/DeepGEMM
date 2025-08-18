@@ -5,6 +5,7 @@
 #include <optional>
 #include <tuple>
 #include <numeric>
+#include <Python.h>
 
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
@@ -17,6 +18,19 @@
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_gemm_cpp
 #endif
+
+
+#define _CONCAT(A, B) A##B
+#define CONCAT(A, B) _CONCAT(A, B)
+
+#define _STRINGIFY(A) #A
+#define STRINGIFY(A) _STRINGIFY(A)
+
+#define REGISTER_EXTENSION(NAME)                                                                      \
+  PyMODINIT_FUNC CONCAT(PyInit_, NAME)() {                                                            \
+    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, STRINGIFY(NAME), nullptr, 0, nullptr}; \
+    return PyModule_Create(&module);                                                                  \
+  }
 
 namespace {
 
@@ -61,13 +75,8 @@ void init_wrapper(const std::string& library_root_path, const std::string& cuda_
 }
 
 // Scalar layout utility wrappers (int64_t signatures for PyTorch registration)
-int64_t get_tma_aligned_size_wrapper(int64_t x, int64_t element_size) {
-    return static_cast<int64_t>(deep_gemm::get_tma_aligned_size(static_cast<int>(x), static_cast<int>(element_size)));
-}
-
-int64_t get_mk_alignment_for_contiguous_layout_wrapper() {
-    return static_cast<int64_t>(deep_gemm::get_mk_alignment_for_contiguous_layout());
-}
+int64_t get_tma_aligned_size_wrapper(int64_t x, int64_t element_size);
+int64_t get_mk_alignment_for_contiguous_layout_wrapper();
 
 // Layout wrappers
 torch::Tensor transform_sf_into_required_layout_wrapper(const torch::Tensor& sf, int64_t mn, int64_t k, c10::IntArrayRef recipe, const c10::optional<int64_t>& num_groups, bool is_sfa, bool disable_ue8m0_cast) {
@@ -179,3 +188,14 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
     m.def("m_grouped_bf16_gemm_nt_contiguous(Tensor a, Tensor b, Tensor d, Tensor m_indices, str compiled_dims=\"\") -> ()", deep_gemm_wrappers::m_grouped_bf16_gemm_nt_contiguous_wrapper);
     m.def("m_grouped_bf16_gemm_nt_masked(Tensor a, Tensor b, Tensor d, Tensor masked_m, int expected_m, str compiled_dims=\"\") -> ()", deep_gemm_wrappers::m_grouped_bf16_gemm_nt_masked_wrapper);
 }
+
+// Provide single definitions for the declared wrappers
+int64_t deep_gemm_wrappers::get_tma_aligned_size_wrapper(int64_t x, int64_t element_size) {
+    return static_cast<int64_t>(deep_gemm::get_tma_aligned_size(static_cast<int>(x), static_cast<int>(element_size)));
+}
+
+int64_t deep_gemm_wrappers::get_mk_alignment_for_contiguous_layout_wrapper() {
+    return static_cast<int64_t>(deep_gemm::get_mk_alignment_for_contiguous_layout());
+}
+
+REGISTER_EXTENSION(deep_gemm_cpp)
