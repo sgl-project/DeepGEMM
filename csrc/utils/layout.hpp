@@ -93,7 +93,7 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
 }
 
 // Value matrix layout
-static int get_mk_alignment_for_contiguous_layout() {
+static int64_t get_mk_alignment_for_contiguous_layout() {
     return 128;
 }
 
