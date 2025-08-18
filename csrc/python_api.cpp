@@ -156,7 +156,7 @@ void m_grouped_bf16_gemm_nt_masked_wrapper(const torch::Tensor& a, const torch::
 
 } // namespace deep_gemm_wrappers
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY(deep_gemm, m) {
     // runtime APIs (explicit schema + impl for stable type behavior)
     m.def("set_num_sms(int new_num_sms) -> ()");
     m.impl("set_num_sms", [](int64_t new_num_sms) {
