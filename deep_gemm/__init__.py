@@ -1,4 +1,5 @@
 import os
+import subprocess
 import torch
 import torch.utils.cpp_extension
 
@@ -12,11 +13,28 @@ try:
 except ImportError:
     pass
 
-# Import functions from the CPP module
-from deep_gemm import deep_gemm_cpp
+from . import deep_gemm_cpp  # noqa: F401
+
+
+def _find_cuda_home() -> str:
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    if cuda_home is None:
+        try:
+            with open(os.devnull, 'w') as devnull:
+                nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
+                cuda_home = os.path.dirname(os.path.dirname(nvcc))
+        except Exception:
+            cuda_home = '/usr/local/cuda'
+            if not os.path.exists(cuda_home):
+                cuda_home = None
+    assert cuda_home is not None
+    return cuda_home
+
+
+# Initialize C++ runtime once on import (safe for fork when avoiding torch CUDA_HOME)
 torch.ops.deep_gemm.init(
-    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
-    torch.utils.cpp_extension.CUDA_HOME         # CUDA home
+    os.path.dirname(os.path.abspath(__file__)),
+    _find_cuda_home(),
 )
 
 set_num_sms = torch.ops.deep_gemm.set_num_sms
@@ -30,7 +48,7 @@ fp8_gemm_tn = torch.ops.deep_gemm.fp8_gemm_tn
 fp8_gemm_tt = torch.ops.deep_gemm.fp8_gemm_tt
 m_grouped_fp8_gemm_nt_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_contiguous
 m_grouped_fp8_gemm_nn_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nn_contiguous
-# Keep backward-compat alias to the registered op name
+# Backward-compat alias
 fp8_m_grouped_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_masked
 k_grouped_fp8_gemm_tn_contiguous = torch.ops.deep_gemm.k_grouped_fp8_gemm_tn_contiguous
 
