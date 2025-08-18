@@ -40,24 +40,24 @@ namespace deep_gemm_wrappers {
 
 // Runtime wrappers
 void set_num_sms_wrapper(int64_t new_num_sms) {
-    device_runtime->set_num_sms(new_num_sms);
+    deep_gemm::device_runtime->set_num_sms(new_num_sms);
 }
 
 int64_t get_num_sms_wrapper() {
-    return device_runtime->get_num_sms();
+    return deep_gemm::device_runtime->get_num_sms();
 }
 
 void set_tc_util_wrapper(int64_t new_tc_util) {
-    device_runtime->set_tc_util(new_tc_util);
+    deep_gemm::device_runtime->set_tc_util(new_tc_util);
 }
 
 int64_t get_tc_util_wrapper() {
-    return device_runtime->get_tc_util();
+    return deep_gemm::device_runtime->get_tc_util();
 }
 
 void init_wrapper(const std::string& library_root_path, const std::string& cuda_home_path_by_python) {
-    Compiler::prepare_init(library_root_path, cuda_home_path_by_python);
-    KernelRuntime::prepare_init(cuda_home_path_by_python);
+    deep_gemm::Compiler::prepare_init(library_root_path, cuda_home_path_by_python);
+    deep_gemm::KernelRuntime::prepare_init(cuda_home_path_by_python);
 }
 
 // Layout wrappers
