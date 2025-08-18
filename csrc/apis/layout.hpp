@@ -69,17 +69,4 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     DG_HOST_UNREACHABLE("Unknown cases");
 }
 
-static void register_apis(pybind11::module_& m) {
-    m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
-      py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
-      py::arg("num_groups") = std::nullopt, py::arg("is_sfa") = false,
-      py::arg("disable_ue8m0_cast") = false);
-
-    m.def("get_tma_aligned_size", &get_tma_aligned_size);
-    m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
-    m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
-    m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", &get_mn_major_tma_aligned_packed_ue8m0_tensor);
-    m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor);
-}
-
 } // namespace deep_gemm::layout
