@@ -60,6 +60,15 @@ void init_wrapper(const std::string& library_root_path, const std::string& cuda_
     deep_gemm::KernelRuntime::prepare_init(cuda_home_path_by_python);
 }
 
+// Scalar layout utility wrappers (int64_t signatures for PyTorch registration)
+int64_t get_tma_aligned_size_wrapper(int64_t x, int64_t element_size) {
+    return static_cast<int64_t>(deep_gemm::get_tma_aligned_size(static_cast<int>(x), static_cast<int>(element_size)));
+}
+
+int64_t get_mk_alignment_for_contiguous_layout_wrapper() {
+    return static_cast<int64_t>(deep_gemm::get_mk_alignment_for_contiguous_layout());
+}
+
 // Layout wrappers
 torch::Tensor transform_sf_into_required_layout_wrapper(const torch::Tensor& sf, int64_t mn, int64_t k, c10::IntArrayRef recipe, const c10::optional<int64_t>& num_groups, bool is_sfa, bool disable_ue8m0_cast) {
     return deep_gemm::layout::transform_sf_into_required_layout(sf, mn, k, to_recipe_tuple_default(recipe), num_groups, is_sfa, disable_ue8m0_cast);
@@ -148,8 +157,8 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
 
     // layout APIs
     m.def("transform_sf_into_required_layout(Tensor sf, int mn, int k, int[] recipe, int? num_groups=None, bool is_sfa=False, bool disable_ue8m0_cast=False) -> Tensor", deep_gemm_wrappers::transform_sf_into_required_layout_wrapper);
-    m.def("get_tma_aligned_size", deep_gemm::get_tma_aligned_size);
-    m.def("get_mk_alignment_for_contiguous_layout", deep_gemm::get_mk_alignment_for_contiguous_layout);
+    m.def("get_tma_aligned_size", deep_gemm_wrappers::get_tma_aligned_size_wrapper);
+    m.def("get_mk_alignment_for_contiguous_layout", deep_gemm_wrappers::get_mk_alignment_for_contiguous_layout_wrapper);
     m.def("get_mn_major_tma_aligned_tensor", deep_gemm::get_mn_major_tma_aligned_tensor);
     m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", deep_gemm::get_mn_major_tma_aligned_packed_ue8m0_tensor);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", deep_gemm_wrappers::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor_wrapper);
