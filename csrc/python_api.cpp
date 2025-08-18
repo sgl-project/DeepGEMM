@@ -71,7 +71,7 @@ torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor_wrapper(con
     for (const auto& k_val : ks) {
         ks_vec.push_back(k_val);
     }
-    return deep_gemm::layout::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks_vec);
+    return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks_vec);
 }
 
 // GEMM wrappers
@@ -148,20 +148,20 @@ TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
 
     // layout APIs
     m.def("transform_sf_into_required_layout(Tensor sf, int mn, int k, int[] recipe, int? num_groups=None, bool is_sfa=False, bool disable_ue8m0_cast=False) -> Tensor", deep_gemm_wrappers::transform_sf_into_required_layout_wrapper);
-    m.def("get_tma_aligned_size", deep_gemm::layout::get_tma_aligned_size);
-    m.def("get_mk_alignment_for_contiguous_layout", deep_gemm::layout::get_mk_alignment_for_contiguous_layout);
-    m.def("get_mn_major_tma_aligned_tensor", deep_gemm::layout::get_mn_major_tma_aligned_tensor);
-    m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", deep_gemm::layout::get_mn_major_tma_aligned_packed_ue8m0_tensor);
+    m.def("get_tma_aligned_size", deep_gemm::get_tma_aligned_size);
+    m.def("get_mk_alignment_for_contiguous_layout", deep_gemm::get_mk_alignment_for_contiguous_layout);
+    m.def("get_mn_major_tma_aligned_tensor", deep_gemm::get_mn_major_tma_aligned_tensor);
+    m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", deep_gemm::get_mn_major_tma_aligned_packed_ue8m0_tensor);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", deep_gemm_wrappers::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor_wrapper);
 
     // gemm APIs
-    m.def("fp8_gemm_nt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_nt_wrapper);
-    m.def("fp8_gemm_nn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_nn_wrapper);
-    m.def("fp8_gemm_tn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_tn_wrapper);
-    m.def("fp8_gemm_tt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_tt_wrapper);
-    m.def("m_grouped_fp8_gemm_nt_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nt_contiguous_wrapper);
-    m.def("m_grouped_fp8_gemm_nn_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nn_contiguous_wrapper);
-    m.def("m_grouped_fp8_gemm_nt_masked(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor masked_m, int expected_m, int[]? recipe=None, str compiled_dims=\"nk\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nt_masked_wrapper);
+    m.def("fp8_gemm_nt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_nt_wrapper);
+    m.def("fp8_gemm_nn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_nn_wrapper);
+    m.def("fp8_gemm_tn(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_tn_wrapper);
+    m.def("fp8_gemm_tt(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor? c=None, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::fp8_gemm_tt_wrapper);
+    m.def("m_grouped_fp8_gemm_nt_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nt_contiguous_wrapper);
+    m.def("m_grouped_fp8_gemm_nn_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nn_contiguous_wrapper);
+    m.def("m_grouped_fp8_gemm_nt_masked(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor masked_m, int expected_m, int[]? recipe=None, str compiled_dims=\\\"nk\\\", bool disable_ue8m0_cast=False) -> ()", deep_gemm_wrappers::m_grouped_fp8_gemm_nt_masked_wrapper);
     m.def("k_grouped_fp8_gemm_tn_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c, int[] recipe, str compiled_dims) -> ()", deep_gemm_wrappers::k_grouped_fp8_gemm_tn_contiguous_wrapper);
     m.def("bf16_gemm_nt(Tensor a, Tensor b, Tensor d, Tensor? c=None, str compiled_dims=\"\") -> ()", deep_gemm_wrappers::bf16_gemm_nt_wrapper);
     m.def("bf16_gemm_nn(Tensor a, Tensor b, Tensor d, Tensor? c=None, str compiled_dims=\"\") -> ()", deep_gemm_wrappers::bf16_gemm_nn_wrapper);
