@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-from . import deep_gemm_cpp  # noqa: F401
+from . import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
 
 
 def _find_cuda_home() -> str:
@@ -31,44 +31,56 @@ def _find_cuda_home() -> str:
     return cuda_home
 
 
-# Initialize C++ runtime once on import (safe for fork when avoiding torch CUDA_HOME)
-torch.ops.deep_gemm.init(
-    os.path.dirname(os.path.abspath(__file__)),
-    _find_cuda_home(),
-)
+# Lazy runtime init to be fork-safe on Linux (avoid initializing CUDA before fork)
+_dg_initialized = False
 
-set_num_sms = torch.ops.deep_gemm.set_num_sms
-get_num_sms = torch.ops.deep_gemm.get_num_sms
-set_tc_util = torch.ops.deep_gemm.set_tc_util
-get_tc_util = torch.ops.deep_gemm.get_tc_util
+def _ensure_initialized() -> None:
+    global _dg_initialized
+    if _dg_initialized:
+        return
+    library_root = os.path.dirname(os.path.abspath(__file__))
+    torch.ops.deep_gemm.init(library_root, _find_cuda_home())
+    _dg_initialized = True
 
-fp8_gemm_nt = torch.ops.deep_gemm.fp8_gemm_nt
-fp8_gemm_nn = torch.ops.deep_gemm.fp8_gemm_nn
-fp8_gemm_tn = torch.ops.deep_gemm.fp8_gemm_tn
-fp8_gemm_tt = torch.ops.deep_gemm.fp8_gemm_tt
-m_grouped_fp8_gemm_nt_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_contiguous
-m_grouped_fp8_gemm_nn_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nn_contiguous
+
+def _wrap_op(name: str):
+    def _fn(*args, **kwargs):
+        _ensure_initialized()
+        return getattr(torch.ops.deep_gemm, name)(*args, **kwargs)
+    return _fn
+
+set_num_sms = _wrap_op('set_num_sms')
+get_num_sms = _wrap_op('get_num_sms')
+set_tc_util = _wrap_op('set_tc_util')
+get_tc_util = _wrap_op('get_tc_util')
+
+fp8_gemm_nt = _wrap_op('fp8_gemm_nt')
+fp8_gemm_nn = _wrap_op('fp8_gemm_nn')
+fp8_gemm_tn = _wrap_op('fp8_gemm_tn')
+fp8_gemm_tt = _wrap_op('fp8_gemm_tt')
+m_grouped_fp8_gemm_nt_contiguous = _wrap_op('m_grouped_fp8_gemm_nt_contiguous')
+m_grouped_fp8_gemm_nn_contiguous = _wrap_op('m_grouped_fp8_gemm_nn_contiguous')
 # Backward-compat alias
-fp8_m_grouped_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_masked
-k_grouped_fp8_gemm_tn_contiguous = torch.ops.deep_gemm.k_grouped_fp8_gemm_tn_contiguous
+fp8_m_grouped_gemm_nt_masked = _wrap_op('m_grouped_fp8_gemm_nt_masked')
+k_grouped_fp8_gemm_tn_contiguous = _wrap_op('k_grouped_fp8_gemm_tn_contiguous')
 
 # BF16 GEMMs
-bf16_gemm_nt = torch.ops.deep_gemm.bf16_gemm_nt
-bf16_gemm_nn = torch.ops.deep_gemm.bf16_gemm_nn
-bf16_gemm_tn = torch.ops.deep_gemm.bf16_gemm_tn
-bf16_gemm_tt = torch.ops.deep_gemm.bf16_gemm_tt
-m_grouped_bf16_gemm_nt_contiguous = torch.ops.deep_gemm.m_grouped_bf16_gemm_nt_contiguous
-m_grouped_bf16_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_bf16_gemm_nt_masked
+bf16_gemm_nt = _wrap_op('bf16_gemm_nt')
+bf16_gemm_nn = _wrap_op('bf16_gemm_nn')
+bf16_gemm_tn = _wrap_op('bf16_gemm_tn')
+bf16_gemm_tt = _wrap_op('bf16_gemm_tt')
+m_grouped_bf16_gemm_nt_contiguous = _wrap_op('m_grouped_bf16_gemm_nt_contiguous')
+m_grouped_bf16_gemm_nt_masked = _wrap_op('m_grouped_bf16_gemm_nt_masked')
 
 # Layout kernels
-transform_sf_into_required_layout = torch.ops.deep_gemm.transform_sf_into_required_layout
+transform_sf_into_required_layout = _wrap_op('transform_sf_into_required_layout')
 
 # Utility functions
-get_tma_aligned_size = torch.ops.deep_gemm.get_tma_aligned_size
-get_mk_alignment_for_contiguous_layout = torch.ops.deep_gemm.get_mk_alignment_for_contiguous_layout
-get_mn_major_tma_aligned_tensor = torch.ops.deep_gemm.get_mn_major_tma_aligned_tensor
-get_mn_major_tma_aligned_packed_ue8m0_tensor = torch.ops.deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor
-get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor = torch.ops.deep_gemm.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor
+get_tma_aligned_size = _wrap_op('get_tma_aligned_size')
+get_mk_alignment_for_contiguous_layout = _wrap_op('get_mk_alignment_for_contiguous_layout')
+get_mn_major_tma_aligned_tensor = _wrap_op('get_mn_major_tma_aligned_tensor')
+get_mn_major_tma_aligned_packed_ue8m0_tensor = _wrap_op('get_mn_major_tma_aligned_packed_ue8m0_tensor')
+get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor = _wrap_op('get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor')
 
 # Some utils
 from . import testing
