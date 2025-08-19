@@ -52,6 +52,14 @@ m_grouped_fp8_gemm_nn_contiguous = torch.ops.deep_gemm.m_grouped_fp8_gemm_nn_con
 fp8_m_grouped_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_masked
 k_grouped_fp8_gemm_tn_contiguous = torch.ops.deep_gemm.k_grouped_fp8_gemm_tn_contiguous
 
+# BF16 GEMMs
+bf16_gemm_nt = torch.ops.deep_gemm.bf16_gemm_nt
+bf16_gemm_nn = torch.ops.deep_gemm.bf16_gemm_nn
+bf16_gemm_tn = torch.ops.deep_gemm.bf16_gemm_tn
+bf16_gemm_tt = torch.ops.deep_gemm.bf16_gemm_tt
+m_grouped_bf16_gemm_nt_contiguous = torch.ops.deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+m_grouped_bf16_gemm_nt_masked = torch.ops.deep_gemm.m_grouped_bf16_gemm_nt_masked
+
 # Layout kernels
 transform_sf_into_required_layout = torch.ops.deep_gemm.transform_sf_into_required_layout
 
