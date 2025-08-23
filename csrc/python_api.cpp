@@ -276,49 +276,53 @@ TORCH_LIBRARY(deep_gemm, m) {
         deep_gemm_wrappers::fp8_gemm_tt_wrapper(a_val, a_scale, b_val, b_scale, d, c, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(m_grouped_fp8_gemm_nt_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("m_grouped_fp8_gemm_nt_contiguous", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                                                 const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(m_grouped_fp8_gemm_nt_contiguous(Any a, Any b, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("m_grouped_fp8_gemm_nt_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                                  const torch::Tensor& d,
                                                                  const torch::Tensor& m_indices,
                                                                  const c10::optional<c10::IntArrayRef>& recipe,
                                                                  const std::string& compiled_dims,
                                                                  bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::m_grouped_fp8_gemm_nt_contiguous_wrapper(a_val, a_scale, b_val, b_scale, d, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(m_grouped_fp8_gemm_nn_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("m_grouped_fp8_gemm_nn_contiguous", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                                                 const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(m_grouped_fp8_gemm_nn_contiguous(Any a, Any b, Tensor d, Tensor m_indices, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("m_grouped_fp8_gemm_nn_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                                  const torch::Tensor& d,
                                                                  const torch::Tensor& m_indices,
                                                                  const c10::optional<c10::IntArrayRef>& recipe,
                                                                  const std::string& compiled_dims,
                                                                  bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::m_grouped_fp8_gemm_nn_contiguous_wrapper(a_val, a_scale, b_val, b_scale, d, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(m_grouped_fp8_gemm_nt_masked(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, Tensor masked_m, int expected_m, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
-    m.impl("m_grouped_fp8_gemm_nt_masked", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                                             const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(m_grouped_fp8_gemm_nt_masked(Any a, Any b, Tensor d, Tensor masked_m, int expected_m, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("m_grouped_fp8_gemm_nt_masked", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                              const torch::Tensor& d,
                                                              const torch::Tensor& masked_m,
                                                              int64_t expected_m,
                                                              const c10::optional<c10::IntArrayRef>& recipe,
                                                              const std::string& compiled_dims,
                                                              bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         deep_gemm_wrappers::m_grouped_fp8_gemm_nt_masked_wrapper(a_val, a_scale, b_val, b_scale, d, masked_m, expected_m, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(k_grouped_fp8_gemm_tn_contiguous(Tensor a_val, Tensor a_scale, Tensor b_val, Tensor b_scale, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c, int[] recipe, str compiled_dims) -> ())");
-    m.impl("k_grouped_fp8_gemm_tn_contiguous", torch::kCUDA, [](const torch::Tensor& a_val, const torch::Tensor& a_scale,
-                                                                 const torch::Tensor& b_val, const torch::Tensor& b_scale,
+    m.def(R"(k_grouped_fp8_gemm_tn_contiguous(Any a, Any b, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c, int[] recipe, str compiled_dims) -> ())");
+    m.impl("k_grouped_fp8_gemm_tn_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                                  const torch::Tensor& d,
                                                                  at::IntArrayRef ks,
                                                                  const torch::Tensor& ks_tensor,
                                                                  const c10::optional<torch::Tensor>& c,
                                                                  c10::IntArrayRef recipe,
                                                                  const std::string& compiled_dims) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
         std::vector<int64_t> ks64(ks.begin(), ks.end());
         c10::List<int64_t> ks_list(ks64);
         deep_gemm_wrappers::k_grouped_fp8_gemm_tn_contiguous_wrapper(a_val, a_scale, b_val, b_scale, d, ks_list, ks_tensor, c, recipe, compiled_dims);
