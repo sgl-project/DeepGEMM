@@ -60,8 +60,9 @@ fp8_gemm_tn = _wrap_op('fp8_gemm_tn')
 fp8_gemm_tt = _wrap_op('fp8_gemm_tt')
 m_grouped_fp8_gemm_nt_contiguous = _wrap_op('m_grouped_fp8_gemm_nt_contiguous')
 m_grouped_fp8_gemm_nn_contiguous = _wrap_op('m_grouped_fp8_gemm_nn_contiguous')
-# Backward-compat alias
-fp8_m_grouped_gemm_nt_masked = _wrap_op('m_grouped_fp8_gemm_nt_masked')
+# Export both canonical name and backward-compat alias
+m_grouped_fp8_gemm_nt_masked = _wrap_op('m_grouped_fp8_gemm_nt_masked')
+fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 k_grouped_fp8_gemm_tn_contiguous = _wrap_op('k_grouped_fp8_gemm_tn_contiguous')
 
 # BF16 GEMMs
