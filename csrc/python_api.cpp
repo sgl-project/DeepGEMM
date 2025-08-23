@@ -313,7 +313,7 @@ TORCH_LIBRARY(deep_gemm, m) {
         deep_gemm_wrappers::m_grouped_fp8_gemm_nt_masked_wrapper(a_val, a_scale, b_val, b_scale, d, masked_m, expected_m, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
-    m.def(R"(k_grouped_fp8_gemm_tn_contiguous(Any a, Any b, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c, int[] recipe, str compiled_dims) -> ())");
+    m.def(R"(k_grouped_fp8_gemm_tn_contiguous(Any a, Any b, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c=None, int[] recipe=[1, 1, 128], str compiled_dims="mn") -> ())");
     m.impl("k_grouped_fp8_gemm_tn_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                                  const torch::Tensor& d,
                                                                  at::IntArrayRef ks,
