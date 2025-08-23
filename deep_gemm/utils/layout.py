@@ -1,4 +1,7 @@
 import torch
+from .. import _ensure_initialized
+
+_ensure_initialized()
 
 get_tma_aligned_size = torch.ops.deep_gemm.get_tma_aligned_size
 get_mk_alignment_for_contiguous_layout = torch.ops.deep_gemm.get_mk_alignment_for_contiguous_layout
