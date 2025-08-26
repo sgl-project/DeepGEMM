@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda.h>
-#include <torch/python.h>
 
 #include "../../utils/math.hpp"
 #include "../../utils/exception.hpp"

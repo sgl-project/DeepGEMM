@@ -1,6 +1,7 @@
 #pragma once
 
-#include <torch/python.h>
+// #include <torch/python.h>
+#include <cstdint>
 
 #include "exception.hpp"
 

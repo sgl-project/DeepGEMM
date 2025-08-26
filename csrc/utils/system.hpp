@@ -4,6 +4,7 @@
 #include <random>
 #include <string>
 #include <memory>
+#include <unistd.h>
 
 #include "exception.hpp"
 

@@ -1,7 +1,5 @@
 #pragma once
 
-#include <torch/python.h>
-
 #include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
