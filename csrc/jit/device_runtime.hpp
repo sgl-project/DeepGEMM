@@ -25,12 +25,9 @@ public:
         return {prop->major, prop->minor};
     }
 
-    std::string get_arch() {
+    int get_arch() {
         const auto& [major, minor] = get_arch_pair();
-        if (major == 10 && minor != 1) {
-            return "100f";
-        }
-        return std::to_string(major * 10 + minor) + "a";
+        return major * 10 + minor;
     }
 
     int get_arch_major() {
