@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda.h>
-#include <torch/python.h>
 
 #include "../../utils/math.hpp"
 #include "../heuristics/sm90.hpp"
@@ -75,10 +74,6 @@ static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const in
     }
 #endif
 
-    DG_HOST_ASSERT(base == 0);
-    switch (mode) {
-        case   0:
-        case  16: return CU_TENSOR_MAP_SWIZZLE_NONE;
         case  32: return CU_TENSOR_MAP_SWIZZLE_32B;
         case  64: return CU_TENSOR_MAP_SWIZZLE_64B;
         case 128: return CU_TENSOR_MAP_SWIZZLE_128B;

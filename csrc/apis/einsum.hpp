@@ -1,8 +1,5 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
-#include <torch/python.h>
-
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/layout.hpp"
@@ -104,12 +101,6 @@ static void einsum(const std::string& expr,
     } else {
         DG_HOST_UNREACHABLE(fmt::format("Unsupported einsum expression: {}", expr));
     }
-}
-
-static void register_apis(pybind11::module_& m) {
-    m.def("einsum", &einsum,
-          py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt);
 }
 
 } // namespace deep_gemm::einsum

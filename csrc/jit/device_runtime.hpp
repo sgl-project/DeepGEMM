@@ -17,6 +17,11 @@ class DeviceRuntime {
     cublasLtHandle_t cublaslt_handle{};
     std::shared_ptr<torch::Tensor> cublaslt_workspace;
 
+    // cuBLASLt utils
+    static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
+    cublasLtHandle_t cublaslt_handle{};
+    std::shared_ptr<torch::Tensor> cublaslt_workspace;
+
 public:
     explicit DeviceRuntime() {
         cublaslt_workspace = std::make_shared<torch::Tensor>(torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA)));
