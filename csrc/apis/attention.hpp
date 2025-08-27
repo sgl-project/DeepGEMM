@@ -78,11 +78,13 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const torch::Tensor& cu_seq_len_k_start,
                                     const torch::Tensor& cu_seq_len_k_end,
                                     const bool& clean_logits,
-                                    const int& max_seqlen_k) {
+                                    const int64_t& max_seqlen_k) {
     const auto& [seq_len, num_heads, head_dim] = get_shape<3>(q);
     const auto& [seq_len_kv, head_dim_] = get_shape<2>(kv.first);
     const auto& [seq_len_, num_heads_] = get_shape<2>(weights);
     const auto& [seq_len_kv_] = get_shape<1>(kv.second);
+
+    int max_seqlen_k_int = static_cast<int>(max_seqlen_k);
 
     DG_HOST_ASSERT(seq_len == seq_len_);
     DG_HOST_ASSERT(num_heads == num_heads_ and head_dim == head_dim_);
@@ -109,14 +111,14 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
     
     torch::Tensor logits;
     int stride_logits;
-    if (max_seqlen_k == 0) {
+    if (max_seqlen_k_int == 0) {
         stride_logits = align(seq_len_kv + block_kv, 4);
         logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(torch::kFloat));
         logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
     } else {
-        stride_logits = align(max_seqlen_k, block_kv);
+        stride_logits = align(max_seqlen_k_int, block_kv);
         logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(torch::kFloat));
-        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k)});
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k_int)});
         DG_HOST_ASSERT(not clean_logits);
     }
 
@@ -124,7 +126,7 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_mqa_logits(q, kv.first, kv.second, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                            seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, seq_len_alignment);
+                            seq_len, seq_len_kv, max_seqlen_k_int, stride_logits, num_heads, head_dim, seq_len_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -252,26 +254,5 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     return logits;
 }
 #endif 
-
-static void register_apis(pybind11::module_& m) {
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-    m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
-          py::arg("recipe") = std::nullopt,
-          py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
-    m.def("fp8_mqa_logits", &fp8_mqa_logits,
-          py::arg("q"), py::arg("kv"), py::arg("weights"),
-          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-          py::arg("clean_logits") = true,
-          py::arg("max_seqlen_k") = 0);
-    m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
-          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"));
-    m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
-          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
-          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-          py::arg("max_context_len"), py::arg("clean_logits") = false);
-#endif
-}
 
 } // namespace deep_gemm::attention
