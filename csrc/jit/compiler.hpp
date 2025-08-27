@@ -155,7 +155,7 @@ public:
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
-        auto selected_arch = device_runtime->get_arch();
+        std::string selected_arch = device_runtime->get_arch();
         // Compatibility: NVCC < 12.9 may not recognize sm_100f; fallback to sm_100a
         if (selected_arch == "100f" && (nvcc_major < 12 || (nvcc_major == 12 && nvcc_minor < 9)))
             selected_arch = "100a";
@@ -209,7 +209,7 @@ public:
         }
 
         // Override the compiler flags
-        auto selected_arch = device_runtime->get_arch();
+        std::string selected_arch = device_runtime->get_arch();
         // Compatibility: NVRTC < 12.9 may not recognize sm_100f; fallback to sm_100a
         if (selected_arch == "100f" && (major < 12 || (major == 12 && minor < 9)))
             selected_arch = "100a";
