@@ -44,9 +44,10 @@ def _ensure_initialized() -> None:
 
 
 def _wrap_op(name: str):
+    func = getattr(torch.ops.deep_gemm, name)
     def _fn(*args, **kwargs):
         _ensure_initialized()
-        return getattr(torch.ops.deep_gemm, name)(*args, **kwargs)
+        return func(*args, **kwargs)
     return _fn
 
 set_num_sms = _wrap_op('set_num_sms')
