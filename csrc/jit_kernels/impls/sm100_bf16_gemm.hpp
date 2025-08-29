@@ -116,7 +116,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
     };
     const auto& code = SM100BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_bf16_gemm", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100BF16GemmRuntime::launch(runtime, args));
 }
 
 static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,

@@ -12,9 +12,12 @@ namespace deep_gemm {
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
     std::shared_ptr<cudaDeviceProp> cached_prop;
+    int compile_mode = 0;
 
     // cuBLASLt utils
     static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
+    cublasLtHandle_t cublaslt_handle{};
+    std::shared_ptr<torch::Tensor> cublaslt_workspace;
 
 public:
 #if TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)
@@ -95,8 +98,6 @@ public:
 
     int get_l2_cache_size() {
         return get_prop()->l2CacheSize;
-<<<<<<< HEAD
-=======
     }
 
     void set_compile_mode(const int& new_compile_mode) {
@@ -106,7 +107,6 @@ public:
 
     int get_compile_mode() {
         return compile_mode;
->>>>>>> ccde9db (fix)
     }
 
     void set_tc_util(const int& new_tc_util) {
