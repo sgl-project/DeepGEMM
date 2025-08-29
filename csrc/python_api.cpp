@@ -214,6 +214,16 @@ TORCH_LIBRARY(deep_gemm, m) {
         return static_cast<int64_t>(deep_gemm::device_runtime->get_num_sms());
     });
 
+    m.def("set_compile_mode(int new_compile_mode) -> ()");
+    m.impl("set_compile_mode", [](int64_t new_compile_mode) {
+        deep_gemm::device_runtime->set_compile_mode(static_cast<int>(new_compile_mode));
+    });
+
+    m.def("get_compile_mode() -> int");
+    m.impl("get_compile_mode", []() -> int64_t {
+        return static_cast<int64_t>(deep_gemm::device_runtime->get_compile_mode());
+    });
+
     m.def("set_tc_util(int new_tc_util) -> ()");
     m.impl("set_tc_util", [](int64_t new_tc_util) {
         deep_gemm::device_runtime->set_tc_util(static_cast<int>(new_tc_util));

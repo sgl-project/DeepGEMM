@@ -67,13 +67,17 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
 }
 
 static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const int& base) {
-#if CUDA_VERSION >= 12080
     if (base != 0) {
+#if CUDA_VERSION >= 12080
         DG_HOST_ASSERT(base == 32 and mode == 128);
         return CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B;
-    }
 #endif
 
+    }
+
+    switch (mode) {
+        case   0:
+        case  16: return CU_TENSOR_MAP_SWIZZLE_NONE;
         case  32: return CU_TENSOR_MAP_SWIZZLE_32B;
         case  64: return CU_TENSOR_MAP_SWIZZLE_64B;
         case 128: return CU_TENSOR_MAP_SWIZZLE_128B;
@@ -214,5 +218,11 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
 }
+
+#define MAYBE_LAUNCH(EXPR) do {                     \
+    if (device_runtime->get_compile_mode() == 0) {  \
+        (EXPR);                                     \
+    }                                               \
+} while (0)
 
 } // namespace deep_gemm

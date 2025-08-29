@@ -44,13 +44,16 @@ def _ensure_initialized() -> None:
 
 
 def _wrap_op(name: str):
+    func = getattr(torch.ops.deep_gemm, name)
     def _fn(*args, **kwargs):
         _ensure_initialized()
-        return getattr(torch.ops.deep_gemm, name)(*args, **kwargs)
+        return func(*args, **kwargs)
     return _fn
 
 set_num_sms = _wrap_op('set_num_sms')
 get_num_sms = _wrap_op('get_num_sms')
+set_compile_mode = _wrap_op('set_compile_mode')
+get_compile_mode = _wrap_op('get_compile_mode')
 set_tc_util = _wrap_op('set_tc_util')
 get_tc_util = _wrap_op('get_tc_util')
 
@@ -121,10 +124,10 @@ def _verify_ops_loaded():
         'cublaslt_gemm_nt', 'cublaslt_gemm_nn',
         'cublaslt_gemm_tn', 'cublaslt_gemm_tt',
     ]
-    
+
     available_ops = list(torch.ops.deep_gemm.__dict__.keys())
     missing_ops = [op for op in expected_ops if op not in available_ops]
-    
+
     if missing_ops:
         print(f"Warning: Missing operations: {missing_ops}")
 
