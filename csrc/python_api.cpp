@@ -48,18 +48,22 @@ std::tuple<int, int, int> to_recipe_tuple_default(c10::IntArrayRef recipe_ref) {
     return std::make_tuple(static_cast<int>(recipe_ref[0]), static_cast<int>(recipe_ref[1]), static_cast<int>(recipe_ref[2]));
 }
 
-// Accept either Tensor or (Tensor, Tensor) tuple; return (tensor, scale)
+// Accept Tensor, (Tensor, Tensor) tuple, or [Tensor, Tensor] list; return (tensor, scale)
 std::pair<at::Tensor, at::Tensor> parse_tensor_or_tuple(const c10::IValue& input) {
     if (input.isTuple()) {
         auto tuple = input.toTuple();
         TORCH_CHECK(tuple->elements().size() >= 2, "Expected (Tensor, Tensor) tuple");
         return {tuple->elements()[0].toTensor(), tuple->elements()[1].toTensor()};
+    } else if (input.isList()) {
+        auto list = input.toList();
+        TORCH_CHECK(list.size() >= 2, "Expected [Tensor, Tensor] list");
+        return {list.get(0).toTensor(), list.get(1).toTensor()};
     } else if (input.isTensor()) {
         auto tensor = input.toTensor();
         auto scale = at::ones({1}, tensor.options().dtype(at::kFloat));
         return {tensor, scale};
     }
-    TORCH_CHECK(false, "Expected Tensor or (Tensor, Tensor) tuple");
+    TORCH_CHECK(false, "Expected Tensor, (Tensor, Tensor) tuple, or [Tensor, Tensor] list");
 }
 
 } // anonymous namespace
