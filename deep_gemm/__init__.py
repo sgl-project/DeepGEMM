@@ -52,6 +52,8 @@ def _wrap_op(name: str):
 
 set_num_sms = _wrap_op('set_num_sms')
 get_num_sms = _wrap_op('get_num_sms')
+set_compile_mode = _wrap_op('set_compile_mode')
+get_compile_mode = _wrap_op('get_compile_mode')
 set_tc_util = _wrap_op('set_tc_util')
 get_tc_util = _wrap_op('get_tc_util')
 
@@ -100,10 +102,10 @@ def _verify_ops_loaded():
         'get_mn_major_tma_aligned_packed_ue8m0_tensor',
         'get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor'
     ]
-    
+
     available_ops = list(torch.ops.deep_gemm.__dict__.keys())
     missing_ops = [op for op in expected_ops if op not in available_ops]
-    
+
     if missing_ops:
         print(f"Warning: Missing operations: {missing_ops}")
     else:
