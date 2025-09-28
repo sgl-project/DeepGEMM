@@ -108,8 +108,7 @@ def _verify_ops_loaded():
 
     if missing_ops:
         print(f"Warning: Missing operations: {missing_ops}")
-    else:
-        print("All deep_gemm operations loaded successfully!")
+
 
 _ensure_initialized()
 
