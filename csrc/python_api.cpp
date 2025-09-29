@@ -7,6 +7,8 @@
 #include <numeric>
 #include <Python.h>
 
+#include "apis/attention.hpp"
+#include "apis/einsum.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/runtime.hpp"
@@ -139,6 +141,15 @@ void m_grouped_fp8_gemm_nt_masked_wrapper(const torch::Tensor& a_val, const torc
     deep_gemm::gemm::m_grouped_fp8_gemm_nt_masked({a_val, a_scale}, {b_val, b_scale}, d, masked_m, expected_m, to_recipe_tuple(recipe), compiled_dims, disable_ue8m0_cast);
 }
 
+void k_grouped_fp8_gemm_nt_contiguous_wrapper(const torch::Tensor& a_val, const torch::Tensor& a_scale, const torch::Tensor& b_val, const torch::Tensor& b_scale, const torch::Tensor& d, c10::List<int64_t> ks, const torch::Tensor& ks_tensor, const c10::optional<torch::Tensor>& c, c10::IntArrayRef recipe, const std::string& compiled_dims) {
+    std::vector<int> ks_vec;
+    ks_vec.reserve(ks.size());
+    for(const auto i : ks) {
+        ks_vec.push_back(i);
+    }
+    deep_gemm::gemm::k_grouped_fp8_gemm_nt_contiguous({a_val, a_scale}, {b_val, b_scale}, d, ks_vec, ks_tensor, c, to_recipe_tuple_default(recipe), compiled_dims);
+}
+
 void k_grouped_fp8_gemm_tn_contiguous_wrapper(const torch::Tensor& a_val, const torch::Tensor& a_scale, const torch::Tensor& b_val, const torch::Tensor& b_scale, const torch::Tensor& d, c10::List<int64_t> ks, const torch::Tensor& ks_tensor, const c10::optional<torch::Tensor>& c, c10::IntArrayRef recipe, const std::string& compiled_dims) {
     std::vector<int> ks_vec;
     ks_vec.reserve(ks.size());
@@ -170,6 +181,23 @@ void m_grouped_bf16_gemm_nt_contiguous_wrapper(const torch::Tensor& a, const tor
 
 void m_grouped_bf16_gemm_nt_masked_wrapper(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d, const torch::Tensor& masked_m, int64_t expected_m, const std::string& compiled_dims) {
     deep_gemm::gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims);
+}
+
+// Attention wrappers
+void fp8_gemm_nt_skip_head_mid_wrapper(const torch::Tensor& a_val, const torch::Tensor& a_scale, const torch::Tensor& b_val, const torch::Tensor b_scale, const torch::Tensor& d, const c10::IntArrayRef& head_splits, const c10::optional<c10::IntArrayRef>& recipe, const std::string& compiled_dims, bool disable_ue8m0_cast) {
+    deep_gemm::attention::fp8_gemm_nt_skip_head_mid({a_val, a_scale}, {b_val, b_scale}, d, to_recipe_tuple_default(head_splits), to_recipe_tuple(recipe), compiled_dims, disable_ue8m0_cast);
+}
+
+torch::Tensor fp8_mqa_logits_wrapper(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& weight, const torch::Tensor& cu_seq_len_k_start, const torch::Tensor& cu_seq_len_k_end, bool clean_logits) {
+    return deep_gemm::attention::fp8_mqa_logits(q, {k, v}, weight, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits);
+}
+
+torch::Tensor get_paged_mqa_logits_metadata_wrapper(const torch::Tensor& context_lens, int64_t block_kv, int64_t num_sms) {
+    return deep_gemm::attention::get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms);
+}
+
+torch::Tensor fp8_paged_mqa_logits_wrapper(const torch::Tensor& q, const torch::Tensor& fused_kv_cache, const torch::Tensor& weight, const torch::Tensor& context_lens, const torch::Tensor& block_table, const torch::Tensor& schedule_meta, const int64_t max_context_len, bool clean_logits) {
+    return deep_gemm::attention::fp8_paged_mqa_logits(q, fused_kv_cache, weight, context_lens, block_table, schedule_meta, max_context_len, clean_logits); 
 }
 
 } // namespace deep_gemm_wrappers
@@ -327,6 +355,21 @@ TORCH_LIBRARY(deep_gemm, m) {
         deep_gemm_wrappers::m_grouped_fp8_gemm_nt_masked_wrapper(a_val, a_scale, b_val, b_scale, d, masked_m, expected_m, recipe, compiled_dims, disable_ue8m0_cast);
     });
 
+    m.def(R"(k_grouped_fp8_gemm_nt_contiguous(Any a, Any b, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c=None, int[] recipe=[1, 1, 128], str compiled_dims="mn") -> ())");
+    m.impl("k_grouped_fp8_gemm_nt_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
+                                                                 const torch::Tensor& d,
+                                                                 at::IntArrayRef ks,
+                                                                 const torch::Tensor& ks_tensor,
+                                                                 const c10::optional<torch::Tensor>& c,
+                                                                 c10::IntArrayRef recipe,
+                                                                 const std::string& compiled_dims) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
+        std::vector<int64_t> ks64(ks.begin(), ks.end());
+        c10::List<int64_t> ks_list(ks64);
+        deep_gemm_wrappers::k_grouped_fp8_gemm_nt_contiguous_wrapper(a_val, a_scale, b_val, b_scale, d, ks_list, ks_tensor, c, recipe, compiled_dims);
+    });
+
     m.def(R"(k_grouped_fp8_gemm_tn_contiguous(Any a, Any b, Tensor d, int[] ks, Tensor ks_tensor, Tensor? c=None, int[] recipe=[1, 1, 128], str compiled_dims="mn") -> ())");
     m.impl("k_grouped_fp8_gemm_tn_contiguous", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
                                                                  const torch::Tensor& d,
@@ -341,6 +384,10 @@ TORCH_LIBRARY(deep_gemm, m) {
         c10::List<int64_t> ks_list(ks64);
         deep_gemm_wrappers::k_grouped_fp8_gemm_tn_contiguous_wrapper(a_val, a_scale, b_val, b_scale, d, ks_list, ks_tensor, c, recipe, compiled_dims);
     });
+
+    /*
+     * BF16 GEMM
+     */
 
     m.def(R"(bf16_gemm_nt(Tensor a, Tensor b, Tensor d, Tensor? c=None, str compiled_dims="") -> ())");
     m.impl("bf16_gemm_nt", torch::kCUDA, [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
@@ -383,6 +430,94 @@ TORCH_LIBRARY(deep_gemm, m) {
                                                               const std::string& compiled_dims) {
         deep_gemm_wrappers::m_grouped_bf16_gemm_nt_masked_wrapper(a, b, d, masked_m, expected_m, compiled_dims);
     });
+
+    /*
+     * cublas gemm
+     */
+    // cuBLASLt GEMMs
+    m.def(R"(cublaslt_gemm_nt(Tensor a, Tensor b, Tensor d, Tensor? c) -> ())");
+    m.impl("cublaslt_gemm_nt", torch::kCUDA, [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                             const c10::optional<torch::Tensor>& c) {
+        deep_gemm::gemm::cublaslt_gemm_nt(a, b, d, c);
+    });
+
+    m.def(R"(cublaslt_gemm_nn(Tensor a, Tensor b, Tensor d, Tensor? c) -> ())");
+    m.impl("cublaslt_gemm_nn", torch::kCUDA, [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                             const c10::optional<torch::Tensor>& c) {
+        deep_gemm::gemm::cublaslt_gemm_nn(a, b, d, c);
+    });
+
+    m.def(R"(cublaslt_gemm_tn(Tensor a, Tensor b, Tensor d, Tensor? c) -> ())");
+    m.impl("cublaslt_gemm_tn", torch::kCUDA, [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                             const c10::optional<torch::Tensor>& c) {
+        deep_gemm::gemm::cublaslt_gemm_tn(a, b, d, c);
+    });
+
+    m.def(R"(cublaslt_gemm_tt(Tensor a, Tensor b, Tensor d, Tensor? c) -> ())");
+    m.impl("cublaslt_gemm_tt", torch::kCUDA, [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                                             const c10::optional<torch::Tensor>& c) {
+        deep_gemm::gemm::cublaslt_gemm_tt(a, b, d, c);
+    });
+
+    /*
+     * Attention
+     */
+    m.def(R"(fp8_gemm_nt_skip_head_mid(Any a, Any b, Tensor d, int[] head_splits, int[]? recipe=None, str compiled_dims="nk", bool disable_ue8m0_cast=False) -> ())");
+    m.impl("fp8_gemm_nt_skip_head_mid", torch::kCUDA, [](const c10::IValue& a_input, const c10::IValue& b_input,
+                                                        const torch::Tensor& d, 
+                                                        const c10::IntArrayRef& head_splits, 
+                                                        const c10::optional<c10::IntArrayRef>& recipe, 
+                                                        const std::string& compiled_dims, 
+                                                        bool disable_ue8m0_cast) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
+        deep_gemm_wrappers::fp8_gemm_nt_skip_head_mid_wrapper(a_val, a_scale, b_val, b_scale, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast);
+    });
+    
+    m.def(R"(fp8_mqa_logits(Tensor q, Any kv, Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits=True) -> Tensor)");
+    m.impl("fp8_mqa_logits", torch::kCUDA, [](
+        const torch::Tensor& q, 
+        const c10::IValue& kv, 
+        const torch::Tensor& weights, 
+        const torch::Tensor& cu_seq_len_k_start, 
+        const torch::Tensor& cu_seq_len_k_end, 
+        bool clean_logits
+    ) -> torch::Tensor {
+        auto [k, v] = parse_tensor_or_tuple(kv);
+        return deep_gemm_wrappers::fp8_mqa_logits_wrapper(q, k, v, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits);
+    });
+
+    m.def(R"(get_paged_mqa_logits_metadata(Tensor context_lens, int block_kv, int num_sms) -> Tensor)");
+    m.impl("get_paged_mqa_logits_metadata", torch::kCUDA, [](
+        const torch::Tensor& context_lens, 
+        int64_t block_kv, 
+        int64_t num_sms
+    ) -> torch::Tensor {
+        return deep_gemm_wrappers::get_paged_mqa_logits_metadata_wrapper(context_lens, block_kv, num_sms);
+    });
+
+    m.def(R"(fp8_paged_mqa_logits(Tensor q, Tensor fused_kv_cache, Tensor weights, Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits) -> Tensor)");
+    m.impl("fp8_paged_mqa_logits", torch::kCUDA, [](
+        const torch::Tensor& q, 
+        const torch::Tensor& fused_kv_cache, 
+        const torch::Tensor& weights, 
+        const torch::Tensor& context_lens, 
+        const torch::Tensor& block_table, 
+        const torch::Tensor& schedule_meta, 
+        int64_t max_context_len, 
+        bool clean_logits
+    ) -> torch::Tensor {
+        return deep_gemm_wrappers::fp8_paged_mqa_logits_wrapper(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits);
+    });
+
+    /*
+     * einsum
+     */
+    m.def(R"(einsum(str expr, Tensor a, Tensor b, Tensor d, Tensor? c=None) -> ())");
+    m.impl("einsum", torch::kCUDA, [](const std::string& expr, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d, const c10::optional<torch::Tensor>& c) {
+        deep_gemm::einsum::einsum(expr, a, b, d, c);
+    });
+
 }
 
 // Provide single definitions for the declared wrappers
