@@ -83,7 +83,7 @@ if __name__ == '__main__':
     # noinspection PyTypeChecker
     setuptools.setup(
         name='deep_gemm',
-        version='2.0.0' + revision,
+        version='2.1.0' + revision,
         packages=find_packages('.'),
         package_data={
             'deep_gemm': [
