@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
+from . import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
 
 
 def _find_cuda_home() -> str:
