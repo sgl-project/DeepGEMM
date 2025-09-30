@@ -1,8 +1,5 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
-#include <torch/python.h>
-
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/layout.hpp"
