@@ -8,6 +8,17 @@ from deep_gemm.testing import (
 )
 
 
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
+
+def nvjet_accessable():
+    cuda_version = get_cuda_version()
+    if cuda_version[0] > 12 or (cuda_version[0] == 12 and cuda_version[1] >= 6):
+        return True
+    return False
+
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
     for s in (129, 4096, 8192):
@@ -81,5 +92,6 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_bmk_bnk_mn()
-    test_bhr_hdr_bhd()
-    test_bhd_hdr_bhr()
+    if nvjet_accessable():
+        test_bhr_hdr_bhd()
+        test_bhd_hdr_bhr()
