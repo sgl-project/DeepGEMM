@@ -276,7 +276,7 @@ __device__ __forceinline__ void tensor_map_replace_global_inner_dim_stride_in_sm
 #if ((__CUDACC_VER_MAJOR__ > 12) or ((__CUDACC_VER_MAJOR__ == 12) and (__CUDACC_VER_MINOR__ >= 5)))
     asm volatile("tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], 0, %1;" :: "l"(smem_int_desc), "l"(new_stride));
 #else
-    DG_STATIC_ASSERT(false, "Invalid CUDA version")
+    DG_DEVICE_ASSERT(false and "Invalid CUDA version");
 #endif
 }
 
