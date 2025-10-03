@@ -71,11 +71,8 @@ static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const in
 #if CUDA_VERSION >= 12080
         DG_HOST_ASSERT(base == 32 and mode == 128);
         return CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B;
-#else
-        // Fall back to standard 128B swizzle on CUDA versions < 12.8
-        DG_HOST_ASSERT(mode == 128 && "Fallback: using CU_TENSOR_MAP_SWIZZLE_128B");
-        return CU_TENSOR_MAP_SWIZZLE_128B;
 #endif
+        
     }
 
     switch (mode) {
