@@ -83,3 +83,5 @@ deep_gemm_cpp.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     _find_cuda_home()                           # CUDA home
 )
+
+__version__ = '2.1.1'
