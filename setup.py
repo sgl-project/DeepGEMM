@@ -185,7 +185,7 @@ class CachedWheelsCommand(_bdist_wheel):
 if __name__ == '__main__':
     # noinspection PyTypeChecker
     setuptools.setup(
-        name='deepgemm',
+        name='ds_deep_gemm',
         version=get_package_version(),
         packages=find_packages('.'),
         package_data={
