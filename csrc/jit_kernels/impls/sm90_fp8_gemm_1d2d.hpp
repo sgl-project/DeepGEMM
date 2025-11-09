@@ -22,7 +22,7 @@ public:
         GemmConfig gemm_config;
         LaunchArgs launch_args;
 
-        void *sfb, *grouped_layout;
+        void *sfb, *grouped_layout, *signal;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
@@ -44,7 +44,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}, {}, {}
+        {}, {}, {},
+        {}
     >);
 }};
 )",
@@ -57,13 +58,14 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type),
-        get_default_epilogue_type(args.epilogue_type));
+        get_default_epilogue_type(args.epilogue_type),
+        args.gemm_config.enable_overlap);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.sfb, args.grouped_layout,
+            args.sfb, args.grouped_layout, args.signal,
             args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
@@ -121,6 +123,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                   config.multicast_config.num_multicast),
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,
+        .signal = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -181,6 +184,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                   config.multicast_config.num_multicast),
         .sfb = sfb.data_ptr(),
         .grouped_layout = m_indices.data_ptr(),
+        .signal = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -198,7 +202,10 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const int& expected_m,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                const std::string& compiled_dims) {
+                                                const std::string& compiled_dims,
+                                                const int& max_block_n,
+                                                const bool& enable_overlap,
+                                                const c10::optional<torch::Tensor>& signal) {
     const auto& aligned_k = align(k, 128);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
@@ -207,7 +214,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         GemmType::MGroupedMasked, KernelType::Kernel1D2D,
         expected_m, n, k, num_groups, major_a, major_b,
         torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        device_runtime->get_num_sms());
+        device_runtime->get_num_sms(), max_block_n, enable_overlap);
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.smem_config.swizzle_a_mode == config.block_k);
@@ -242,6 +249,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                   config.multicast_config.num_multicast),
         .sfb = sfb.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
+        .signal = enable_overlap ? signal.value().data_ptr() : nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -250,6 +258,9 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_m_grouped_gemm_masked_1d2d", code);
     MAYBE_LAUNCH(SM90FP8Gemm1D2DRuntime::launch(runtime, args));
+    return enable_overlap ? 
+        std::optional(std::make_pair(config.block_m, config.signal_threshold)) : 
+        std::nullopt;
 }
 
 } // namespace deep_gemm
