@@ -12,7 +12,7 @@ namespace deep_gemm {
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
 
-    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype) {
+    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype, const int& max_block_n) {
         // 16 is for better SM usage
         // Stride 32 is due to low-performance swizzle-16/32B
         std::vector<int> candidates = {16};
