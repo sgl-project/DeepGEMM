@@ -93,7 +93,7 @@ if __name__ == '__main__':
             ]
         },
         ext_modules=[
-            CUDAExtension(name='deep_gemm_cpp',
+            CUDAExtension(name='deep_gemm.deep_gemm_cpp',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
