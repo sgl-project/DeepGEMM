@@ -11,11 +11,11 @@ namespace deep_gemm {
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
 
-    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype) {
+    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype, const int& max_block_n) {
         // Avoid bank conflicts for FP32 output
         const auto& start = cd_dtype == torch::kFloat ? 8 : 16;
         std::vector<int> candidates;
-        for (int i = start; i <= 256; i += 16)
+        for (int i = start; i <= max_block_n; i += 16)
             candidates.push_back(i);
         return candidates;
     }
