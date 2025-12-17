@@ -64,6 +64,7 @@ struct GemmConfig {
     cute::UMMA::Major major_b;
     bool with_accumulation;
     int block_m, block_n, block_k;
+    int signal_threshold;
     int num_stages, num_last_stages;
 
     // Templated device configs
@@ -74,6 +75,8 @@ struct GemmConfig {
     MulticastConfig multicast_config;
     SharedMemoryConfig smem_config;
     ThreadConfig thread_config;
+
+    bool enable_overlap;
 };
 
 static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
@@ -152,7 +155,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
+                                  const bool& with_accumulation, const int& num_sms,
+                                  const int& max_block_n = 256, const bool& enable_overlap = false) {
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
@@ -162,7 +166,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
     if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
         block_ms = std::vector{64, 128};
-    const auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+    const auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype, max_block_n);
 
     // K block size is selected in a fixed manner
     const auto& block_k = 128 / static_cast<int>(c10::elementSize(ab_dtype));
@@ -272,6 +276,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .block_m = best_block_m,
         .block_n = best_block_n,
         .block_k = block_k,
+        .signal_threshold = ceil_div(n, best_block_n),
         .num_stages = best_num_stages,
         .num_last_stages = ceil_div(k, block_k) % best_num_stages,
         .num_sms = num_min_sms,
@@ -279,7 +284,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .multicast_config = best_multicast_config,
         // ReSharper disable once CppLocalVariableMightNotBeInitialized
         .smem_config = best_smem_config,
-        .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n)
+        .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n),
+        .enable_overlap = enable_overlap
     };
 
     // Only SM100 BF16 kernels support tensor core control

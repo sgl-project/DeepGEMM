@@ -103,9 +103,10 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
 def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
     max_m = 4096
     for kernel_type in get_kernel_types(dtype):
-        for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
-            for n, k in ((4096, 7168), (7168, 2048), ):
-                yield kernel_type, num_groups, max_m, m, n, k
+        for enable_overlap in (False, True):
+            for num_groups, m in ((1, 1024), (2, 512), (4, 256), (16, 64), (16, 32)):
+                for n, k in ((4096, 7168), (7168, 2048), ):
+                    yield kernel_type, enable_overlap, num_groups, max_m, m, n, k
 
 
 def enumerate_k_grouped_contiguous(dtype: torch.dtype):
@@ -208,7 +209,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
 
 
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
-                              use_ue8m0: bool = False, use_bf16: bool = False):
+                              use_ue8m0: bool = False, use_bf16: bool = False, enable_overlap: bool = False):
     a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
@@ -228,7 +229,10 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
         a_fp8[0][i], a_fp8[1][i] = per_token_cast_to_fp8(a[i], use_ue8m0=use_ue8m0)
         b_fp8[0][i], b_fp8[1][i] = per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
 
-    return a_fp8, b_fp8, masked_m, d, ref_d
+    max_signal_size = num_groups * ceil_div(max_m, 64)
+    signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_overlap else None
+
+    return a_fp8, b_fp8, masked_m, d, ref_d, signal
 
 
 def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int],

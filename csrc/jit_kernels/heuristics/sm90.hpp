@@ -21,18 +21,11 @@ struct SM90ArchSpec {
         return candidates;
     }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
-        int start = 16;
-
-        // Avoid bank conflicts for 1D1D kernel FP32 output
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype, const int& max_block_n) {
+        // Avoid bank conflicts for FP32 output
+        const auto& start = cd_dtype == torch::kFloat ? 8 : 16;
         std::vector<int> candidates;
-        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
-            candidates.push_back(16);
-            start = 24;
-        }
-
-        // Push the strided options
-        for (int i = start; i <= 256; i += 16)
+        for (int i = start; i <= max_block_n; i += 16)
             candidates.push_back(i);
         return candidates;
     }
