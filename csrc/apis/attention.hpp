@@ -139,6 +139,7 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
 
 static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms) {
     const bool is_context_lens_2d = context_lens.dim() == 2;
+    const int compute_block_kv = device_runtime->get_arch_major() == 10 ? 128 : 64;
     int batch_size = 0, next_n = 0;
     if (is_context_lens_2d) {
         batch_size = context_lens.size(0);
@@ -155,7 +156,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
-        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d);
+        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, compute_block_kv, num_sms, is_context_lens_2d);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -177,8 +178,11 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     const auto& [batch_size_, max_block_len] = get_shape<2>(block_table);
     const auto& [schedule_meta_size, meta_info_size] = get_shape<2>(schedule_meta);
     const auto& num_sms = device_runtime->get_num_sms();
+    const auto& num_kv_multicast = next_n == 4 ? 2 : 1;
+    const auto& num_clusters = num_sms / num_kv_multicast;
     const auto& kv_cache_stride_bytes = fused_kv_cache.stride(0);
     const auto& block_table_stride = block_table.stride(0);
+    const auto& arch_major = device_runtime->get_arch_major();
 
     const bool is_context_lens_2d = context_lens.dim() == 2;
     if (is_context_lens_2d) {
@@ -194,10 +198,12 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(batch_size_next_n == batch_size * next_n);
     DG_HOST_ASSERT(num_heads == num_heads_ and num_heads_kv == 1);
     DG_HOST_ASSERT(head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
-    DG_HOST_ASSERT(schedule_meta_size == num_sms + 1 and meta_info_size == 2);
+    DG_HOST_ASSERT(num_sms % num_kv_multicast == 0);
+    DG_HOST_ASSERT(schedule_meta_size == num_clusters + 1 and meta_info_size == 2);
 
-    DG_HOST_ASSERT(next_n == 1 or next_n == 2);
-    DG_HOST_ASSERT(block_kv == 64);
+    const int compute_block_kv = arch_major == 10 ? 128 : 64;
+    DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
+    DG_HOST_ASSERT(compute_block_kv % block_kv == 0 and compute_block_kv / block_kv <= 4);
 
     DG_HOST_ASSERT(q.is_contiguous());
     DG_HOST_ASSERT(kv_cache_stride_bytes % sizeof(float) == 0);
@@ -231,13 +237,12 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     );
 
     // Allocate output
-    constexpr int num_math_warp_groups = 4;
-    const auto& aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv);
+    const int num_math_warp_groups = arch_major == 10 ? 2 : 4;
+    const auto& aligned_max_context_len = align(max_context_len, num_math_warp_groups * compute_block_kv);
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q.options().dtype(torch::kFloat));
     logits = logits.slice(-1, 0, max_context_len);
 
     // Dispatch implementation
-    const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_paged_mqa_logits(q, kv_cache, kv_cache_scales, weights, context_lens, logits, block_table, schedule_meta,
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
