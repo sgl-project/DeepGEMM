@@ -13,14 +13,6 @@ try:
 except ImportError:
     pass
 
-from . import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
-
-# Legacy Triton kernels for A100
-try:
-    from . import legacy
-except Exception as e:
-    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
-
 def _find_cuda_home() -> str:
     cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
     if cuda_home is None:
@@ -46,6 +38,21 @@ def _ensure_initialized() -> None:
     library_root = os.path.dirname(os.path.abspath(__file__))
     torch.ops.deep_gemm.init(library_root, _find_cuda_home())
     _dg_initialized = True
+
+
+# Import utils first (they need _ensure_initialized but not deep_gemm_cpp)
+from . import testing
+from . import utils
+from .utils import *
+
+# Import the C++ extension after utils are loaded
+from . import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
+
+# Legacy Triton kernels for A100
+try:
+    from . import legacy
+except Exception as e:
+    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
 
 
 def _wrap_op(name: str):
