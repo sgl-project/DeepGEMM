@@ -97,4 +97,6 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     DG_HOST_UNREACHABLE("Unknown cases");
 }
 
+#endif // DG_TENSORMAP_COMPATIBLE
+
 } // namespace deep_gemm::layout

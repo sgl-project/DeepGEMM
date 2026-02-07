@@ -243,7 +243,8 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
                                                   config.block_m, config.block_k, num_groups, 0);
 
     // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
+    const auto& major_sfb = get_major_type_ab(sfb);
+    const SM90FP8Gemm1D2DRuntime::Args args = {
         .major_sfb = major_sfb,
         .m = m, .n = n, .k = k,
         .num_groups = num_groups,

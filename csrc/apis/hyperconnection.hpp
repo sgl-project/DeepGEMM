@@ -59,12 +59,4 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
 
 #endif
 
-static void register_apis(pybind11::module_& m) {
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
-          py::arg("num_splits") = std::nullopt);
-#endif
-}
-
 } // namespace deep_gemm::hyperconnection

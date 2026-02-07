@@ -262,7 +262,6 @@ static std::optional<std::pair<int, int>> m_grouped_fp8_gemm_nt_masked(const std
         a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt, num_groups, num_groups, disable_ue8m0_cast);
 
     // Dispatch implementation
-    const auto& arch_major = device_runtime->get_arch_major();
     std::optional<std::pair<int, int>> result = std::nullopt;
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         result = sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,

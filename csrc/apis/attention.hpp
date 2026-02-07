@@ -253,4 +253,6 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     return logits;
 }
 
+#endif // DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+
 } // namespace deep_gemm::attention

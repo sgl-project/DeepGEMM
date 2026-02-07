@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <deep_gemm/common/types.hpp>
 
 #include "../../utils/math.hpp"
@@ -178,7 +179,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // Filter block_ns by max_block_n (sgl-release feature)
     if (max_block_n < 256) {
-        std::erase_if(block_ns, [&](int bn) { return bn > max_block_n; });
+        block_ns.erase(std::remove_if(block_ns.begin(), block_ns.end(), [&](int bn) { return bn > max_block_n; }), block_ns.end());
     }
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
