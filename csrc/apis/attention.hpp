@@ -1,21 +1,25 @@
 #pragma once
 
+#include "../utils/compatibility.hpp"
+
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
-#include "../jit_kernels/impls/sm100_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/smxx_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
+#endif
 
 #include "layout.hpp"
 
 namespace deep_gemm::attention {
 
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tensor>& a,
                                       const std::pair<torch::Tensor, torch::Tensor>& b,
                                       const torch::Tensor& d,
-                                      const std::tuple<int, int, int> &head_splits,
+                                      const std::tuple<int, int, int>& head_splits,
                                       std::optional<std::tuple<int, int, int>> recipe,
                                       const std::string& compiled_dims,
                                       const bool& disable_ue8m0_cast) {
@@ -49,21 +53,21 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
         return;
 
     // Transform SFA and SFB into compute-required layout
-    if (not recipe.has_value())
-        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    DG_HOST_ASSERT(recipe.value() == std::make_tuple(1, 1, 128) or recipe.value() == std::make_tuple(1, 128, 128));
-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast);
-    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, false, disable_ue8m0_cast);
+    const auto& [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, disable_ue8m0_cast);
+    DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
 
     // Dispatch into different implements
     const auto& arch_major = device_runtime->get_arch_major();
     const auto& epilogue_type = fmt::format("EpilogueHeadSplits<{}, {}, {}>", left, mid, right);
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat and std::get<1>(recipe.value()) != 1) {
-        sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
+        const auto& major_sfb = get_major_type_ab(sfb);
+        sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kFloat) {
-        sm100_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
+        // NOTES: Only granularity 128 and FP8 are exposed in the API
+        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
+                                128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -74,7 +78,8 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const torch::Tensor& weights,
                                     const torch::Tensor& cu_seq_len_k_start,
                                     const torch::Tensor& cu_seq_len_k_end,
-                                    const bool& clean_logits) {
+                                    const bool& clean_logits,
+                                    const int& max_seqlen_k) {
     const auto& [seq_len, num_heads, head_dim] = get_shape<3>(q);
     const auto& [seq_len_kv, head_dim_] = get_shape<2>(kv.first);
     const auto& [seq_len_, num_heads_] = get_shape<2>(weights);
@@ -102,27 +107,45 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
     constexpr int seq_len_alignment = 4;
     constexpr int block_kv = 256;
     const auto aligned_seq_len = align(seq_len, seq_len_alignment);
-    const auto aligned_seq_len_kv = align(seq_len_kv + block_kv, 4);
-    auto logits = torch::empty({aligned_seq_len, aligned_seq_len_kv}, q.options().dtype(torch::kFloat));
-    logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
+    
+    torch::Tensor logits;
+    int stride_logits;
+    if (max_seqlen_k == 0) {
+        stride_logits = align(seq_len_kv + block_kv, 4);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(torch::kFloat));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
+    } else {
+        stride_logits = align(max_seqlen_k, block_kv);
+        logits = torch::empty({aligned_seq_len, stride_logits}, q.options().dtype(torch::kFloat));
+        logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, max_seqlen_k)});
+        DG_HOST_ASSERT(not clean_logits);
+    }
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_mqa_logits(q, kv.first, kv.second, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                            seq_len, seq_len_kv, aligned_seq_len_kv, num_heads, head_dim, seq_len_alignment);
+                            seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, seq_len_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
     // Clean unfilled logits
     if (clean_logits)
-        smxx_clean_logits(logits, cu_seq_len_k_start, cu_seq_len_k_end, 1, seq_len, seq_len_kv, aligned_seq_len_kv);
+        smxx_clean_logits(logits, cu_seq_len_k_start, cu_seq_len_k_end, 1, seq_len, seq_len_kv, stride_logits);
     return logits;
 }
 
 static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms) {
-    const auto& [batch_size] = get_shape<1>(context_lens);
+    const bool is_context_lens_2d = context_lens.dim() == 2;
+    int batch_size = 0, next_n = 0;
+    if (is_context_lens_2d) {
+        batch_size = context_lens.size(0);
+        next_n = context_lens.size(1);
+    } else {
+        DG_HOST_ASSERT(context_lens.dim() == 1);
+        batch_size = context_lens.size(0);
+    }
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(context_lens.is_contiguous());
 
@@ -131,7 +154,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
-        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, block_kv, num_sms);
+        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -149,15 +172,24 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const bool& clean_logits) {
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
     const auto& [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
-    const auto& [batch_size_] = get_shape<1>(context_lens);
     const auto& [batch_size_next_n, num_heads_] = get_shape<2>(weights);
-    const auto& [batch_size__, max_block_len] = get_shape<2>(block_table);
+    const auto& [batch_size_, max_block_len] = get_shape<2>(block_table);
     const auto& [schedule_meta_size, meta_info_size] = get_shape<2>(schedule_meta);
     const auto& num_sms = device_runtime->get_num_sms();
     const auto& kv_cache_stride_bytes = fused_kv_cache.stride(0);
     const auto& block_table_stride = block_table.stride(0);
 
-    DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size__);
+    const bool is_context_lens_2d = context_lens.dim() == 2;
+    if (is_context_lens_2d) {
+        const auto& [batch_size__, next_n_] = get_shape<2>(context_lens);
+        DG_HOST_ASSERT(batch_size == batch_size__ and next_n == next_n_);
+    } else {
+        DG_HOST_ASSERT(context_lens.dim() == 1);
+        const auto& [batch_size__] = get_shape<1>(context_lens);
+        DG_HOST_ASSERT(batch_size == batch_size__);
+    }
+
+    DG_HOST_ASSERT(batch_size == batch_size_);
     DG_HOST_ASSERT(batch_size_next_n == batch_size * next_n);
     DG_HOST_ASSERT(num_heads == num_heads_ and num_heads_kv == 1);
     DG_HOST_ASSERT(head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
@@ -198,8 +230,8 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     );
 
     // Allocate output
-    constexpr int num_math_warp_groups = 4;
-    const auto& aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv);
+    constexpr int split_kv = 256;
+    const auto& aligned_max_context_len = align(max_context_len, split_kv);
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q.options().dtype(torch::kFloat));
     logits = logits.slice(-1, 0, max_context_len);
 
@@ -207,15 +239,17 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_paged_mqa_logits(q, kv_cache, kv_cache_scales, weights, context_lens, logits, block_table, schedule_meta,
-                                  batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv,
-                                  kv_cache_stride_bytes, aligned_max_context_len, block_table_stride, num_sms, num_math_warp_groups);
+                                  batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                                  kv_cache_stride_bytes, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
     // Clean unfilled logits
-    if (clean_logits)
+    if (clean_logits) {
+        DG_HOST_ASSERT(not is_context_lens_2d);
         smxx_clean_logits(logits, std::nullopt, context_lens, next_n, batch_size * next_n, max_context_len, aligned_max_context_len);
+    }
     return logits;
 }
 

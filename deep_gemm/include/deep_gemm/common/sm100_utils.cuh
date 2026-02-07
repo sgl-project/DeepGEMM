@@ -3,38 +3,12 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/tma_utils.cuh>
 
 namespace deep_gemm::sm100 {
-
-template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
-constexpr uint32_t get_inner_block_atom_size() {
-    return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);
-}
-
-template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
-          uint32_t kSwizzleMode, uint32_t kNumMulticast,
-          typename dtype_t>
-__device__ __forceinline__ void
-tma_copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
-         dtype_t* smem_ptr, const uint32_t& inner_idx, const int32_t& outer_idx) {
-    DG_STATIC_ASSERT(1 <= kNumMulticast and kNumMulticast <= 2, "Invalid multicast config");
-    DG_STATIC_ASSERT(static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL) ==
-                     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL), "Invalid cache hint");
-
-    // 2-CTA function will send signals to the leader CTA only
-    const auto copy_func = kNumMulticast == 1 ? cute::SM90_TMA_LOAD_2D::copy : cute::SM100_TMA_2SM_LOAD_2D::copy;
-
-    // Issue multiple TMAs
-    constexpr uint32_t BLOCK_INNER_ATOM = get_inner_block_atom_size<BLOCK_INNER, kSwizzleMode, dtype_t>();
-    #pragma unroll
-    for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
-        copy_func(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
-                  static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                  smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM, inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
-    }
-}
 
 __device__ __forceinline__
 cute::UMMA::SmemDescriptor make_smem_desc(cute::UMMA::LayoutType layout, void* smem_ptr,
@@ -123,7 +97,8 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
     const auto& layout_type = to_umma_layout_type<kMajorMode, kSwizzleMode, kUseBase32, dtype_t>();
     const auto& num_non_contiguous = 128 / get_atom_base(layout_type);
     if constexpr (kMajorMode == cute::UMMA::Major::K) {
-        // NOTES: for K-major layout, the swizzle must be 128B (also, atom index must be 0), as `BLOCK_K` is always 128
+        // NOTES: for K-major layout, the swizzle must be the same as `BLOCK_K * sizeof(dtype_t)`
+        // also, atom index must be 0, so that each block has exactly one swizzle atom on the K axis
         DG_STATIC_ASSERT(kSwizzleMode == BLOCK_K * sizeof(dtype_t), "Unexpected value");
 
         // Atom size: 8 x `kSwizzleMode` (in bytes, on K)
@@ -157,8 +132,8 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
 }
 
 __device__  __forceinline__
-uint64_t make_runtime_instr_desc_with_sf_id(cute::UMMA::InstrDescriptorBlockScaled desc, const uint32_t& sf_id) {
-    desc.a_sf_id_ = sf_id, desc.b_sf_id_ = sf_id;
+uint64_t make_runtime_instr_desc_with_sf_id(cute::UMMA::InstrDescriptorBlockScaled desc, const uint32_t& sfa_id, const uint32_t& sfb_id) {
+    desc.a_sf_id_ = sfa_id, desc.b_sf_id_ = sfb_id;
     return static_cast<uint64_t>(static_cast<uint32_t>(desc)) << 32;
 }
 
@@ -178,6 +153,20 @@ __device__ __forceinline__ void tcgen05_before_thread_sync() {
 
 __device__ __forceinline__ void tcgen05_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
+}
+
+__device__ __forceinline__
+void tma_gather4(const void* desc_ptr, cutlass::arch::ClusterTransactionBarrier &mbarrier, void* smem_ptr, int col_idx, int4 row_idxs, uint64_t cache_hint) {
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t mbarrier_addr = cute::cast_smem_ptr_to_uint(&mbarrier);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
+        :
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx), 
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+          "r"(mbarrier_addr), "l"(cache_hint)
+        : "memory"
+    );
 }
 
 // UMMA versions with relaxed assertions
@@ -254,6 +243,23 @@ struct SM100_MMA_MXF8F6F4_2x1SM_SS {
           :
           : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(static_cast<uint32_t>(desc >> 32)), "r"(scale_c),
             "r"(tmem_sfa), "r"(tmem_sfb));
+    }
+};
+
+struct SM100_MMA_F16BF16_WS_SS {
+    __device__ static void
+    fma(uint64_t const& desc_a,
+        uint64_t const& desc_b,
+        uint32_t const& tmem_c,
+        uint32_t const& scale_c,
+        uint64_t const& desc) {
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.ws.cta_group::1.kind::f16 [%0], %1, %2, %3, p; \n\t"
+            "}\n"
+            :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(static_cast<uint32_t>(desc >> 32)), "r"(scale_c));
     }
 };
 

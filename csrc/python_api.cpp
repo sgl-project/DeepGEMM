@@ -9,6 +9,7 @@
 
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
+#include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/runtime.hpp"
@@ -524,9 +525,20 @@ TORCH_LIBRARY(deep_gemm, m) {
     /*
      * einsum
      */
-    m.def(R"(einsum(str expr, Tensor a, Tensor b, Tensor d, Tensor? c=None) -> ())");
-    m.impl("einsum", torch::kCUDA, [](const std::string& expr, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d, const c10::optional<torch::Tensor>& c) {
-        deep_gemm::einsum::einsum(expr, a, b, d, c);
+    m.def(R"(einsum(str expr, Tensor a, Tensor b, Tensor d, Tensor? c=None, bool use_cublaslt=False) -> ())");
+    m.impl("einsum", torch::kCUDA, [](const std::string& expr, const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d, const c10::optional<torch::Tensor>& c, bool use_cublaslt) {
+        deep_gemm::einsum::einsum(expr, a, b, d, c, use_cublaslt);
+    });
+
+    m.def(R"(fp8_einsum(str expr, Any a, Any b, Tensor d, Tensor? c=None, int[] recipe=[1, 128, 128]) -> ())");
+    m.impl("fp8_einsum", torch::kCUDA, [](const std::string& expr,
+                                           const c10::IValue& a_input, const c10::IValue& b_input,
+                                           const torch::Tensor& d,
+                                           const c10::optional<torch::Tensor>& c,
+                                           c10::IntArrayRef recipe) {
+        auto [a_val, a_scale] = parse_tensor_or_tuple(a_input);
+        auto [b_val, b_scale] = parse_tensor_or_tuple(b_input);
+        deep_gemm::einsum::fp8_einsum(expr, {a_val, a_scale}, {b_val, b_scale}, d, c, to_recipe_tuple_default(recipe));
     });
 
 }

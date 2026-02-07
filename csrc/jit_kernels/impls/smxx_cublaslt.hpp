@@ -3,6 +3,11 @@
 #include <cublasLt.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <cute/arch/mma_sm100_umma.hpp>
+
+#include "../../jit/device_runtime.hpp"
+#include "../../utils/exception.hpp"
+#include "../../utils/compatibility.hpp"
 
 namespace deep_gemm {
 
@@ -32,8 +37,6 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                               const bool& accumulate) {
     cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
     cudaDataType_t scale_type = CUDA_R_32F;
-    const int& math_sms = device_runtime->get_num_sms();
-    bool fp8_fast_accumulate = false;
 
     // Operation description
     cublasLtMatmulDesc_t desc;
@@ -41,9 +44,17 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
+
+#if DG_CUBLASLT_ADVANCED_FEATURES_COMPATIBLE
+    const int& math_sms = device_runtime->get_num_sms();
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &math_sms, sizeof(math_sms)));
+#endif
+
+#if DG_FP8_COMPATIBLE and DG_CUBLASLT_ADVANCED_FEATURES_COMPATIBLE
+    bool fp8_fast_accumulate = false;
     if (a.scalar_type() == torch::kFloat8_e4m3fn)
         DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fp8_fast_accumulate, sizeof(fp8_fast_accumulate)));
+#endif
 
     // Get cuBLASLt handle, workspace, and stream
     const auto& handle = device_runtime->get_cublaslt_handle();

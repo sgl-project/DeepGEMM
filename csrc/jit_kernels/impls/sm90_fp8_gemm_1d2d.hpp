@@ -15,6 +15,7 @@ namespace deep_gemm {
 class SM90FP8Gemm1D2DRuntime final: public LaunchRuntime<SM90FP8Gemm1D2DRuntime> {
 public:
     struct Args {
+        cute::UMMA::Major major_sfb;
         int m, n, k, num_groups;
         const std::string& compiled_dims;
         const std::optional<std::string>& epilogue_type;
@@ -37,10 +38,11 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_gemm_1d2d_impl<
-        {}, {}, {},
         {},
         {}, {}, {},
         {},
+        {}, {}, {},
+        {}, {}, {},
         {}, {},
         {}, {},
         {}, {},
@@ -50,10 +52,11 @@ static void __instantiate_kernel() {{
 }};
 )",
         // TODO: add CD dtype
+        to_string(args.major_sfb),
         get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
         args.num_groups,
         args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
-        args.gemm_config.smem_config.swizzle_cd_mode,
+        args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
         args.gemm_config.num_stages, args.gemm_config.num_last_stages,
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
@@ -77,17 +80,17 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const std::optional<torch::Tensor>& c,
                                const torch::Tensor& d,
                                const int& m, const int& n, const int& k,
-                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
                                const std::optional<std::string>& epilogue_type = std::nullopt) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const auto& aligned_k = align(k, 128);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Normal, KernelType::Kernel1D2D,
         m, n, k, 1, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -113,7 +116,8 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .major_sfb = major_sfb,
+        .m = m, .n = n, .k = k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
         .epilogue_type = epilogue_type,
@@ -139,16 +143,16 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const torch::Tensor& d,
                                                     const torch::Tensor& m_indices,
                                                     const int& num_groups, const int& m, const int& n, const int& k,
-                                                    const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                    const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const auto& aligned_k = align(k, 128);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedContiguous, KernelType::Kernel1D2D,
         m, n, k, 1, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -174,7 +178,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .major_sfb = major_sfb,
+        .m = m, .n = n, .k = k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
@@ -206,14 +211,14 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
                                                 const int& max_block_n,
                                                 const bool& enable_overlap,
                                                 const c10::optional<torch::Tensor>& signal) {
-    const auto& aligned_k = align(k, 128);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedMasked, KernelType::Kernel1D2D,
         expected_m, n, k, num_groups, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), false,
+        torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn,
+        d.scalar_type(), false,
         device_runtime->get_num_sms(), max_block_n, enable_overlap);
 
     // Requires no TMA splits
@@ -239,7 +244,8 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .major_sfb = major_sfb,
+        .m = m, .n = n, .k = k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
         .epilogue_type = std::nullopt,
@@ -261,6 +267,73 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
     return enable_overlap ? 
         std::optional(std::make_pair(config.block_m, config.signal_threshold)) : 
         std::nullopt;
+}
+
+static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
+                         const torch::Tensor& b, const torch::Tensor& sfb,
+                         const std::optional<torch::Tensor>& c,
+                         const torch::Tensor& d,
+                         const int& batch_size, const int& m, const int& n, const int& k,
+                         const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
+                         const std::string& compiled_dims) {
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+
+    const auto& config = get_best_config<SM90ArchSpec>(
+        GemmType::Batched, KernelType::Kernel1D2D,
+        m, n, k, batch_size, major_a, major_b,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
+        device_runtime->get_num_sms());
+
+    // Requires no TMA splits
+    DG_HOST_ASSERT(config.smem_config.swizzle_a_mode == config.block_k);
+    DG_HOST_ASSERT(config.smem_config.swizzle_b_mode == config.block_k);
+    const int& load_block_m = SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m);
+    const auto& tensor_map_a = make_tma_3d_desc(a, k, m, batch_size,
+                                                config.block_k, load_block_m, 1,
+                                                a.stride(1),
+                                                a.stride(0),
+                                                config.smem_config.swizzle_a_mode);
+
+    const int& load_block_n = SM90ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n);
+    const auto& tensor_map_b = make_tma_3d_desc(b, k, n, batch_size,
+                                                config.block_k, load_block_n, 1,
+                                                b.stride(1),
+                                                b.stride(0),
+                                                config.smem_config.swizzle_b_mode);
+
+    const int& store_block_m = SM90ArchSpec::get_cd_store_block_m(config.block_m);
+    const int& store_block_n = SM90ArchSpec::get_cd_store_block_n(config.block_n);
+    const auto& tensor_map_d = make_tma_3d_desc(d, n, m, batch_size,
+                                                store_block_n, store_block_m, 1,
+                                                d.stride(1), d.stride(0),
+                                                config.smem_config.swizzle_cd_mode);
+
+    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                  config.block_m, config.block_k, batch_size, 0);
+
+    // Launch
+    const SM90FP8Gemm1D2DRuntime::Args& args = {
+        .major_sfb = major_sfb,
+        .m = m, .n = n, .k = k,
+        .num_groups = batch_size,
+        .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .sfb = sfb.data_ptr(),
+        .grouped_layout = nullptr,
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_d = tensor_map_d,
+        .tensor_map_sfa = tensor_map_sfa,
+    };
+    const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
+    const auto& runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
+    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

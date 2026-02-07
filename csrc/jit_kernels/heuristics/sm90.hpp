@@ -10,12 +10,29 @@ namespace deep_gemm {
 
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
+    
+    static std::vector<int> get_block_m_candidates(const KernelType& kernel_type, const cute::UMMA::Major& major_a, const int& m) {
+        std::vector<int> candidates{64, 128, 256};
+        if ((kernel_type == KernelType::Kernel1D2D or kernel_type == KernelType::KernelNoSF) and major_a == cute::UMMA::Major::K) {
+            // NOTES: `block_m = 16/32` is smaller than MMA M size, should be careful in handling this
+            if (m <= 16) candidates.push_back(16);
+            if (m <= 32) candidates.push_back(32);
+        }
+        return candidates;
+    }
 
-    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype, const int& max_block_n) {
-        // Avoid bank conflicts for FP32 output
-        const auto& start = cd_dtype == torch::kFloat ? 8 : 16;
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
+        int start = 16;
+
+        // Avoid bank conflicts for 1D1D kernel FP32 output
         std::vector<int> candidates;
-        for (int i = start; i <= max_block_n; i += 16)
+        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
+            candidates.push_back(16);
+            start = 24;
+        }
+
+        // Push the strided options
+        for (int i = start; i <= 256; i += 16)
             candidates.push_back(i);
         return candidates;
     }
@@ -43,7 +60,8 @@ struct SM90ArchSpec {
 
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+                                    const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // SM90 FP32 output does not support `block_m == 256`
         if (cd_dtype == at::kFloat and block_m == 256)
@@ -58,29 +76,25 @@ struct SM90ArchSpec {
                 return false;
         }
 
+        // When B is N Major, use swizzle 128B for better performance; only affects SM90 BF16 GEMM
+        if (major_b == cute::UMMA::Major::MN and block_n >= 128 and block_n % 64 != 0)
+            return false;
+
         // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
         // Or too many register spills
         if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
-            return false;
-
-        // Avoid bank conflicts for FP32 output
-        if (cd_dtype == torch::kFloat and block_n % 16 == 0)
             return false;
 
         // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
         return block_m <= 128 or block_n <= 128;
     }
 
-    static bool is_num_stages_legal(const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& num_stages,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // Unrolling both stages and `num_former_iters` will cause large code size
-        if (ab_dtype == torch::kFloat8_e4m3fn and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
+        if (mma_kind == MmaKind::MXFP8FP4 and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
             return num_stages <= 4;
-        return true;
-    }
-
-    static bool should_minimize_num_sms() {
         return true;
     }
 
@@ -89,6 +103,9 @@ struct SM90ArchSpec {
                                                         const int& num_sms) {
         // Disable multicast when the number of k-groups is large (a heuristic)
         if (gemm_type == GemmType::KGroupedContiguous and num_groups > 4)
+            return {false, false};
+
+        if (gemm_type == GemmType::Batched)
             return {false, false};
 
         return {
@@ -101,27 +118,27 @@ struct SM90ArchSpec {
 
     static ThreadConfig get_thread_config(const KernelType& kernel_type,
                                           const int& block_m, const int& block_n) {
-        return ThreadConfig::sm90(128, (block_m == 64 ? 1 : 2) * 128);
+        return ThreadConfig::sm90(128, (block_m <= 64 ? 1 : 2) * 128);
     }
 
     static int get_smem_cd_size(const KernelType& kernel_type,
                                 const int& block_m, const int& block_n,
                                 const int& swizzle_cd_mode, const at::ScalarType& cd_dtype) {
-        return block_m * block_n * static_cast<int>(c10::elementSize(cd_dtype));
+        // NOTES: 1024 is for TMA swizzling alignment requirement
+        return align(block_m * block_n * static_cast<int>(c10::elementSize(cd_dtype)), 1024);
     }
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype) {
-        if (ab_dtype == torch::kBFloat16)
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+        if (mma_kind == MmaKind::BF16)
             return {0, 0};
 
-        int smem_sfa_per_stage = block_m * static_cast<int>(sizeof(float));
+        // NOTES: 128 is for 2D TMA alignment requirement
+        int smem_sfa_per_stage = align(block_m * static_cast<int>(sizeof(float)), 128);
         int smem_sfb_per_stage = 0;
-        if (kernel_type == KernelType::Kernel1D1D) {
-            // NOTES: `128` is for 2D TMA alignment requirement
+        if (kernel_type == KernelType::Kernel1D1D)
             smem_sfb_per_stage = align(block_n * 4, 128);
-        }
         return {smem_sfa_per_stage, smem_sfb_per_stage};
     }
 

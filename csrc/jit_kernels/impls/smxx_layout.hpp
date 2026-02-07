@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../jit/kernel_runtime.hpp"
+#include "../../jit/compiler.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"

@@ -15,6 +15,11 @@ except ImportError:
 
 from . import deep_gemm_cpp  # noqa: F401  # Registers ops into torch.ops without touching CUDA
 
+# Legacy Triton kernels for A100
+try:
+    from . import legacy
+except Exception as e:
+    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
 
 def _find_cuda_home() -> str:
     cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
@@ -76,6 +81,7 @@ bf16_gemm_tn = _wrap_op('bf16_gemm_tn')
 bf16_gemm_tt = _wrap_op('bf16_gemm_tt')
 m_grouped_bf16_gemm_nt_contiguous = _wrap_op('m_grouped_bf16_gemm_nt_contiguous')
 m_grouped_bf16_gemm_nt_masked = _wrap_op('m_grouped_bf16_gemm_nt_masked')
+bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
 # cuBLASLt GEMMs
 cublaslt_gemm_nt = _wrap_op('cublaslt_gemm_nt')
@@ -89,8 +95,9 @@ fp8_mqa_logits = _wrap_op('fp8_mqa_logits')
 get_paged_mqa_logits_metadata = _wrap_op('get_paged_mqa_logits_metadata')
 fp8_paged_mqa_logits = _wrap_op('fp8_paged_mqa_logits')
 
-# Einsum kernel
+# Einsum kernels
 einsum = _wrap_op('einsum')
+fp8_einsum = _wrap_op('fp8_einsum')
 
 # Layout kernels
 transform_sf_into_required_layout = _wrap_op('transform_sf_into_required_layout')
@@ -120,7 +127,7 @@ def _verify_ops_loaded():
         'get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor',
         'fp8_gemm_nt_skip_head_mid', 'fp8_mqa_logits',
         'get_paged_mqa_logits_metadata', 'fp8_paged_mqa_logits',
-        'einsum',
+        'einsum', 'fp8_einsum',
         'cublaslt_gemm_nt', 'cublaslt_gemm_nn',
         'cublaslt_gemm_tn', 'cublaslt_gemm_tt',
     ]
@@ -137,3 +144,5 @@ _ensure_initialized()
 
 if __debug__:
     _verify_ops_loaded()
+
+__version__ = '2.3.0'
