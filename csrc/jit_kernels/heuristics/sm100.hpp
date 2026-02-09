@@ -22,11 +22,11 @@ struct SM100ArchSpec {
         return candidates;
     }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype, const int& max_block_n) {
         // 16 is for better SM usage
         // Stride 32 is due to low-performance swizzle-16/32B
         std::vector<int> candidates = {16};
-        for (int i = 32; i <= 256; i += 32)
+        for (int i = 32; i <= max_block_n; i += 32)
             candidates.push_back(i);
         return candidates;
     }

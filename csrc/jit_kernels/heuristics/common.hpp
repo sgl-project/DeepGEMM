@@ -65,11 +65,13 @@ struct GemmConfig {
     cute::UMMA::Major major_b;
     bool with_accumulation;
     int block_m, block_n, block_k;
+    int signal_threshold;
     int num_stages, num_last_stages;
 
     // Templated device configs
     int num_sms;
     int tc_util;
+    bool enable_overlap;
 
     // Structured configs
     MulticastConfig multicast_config;
@@ -154,7 +156,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
                                   const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
+                                  const bool& with_accumulation, const int& num_sms,
+                                  const int& max_block_n = 256, const bool& enable_overlap = false) {
     const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
     if (mma_kind == MmaKind::BF16) {
         DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
@@ -170,7 +173,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
     if (gemm_type == GemmType::MGroupedMasked or gemm_type == GemmType::MGroupedContiguousWithPsumLayout) 
         block_ms = std::vector{64, 128};    // Exclude 256 for performance
-    auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+    auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype, max_block_n);
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
@@ -297,10 +300,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .block_m = best_block_m,
         .block_n = best_block_n,
         .block_k = block_k,
+        .signal_threshold = ceil_div(n, best_block_n),
         .num_stages = best_num_stages,
         .num_last_stages = ceil_div(k, block_k) % best_num_stages,
         .num_sms = num_min_sms,
         .tc_util = device_runtime->get_tc_util(),
+        .enable_overlap = enable_overlap,
         .multicast_config = best_multicast_config,
         // ReSharper disable once CppLocalVariableMightNotBeInitialized
         .smem_config = best_smem_config,

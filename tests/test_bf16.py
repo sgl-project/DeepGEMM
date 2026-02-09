@@ -86,14 +86,17 @@ def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')
 
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
-    for _, _, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.bfloat16):
+    for _, enable_overlap, _, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.bfloat16):
+        if enable_overlap:
+            continue
         num_tests = 8
         sum_t, max_t = 0, 0
         sum_ops, sum_bytes = 0, 0
 
         for i in range(num_tests):
-            a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
-                                                                         use_bf16=True, use_psum_layout=use_psum_layout)
+            a, b, masked_m, psum_m, d, ref_d, _ = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
+                                                                            use_bf16=True, use_psum_layout=use_psum_layout,
+                                                                            enable_overlap=False)
             if use_psum_layout:
                 a_psum = layout_masked_to_psum(a, psum_m)
                 d_psum = layout_masked_to_psum(d, psum_m)

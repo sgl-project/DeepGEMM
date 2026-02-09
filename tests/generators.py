@@ -178,7 +178,8 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
                 reset_seed()
                 for num_groups, m in m_group_list:
                     for n, k in n_k_list:
-                        yield kernel_type, quant_config, num_groups, max_m, m, n, k, use_psum_layout
+                        for enable_overlap in (False, True):
+                            yield kernel_type, enable_overlap, quant_config, num_groups, max_m, m, n, k, use_psum_layout
 
 
 def enumerate_k_grouped_contiguous(dtype: torch.dtype):
@@ -332,7 +333,8 @@ def layout_masked_to_psum(x: torch.Tensor, psum_m: torch.Tensor):
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
                               use_ue8m0: bool = False, use_bf16: bool = False,
                               use_psum_layout: bool = False,
-                              quant_config: Optional[QuantConfig] = None):
+                              quant_config: Optional[QuantConfig] = None,
+                              enable_overlap: bool = False):
     a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
@@ -346,13 +348,21 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
     assert masked_m.amax().item() <= max_m
 
     if use_bf16:
-        return a, b, masked_m, psum_m, d, ref_d
+        signal = None
+        if enable_overlap and (not use_psum_layout):
+            max_signal_size = num_groups * ceil_div(max_m, 64)
+            signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
+        return a, b, masked_m, psum_m, d, ref_d, signal
 
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = grouped_cast_fp8_fp4_with_major(a, MajorTypeAB.KMajor, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
     b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
 
-    return a, b, masked_m, psum_m, d, ref_d
+    signal = None
+    if enable_overlap and (not use_psum_layout):
+        max_signal_size = num_groups * ceil_div(max_m, 64)
+        signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
+    return a, b, masked_m, psum_m, d, ref_d, signal
 
 
 def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int],

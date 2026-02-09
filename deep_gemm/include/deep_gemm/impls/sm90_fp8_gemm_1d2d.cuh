@@ -39,9 +39,9 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename epilogue_type_t>
+          typename epilogue_type_t, bool kEnableOverlap>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -427,6 +427,18 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 cute::tma_store_arrive();
             }
             __syncwarp();
+
+            if constexpr (kEnableOverlap) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(signal != nullptr);
+                if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
+                    store_wait();
+                }
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 2);
+                if (threadIdx.x == 0) {
+                    atomic_add_release_global(
+                        signal + scheduler.current_group_idx * ceil_div(shape_m, BLOCK_M) + m_block_idx, 1);
+                }
+            }
         }
     }
 #else

@@ -17,6 +17,8 @@ from . import _C
 from ._C import (
     set_num_sms,
     get_num_sms,
+    set_compile_mode,
+    get_compile_mode,
     set_tc_util,
     get_tc_util,
 )
