@@ -7,6 +7,7 @@ import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
     calc_diff, count_bytes,
+    check_signal,
     ignore_env, get_arch_major
 )
 
@@ -102,20 +103,23 @@ def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')
 
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
-    for kernel_type, quant_config, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
+    for kernel_type, enable_overlap, quant_config, num_groups, max_m, expected_m_per_group, n, k, use_psum_layout in enumerate_m_grouped_masked(torch.float8_e4m3fn):
         kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
         use_ue8m0 = get_ue8m0_usage(kernel_type)
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes()
+
+        if enable_overlap and (use_psum_layout or get_arch_major() != 9):
+            continue
 
         num_tests = 8
         sum_t, max_t = 0, 0
         sum_ops, sum_bytes = 0, 0
 
         for i in range(num_tests):
-            a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
-                                                                         use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
-                                                                         quant_config=quant_config)
+            a, b, masked_m, psum_m, d, ref_d, signal = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
+                                                                                 use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
+                                                                                 quant_config=quant_config, enable_overlap=enable_overlap)
             if use_psum_layout:
                 a_psum = (layout_masked_to_psum(a[0], psum_m), layout_masked_to_psum(a[1], psum_m))
                 d_psum = layout_masked_to_psum(d, psum_m)
@@ -127,8 +131,15 @@ def test_m_grouped_gemm_masked() -> None:
                                                                    use_psum_layout=True, expected_m_for_psum_layout=expected_m_per_group,
                                                                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
                 else:
-                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast,
-                                                               recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+                    result = deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(
+                        a, b, d, masked_m, expected_m_per_group,
+                        disable_ue8m0_cast=disable_ue8m0_cast,
+                        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+                        enable_overlap=enable_overlap, signal=signal,
+                    )
+                    if enable_overlap:
+                        block_m, threshold = result
+                        check_signal(num_groups, max_m, block_m, threshold, signal, masked_m)
 
             test_func()
             for j in range(num_groups):
@@ -151,7 +162,7 @@ def test_m_grouped_gemm_masked() -> None:
             sum_bytes += count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)
 
         print(f' > Perf (num_groups={num_groups:2}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, '
-              f'{kernel_opt}, psum={1 if use_psum_layout else 0}): '
+              f'{kernel_opt}, psum={1 if use_psum_layout else 0}, enable_overlap={enable_overlap}): '
               f'{sum_t / num_tests * 1e6:4.0f} us (max: {max_t * 1e6:3.0f} us) | '
               f'{sum_ops / sum_t / 1e12:4.0f} TFLOPS | '
               f'{sum_bytes / sum_t / 1e9:4.0f} GB/s')

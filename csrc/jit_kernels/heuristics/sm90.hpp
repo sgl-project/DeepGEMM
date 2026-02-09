@@ -21,7 +21,7 @@ struct SM90ArchSpec {
         return candidates;
     }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype, const int& max_block_n) {
         int start = 16;
 
         // Avoid bank conflicts for 1D1D kernel FP32 output
@@ -32,7 +32,7 @@ struct SM90ArchSpec {
         }
 
         // Push the strided options
-        for (int i = start; i <= 256; i += 16)
+        for (int i = start; i <= max_block_n; i += 16)
             candidates.push_back(i);
         return candidates;
     }

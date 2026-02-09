@@ -5,6 +5,7 @@
 
 #include "../heuristics/sm90.hpp"
 #include "../../jit/handle.hpp"
+#include "../../jit/device_runtime.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/exception.hpp"
@@ -233,5 +234,13 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
 }
+
+#ifndef MAYBE_LAUNCH
+#define MAYBE_LAUNCH(EXPR) do {                    \
+    if (device_runtime->get_compile_mode() == 0) { \
+        (EXPR);                                    \
+    }                                              \
+} while (0)
+#endif
 
 } // namespace deep_gemm
