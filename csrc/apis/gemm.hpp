@@ -219,7 +219,8 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                          d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, std::nullopt);
 }
 
-static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+static std::tuple<c10::optional<int64_t>, c10::optional<int64_t>> m_grouped_fp8_fp4_gemm_nt_masked(
+                                             const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
                                              const torch::Tensor& masked_m,
@@ -228,7 +229,10 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
                                              std::optional<std::tuple<int, int>> recipe_a,
                                              std::optional<std::tuple<int, int>> recipe_b,
                                              const std::string& compiled_dims,
-                                             const bool& disable_ue8m0_cast) {
+                                             const bool& disable_ue8m0_cast,
+                                             const int& max_block_n,
+                                             const bool& enable_overlap,
+                                             const c10::optional<torch::Tensor>& signal) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -255,17 +259,28 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, num_groups, num_groups, disable_ue8m0_cast);
 
     // Dispatch implementation
+    std::optional<std::pair<int, int>> overlap_result = std::nullopt;
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const auto& major_sfb = get_major_type_ab(sfb);
-        sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
-                                            num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
+        overlap_result = sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
+                                            num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims,
+                                            max_block_n, enable_overlap, signal);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(not enable_overlap);
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+
+    if (!overlap_result) {
+        return std::make_tuple(c10::nullopt, c10::nullopt);
+    }
+    return std::make_tuple(
+        c10::optional<int64_t>(overlap_result->first),
+        c10::optional<int64_t>(overlap_result->second)
+    );
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -640,7 +655,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
-          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
+          py::arg("max_block_n") = 256, py::arg("enable_overlap") = false, py::arg("signal") = std::nullopt);
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,

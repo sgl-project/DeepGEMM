@@ -19,3 +19,19 @@ def count_bytes(*tensors):
         elif t is not None:
             total += t.numel() * t.element_size()
     return total
+
+
+def check_signal(num_local_expert, max_m, block_m, threshold, signal, masked_m):
+    ceil_div = lambda a, b: (a + b - 1) // b
+
+    expert_len = max_m // block_m
+    for expert in range(num_local_expert):
+        mask = masked_m[expert]
+        start = expert * expert_len
+        end = expert * expert_len + expert_len
+        valid_len = ceil_div(mask, block_m)
+        for i in range(start, end):
+            if i < start + valid_len:
+                assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
+            else:
+                assert signal[i] == 0, f'{i=}, {signal[i]=}'

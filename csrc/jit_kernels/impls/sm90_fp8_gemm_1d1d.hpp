@@ -136,7 +136,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);
 
-    SM90FP8Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM90FP8Gemm1D1DRuntime::launch(runtime, args));
 }
 
 static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -212,7 +212,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);
 
-    SM90FP8Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM90FP8Gemm1D1DRuntime::launch(runtime, args));
 }
 
 } // namespace deep_gemm

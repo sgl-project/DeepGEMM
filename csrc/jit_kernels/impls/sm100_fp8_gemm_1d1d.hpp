@@ -141,7 +141,7 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_fp4_gemm_1d1d", code);
-    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
 static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -210,7 +210,7 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
-    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
 static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -271,7 +271,7 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
-    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
 static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -342,7 +342,7 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_k_grouped_fp8_gemm_1d1d", code);
-    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
 static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -410,7 +410,7 @@ static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_gemm_1d1d", code);
-    SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
 } // namespace deep_gemm
