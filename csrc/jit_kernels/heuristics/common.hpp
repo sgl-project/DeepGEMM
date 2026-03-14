@@ -8,6 +8,13 @@
 
 namespace deep_gemm {
 
+// Pack DLDataType into a comparable uint32_t (for use in std::set keys)
+static uint32_t dg_dtype_pack(const DLDataType& dt) {
+    return (static_cast<uint32_t>(dt.code) << 24) |
+           (static_cast<uint32_t>(dt.bits) << 16) |
+           static_cast<uint32_t>(dt.lanes);
+}
+
 struct MulticastConfig {
     int num_multicast;
     bool is_multicast_on_a;
@@ -60,7 +67,7 @@ struct GemmConfig {
     GemmType gemm_type;
     KernelType kernel_type;
     MmaKind mma_kind;
-    at::ScalarType a_dtype, b_dtype, cd_dtype;
+    DLDataType a_dtype, b_dtype, cd_dtype;
     cute::UMMA::Major major_a;
     cute::UMMA::Major major_b;
     bool with_accumulation;
@@ -102,10 +109,10 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
                                           const int& m, const int& n, const int& k,
                                           const int& block_m, const int& block_n, const int& block_k,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+                                          const MmaKind& mma_kind, const DLDataType& cd_dtype,
                                           const int& num_stages, const MulticastConfig& multicast_config) {
     const int& ab_elem_size = static_cast<int>(get_element_size(mma_kind));
-    const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
+    const int& cd_elem_size = dg_element_size(cd_dtype);
 
     const int& load_block_m = ArchSpec::get_ab_load_block_m(multicast_config, block_m);
     const int& load_block_n = ArchSpec::get_ab_load_block_n(multicast_config, block_n);
@@ -154,18 +161,18 @@ template <typename ArchSpec>
 static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& kernel_type,
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                  const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
-                                  const at::ScalarType& cd_dtype,
+                                  const DLDataType& a_dtype, const DLDataType& b_dtype,
+                                  const DLDataType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms,
                                   const int& max_block_n = 256, const bool& enable_overlap = false) {
-    const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
+    const auto mma_kind = (dg_dtype_eq(a_dtype, dg_dtype::BFloat16) ? MmaKind::BF16 : MmaKind::MXFP8FP4);
     if (mma_kind == MmaKind::BF16) {
-        DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
+        DG_HOST_ASSERT(dg_dtype_eq(a_dtype, dg_dtype::BFloat16) and dg_dtype_eq(b_dtype, dg_dtype::BFloat16));
     } else {
-        DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
-        DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
+        DG_HOST_ASSERT(dg_dtype_eq(a_dtype, dg_dtype::Float8E4M3) or dg_dtype_eq(a_dtype, kPackedFP4));
+        DG_HOST_ASSERT(dg_dtype_eq(b_dtype, dg_dtype::Float8E4M3) or dg_dtype_eq(b_dtype, kPackedFP4));
     }
-    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
+    DG_HOST_ASSERT(dg_dtype_eq(cd_dtype, dg_dtype::BFloat16) or dg_dtype_eq(cd_dtype, dg_dtype::Float32));
 
     // Select M/N block sizes
     auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
@@ -177,9 +184,9 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
-    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
+    if (dg_dtype_eq(a_dtype, kPackedFP4) and major_a == cute::UMMA::Major::MN)
         block_ms = std::vector{128};
-    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
+    if (dg_dtype_eq(b_dtype, kPackedFP4) and major_b == cute::UMMA::Major::MN)
         block_ns = std::vector{128};
 
     // K block size is selected in a fixed manner
@@ -241,9 +248,9 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
-    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
+    if (dg_dtype_eq(a_dtype, kPackedFP4) and major_a == cute::UMMA::Major::MN)
         is_legal_on_a = false;
-    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
+    if (dg_dtype_eq(b_dtype, kPackedFP4) and major_b == cute::UMMA::Major::MN)
         is_legal_on_b = false;
 
     const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
@@ -319,7 +326,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
-                                   mma_kind, a_dtype, b_dtype, cd_dtype, with_accumulation, num_sms);
+                                   mma_kind, dg_dtype_pack(a_dtype), dg_dtype_pack(b_dtype), dg_dtype_pack(cd_dtype), with_accumulation, num_sms);
         static std::set<decltype(key)> printed;
         if (printed.count(key) == 0) {
             printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
@@ -329,7 +336,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                    "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
                    static_cast<int>(major_a), static_cast<int>(major_b), static_cast<int>(mma_kind),
-                   c10::toString(a_dtype), c10::toString(b_dtype), c10::toString(cd_dtype),
+                   dg_dtype_to_string(a_dtype).c_str(), dg_dtype_to_string(b_dtype).c_str(), dg_dtype_to_string(cd_dtype).c_str(),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),

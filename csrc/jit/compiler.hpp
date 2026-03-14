@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>

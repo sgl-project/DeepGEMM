@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/python.h>
+#include "../../utils/tensor_view.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -77,15 +77,15 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                               const torch::Tensor& b, const torch::Tensor& sfb,
-                               const std::optional<torch::Tensor>& c,
-                               const torch::Tensor& d,
+static void sm90_fp8_gemm_1d2d(const DGTensorView& a, const DGTensorView& sfa,
+                               const DGTensorView& b, const DGTensorView& sfb,
+                               const std::optional<DGTensorView>& c,
+                               const DGTensorView& d,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
                                const std::optional<std::string>& epilogue_type = std::nullopt) {
-    DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(not c.has_value() and dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -140,14 +140,14 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     MAYBE_LAUNCH(SM90FP8Gemm1D2DRuntime::launch(runtime, args));
 }
 
-static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                                    const torch::Tensor& b, const torch::Tensor& sfb,
-                                                    const torch::Tensor& d,
-                                                    const torch::Tensor& m_indices,
+static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const DGTensorView& a, const DGTensorView& sfa,
+                                                    const DGTensorView& b, const DGTensorView& sfb,
+                                                    const DGTensorView& d,
+                                                    const DGTensorView& m_indices,
                                                     const int& num_groups, const int& m, const int& n, const int& k,
                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                     const std::string& compiled_dims) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -202,23 +202,23 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     MAYBE_LAUNCH(SM90FP8Gemm1D2DRuntime::launch(runtime, args));
 }
 
-static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                                const torch::Tensor& b, const torch::Tensor& sfb,
-                                                const torch::Tensor& d,
-                                                const torch::Tensor& masked_m,
+static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(const DGTensorView& a, const DGTensorView& sfa,
+                                                const DGTensorView& b, const DGTensorView& sfb,
+                                                const DGTensorView& d,
+                                                const DGTensorView& masked_m,
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const int& expected_m,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                                 const std::string& compiled_dims,
                                                 const int& max_block_n,
                                                 const bool& enable_overlap,
-                                                const c10::optional<torch::Tensor>& signal) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+                                                const std::optional<DGTensorView>& signal) {
+    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     if (enable_overlap) {
         DG_HOST_ASSERT(signal.has_value());
         DG_HOST_ASSERT(signal.value().is_contiguous());
-        DG_HOST_ASSERT(signal.value().scalar_type() == torch::kInt32);
+        DG_HOST_ASSERT(dg_dtype_eq(signal.value().scalar_type(), dg_dtype::Int32));
     }
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -274,14 +274,14 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
     return enable_overlap ? std::optional(std::make_pair(config.block_m, config.signal_threshold)) : std::nullopt;
 }
 
-static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
-                         const torch::Tensor& b, const torch::Tensor& sfb,
-                         const std::optional<torch::Tensor>& c,
-                         const torch::Tensor& d,
+static void sm90_fp8_bmm(const DGTensorView& a, const DGTensorView& sfa,
+                         const DGTensorView& b, const DGTensorView& sfb,
+                         const std::optional<DGTensorView>& c,
+                         const DGTensorView& d,
                          const int& batch_size, const int& m, const int& n, const int& k,
                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(

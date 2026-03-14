@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/python.h>
+#include "../../utils/tensor_view.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -63,10 +63,10 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
-                                      const torch::Tensor& b,
-                                      const torch::Tensor& d,
-                                      const torch::Tensor& sqr_sum,
+static void sm90_tf32_hc_prenorm_gemm(const DGTensorView& a,
+                                      const DGTensorView& b,
+                                      const DGTensorView& d,
+                                      const DGTensorView& sqr_sum,
                                       const int& m, const int& n, const int& k,
                                       const int& num_splits) {
     constexpr int block_m = 64;

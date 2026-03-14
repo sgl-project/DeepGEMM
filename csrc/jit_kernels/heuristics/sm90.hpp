@@ -21,12 +21,12 @@ struct SM90ArchSpec {
         return candidates;
     }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype, const int& max_block_n) {
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const DLDataType& cd_dtype, const int& max_block_n) {
         int start = 16;
 
         // Avoid bank conflicts for 1D1D kernel FP32 output
         std::vector<int> candidates;
-        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
+        if (kernel_type == KernelType::Kernel1D1D and dg_dtype_eq(cd_dtype, dg_dtype::Float32)) {
             candidates.push_back(16);
             start = 24;
         }
@@ -54,22 +54,22 @@ struct SM90ArchSpec {
         return block_n;
     }
 
-    static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
-        return cd_dtype != torch::kFloat;
+    static bool enable_cd_swizzle(const DLDataType& cd_dtype) {
+        return dg_dtype_ne(cd_dtype, dg_dtype::Float32);
     }
 
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+                                    const MmaKind& mma_kind, const DLDataType& cd_dtype,
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // SM90 FP32 output does not support `block_m == 256`
-        if (cd_dtype == at::kFloat and block_m == 256)
+        if (dg_dtype_eq(cd_dtype, dg_dtype::Float32) and block_m == 256)
             return false;
 
         // Avoid large C/D shared memory for FP32 output
         // Ensure `num_stages >= 4` (for 1D1D Kernel), `num_stages >= 3` (for No SF kernel)
-        if (block_n > 128 and cd_dtype == torch::kFloat) {
+        if (block_n > 128 and dg_dtype_eq(cd_dtype, dg_dtype::Float32)) {
             if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
                 return false;
             if (kernel_type == KernelType::KernelNoSF and block_n > 200)
@@ -89,7 +89,7 @@ struct SM90ArchSpec {
         return block_m <= 128 or block_n <= 128;
     }
 
-    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+    static bool is_num_stages_legal(const MmaKind& mma_kind, const DLDataType& cd_dtype,
                                     const int& num_stages,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // Unrolling both stages and `num_former_iters` will cause large code size
@@ -123,14 +123,14 @@ struct SM90ArchSpec {
 
     static int get_smem_cd_size(const KernelType& kernel_type,
                                 const int& block_m, const int& block_n,
-                                const int& swizzle_cd_mode, const at::ScalarType& cd_dtype) {
+                                const int& swizzle_cd_mode, const DLDataType& cd_dtype) {
         // NOTES: 1024 is for TMA swizzling alignment requirement
-        return align(block_m * block_n * static_cast<int>(c10::elementSize(cd_dtype)), 1024);
+        return align(block_m * block_n * dg_element_size(cd_dtype), 1024);
     }
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+                                                          const MmaKind& mma_kind, const DLDataType& cd_dtype) {
         if (mma_kind == MmaKind::BF16)
             return {0, 0};
 

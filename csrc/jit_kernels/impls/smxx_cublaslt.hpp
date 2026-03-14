@@ -1,13 +1,12 @@
 #pragma once
 
 #include <cublasLt.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDADataType.h>
 #include <cute/arch/mma_sm100_umma.hpp>
 
 #include "../../jit/device_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/compatibility.hpp"
+#include "../../utils/tensor_view.hpp"
 
 namespace deep_gemm {
 
@@ -31,9 +30,9 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                               const cublasLtMatrixLayout_t& layout_a,
                               const cublasLtMatrixLayout_t& layout_b,
                               const cublasLtMatrixLayout_t& layout_d,
-                              const torch::Tensor& a,
-                              const torch::Tensor& b,
-                              const torch::Tensor& d,
+                              const DGTensorView& a,
+                              const DGTensorView& b,
+                              const DGTensorView& d,
                               const bool& accumulate) {
     cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
     cudaDataType_t scale_type = CUDA_R_32F;
@@ -52,15 +51,16 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
 
 #if DG_FP8_COMPATIBLE and DG_CUBLASLT_ADVANCED_FEATURES_COMPATIBLE
     bool fp8_fast_accumulate = false;
-    if (a.scalar_type() == torch::kFloat8_e4m3fn)
+    if (dg_dtype_eq(a.scalar_type(), dg_dtype::Float8E4M3))
         DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fp8_fast_accumulate, sizeof(fp8_fast_accumulate)));
 #endif
 
     // Get cuBLASLt handle, workspace, and stream
     const auto& handle = device_runtime->get_cublaslt_handle();
-    const auto& workspace = device_runtime->get_cublaslt_workspace();
-    const auto& workspace_bytes = workspace.nbytes();
-    const auto& stream = at::cuda::getCurrentCUDAStream();
+    auto* workspace_ptr = device_runtime->get_cublaslt_workspace_ptr();
+    const auto workspace_bytes = device_runtime->get_cublaslt_workspace_bytes();
+    cudaStream_t stream = nullptr;
+    DG_CUDA_RUNTIME_CHECK(cudaGetDefaultStream(&stream));
 
     // Algorithm selection
     cublasLtMatmulPreference_t pref;
@@ -87,7 +87,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                                      d.data_ptr(), layout_d,                // C
                                      d.data_ptr(), layout_d,                // D
                                      &heuristic.algo,                       // Algorithm
-                                     workspace.data_ptr(), workspace_bytes, // Workspace
+                                     workspace_ptr, workspace_bytes,        // Workspace
                                      stream));                              // Stream
 
     // Free memory
@@ -98,9 +98,9 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulDescDestroy(desc));
 }
 
-static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
-                          const std::optional<torch::Tensor>& acc,
-                          const torch::Tensor& out,
+static void cublaslt_gemm(const DGTensorView& lhs, const DGTensorView& rhs,
+                          const std::optional<DGTensorView>& acc,
+                          const DGTensorView& out,
                           const int& m, const int& n, const int& k,
                           const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major) {
     const auto& trans_a = b_major == cute::UMMA::Major::K ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -110,16 +110,25 @@ static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
     // TODO: remove this
     if (acc.has_value()) {
         if (acc->data_ptr() == out.data_ptr()) {
-            DG_HOST_ASSERT(acc->sizes() == out.sizes() and acc->strides() == out.strides());
+            bool layout_match = (acc->dim() == out.dim());
+            if (layout_match) {
+                for (int i = 0; i < out.dim(); ++i) {
+                    if (acc->size(i) != out.size(i) || acc->stride(i) != out.stride(i)) {
+                        layout_match = false;
+                        break;
+                    }
+                }
+            }
+            DG_HOST_ASSERT(layout_match);
         } else {
-            out.copy_(acc.value());
+            DG_CUDA_RUNTIME_CHECK(cudaMemcpy(out.data_ptr(), acc->data_ptr(), out.nbytes(), cudaMemcpyDeviceToDevice));
         }
     }
 
     // Matrix layouts
-    const auto& cuda_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
-    const auto& cuda_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto& cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto& cuda_type_a = dg_dtype_to_cublas(rhs.scalar_type());
+    const auto& cuda_type_b = dg_dtype_to_cublas(lhs.scalar_type());
+    const auto& cuda_type_d = dg_dtype_to_cublas(out.scalar_type());
     const auto& layout_a = b_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_a, k, n, rhs.stride(0))
                                                            : get_cublaslt_layout(cuda_type_a, n, k, rhs.stride(1));
     const auto& layout_b = a_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_b, k, m, lhs.stride(0))
@@ -130,7 +139,7 @@ static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
 }
 
 
-static void cublaslt_bhr_hdr_bhd(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
+static void cublaslt_bhr_hdr_bhd(const DGTensorView& lhs, const DGTensorView& rhs, const DGTensorView& out,
                                  const int& b, const int& h, const int& r, const int& d) {
     const auto& m = d, n = b, k = r;
     const auto& trans_a = CUBLAS_OP_T;
@@ -145,7 +154,7 @@ static void cublaslt_bhr_hdr_bhd(const torch::Tensor& lhs, const torch::Tensor& 
 }
 
 
-static void cublaslt_bhd_hdr_bhr(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
+static void cublaslt_bhd_hdr_bhr(const DGTensorView& lhs, const DGTensorView& rhs, const DGTensorView& out,
                                  const int& b, const int& h, const int& r, const int& d) {
     const auto& m = r, n = b, k = d;
     const auto& trans_a = CUBLAS_OP_N;
