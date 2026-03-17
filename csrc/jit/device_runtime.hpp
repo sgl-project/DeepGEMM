@@ -1,7 +1,8 @@
 #pragma once
 
 #include <cublasLt.h>
-#include <cuda_runtime.h>
+#include <torch/version.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
@@ -13,36 +14,29 @@ class DeviceRuntime {
     std::shared_ptr<cudaDeviceProp> cached_prop;
     int compile_mode = 0;
 
+    // cuBLASLt utils
     static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
 
 public:
+    // Create the cuBLASLt handle ourselves
     cublasLtHandle_t cublaslt_handle{};
-    void* cublaslt_workspace_ptr = nullptr;
-    size_t cublaslt_workspace_bytes = kCublasLtWorkspaceSize;
+    std::shared_ptr<torch::Tensor> cublaslt_workspace;
 
     explicit DeviceRuntime() {
-        DG_CUDA_RUNTIME_CHECK(cudaMalloc(&cublaslt_workspace_ptr, kCublasLtWorkspaceSize));
+        cublaslt_workspace = std::make_shared<torch::Tensor>(torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA)));
         DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));
     }
 
     ~DeviceRuntime() noexcept(false) {
         DG_CUBLASLT_CHECK(cublasLtDestroy(cublaslt_handle));
-        if (cublaslt_workspace_ptr) {
-            cudaFree(cublaslt_workspace_ptr);
-            cublaslt_workspace_ptr = nullptr;
-        }
     }
 
     cublasLtHandle_t get_cublaslt_handle() const {
         return cublaslt_handle;
     }
 
-    void* get_cublaslt_workspace_ptr() const {
-        return cublaslt_workspace_ptr;
-    }
-
-    size_t get_cublaslt_workspace_bytes() const {
-        return cublaslt_workspace_bytes;
+    torch::Tensor get_cublaslt_workspace() const {
+        return *cublaslt_workspace;
     }
 
     std::shared_ptr<cudaDeviceProp> get_prop() {

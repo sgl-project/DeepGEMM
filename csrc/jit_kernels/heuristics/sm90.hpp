@@ -26,7 +26,7 @@ struct SM90ArchSpec {
 
         // Avoid bank conflicts for 1D1D kernel FP32 output
         std::vector<int> candidates;
-        if (kernel_type == KernelType::Kernel1D1D and ((cd_dtype) == (at::kFloat))) {
+        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
             candidates.push_back(16);
             start = 24;
         }
@@ -55,7 +55,7 @@ struct SM90ArchSpec {
     }
 
     static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
-        return ((cd_dtype) != (at::kFloat));
+        return cd_dtype != torch::kFloat;
     }
 
     static bool is_block_size_legal(const KernelType& kernel_type,
@@ -64,12 +64,12 @@ struct SM90ArchSpec {
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // SM90 FP32 output does not support `block_m == 256`
-        if (((cd_dtype) == (at::kFloat)) and block_m == 256)
+        if (cd_dtype == at::kFloat and block_m == 256)
             return false;
 
         // Avoid large C/D shared memory for FP32 output
         // Ensure `num_stages >= 4` (for 1D1D Kernel), `num_stages >= 3` (for No SF kernel)
-        if (block_n > 128 and ((cd_dtype) == (at::kFloat))) {
+        if (block_n > 128 and cd_dtype == torch::kFloat) {
             if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
                 return false;
             if (kernel_type == KernelType::KernelNoSF and block_n > 200)
@@ -125,7 +125,7 @@ struct SM90ArchSpec {
                                 const int& block_m, const int& block_n,
                                 const int& swizzle_cd_mode, const at::ScalarType& cd_dtype) {
         // NOTES: 1024 is for TMA swizzling alignment requirement
-        return align(static_cast<int>(block_m * block_n * c10::elementSize(cd_dtype)), 1024);
+        return align(block_m * block_n * static_cast<int>(c10::elementSize(cd_dtype)), 1024);
     }
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,

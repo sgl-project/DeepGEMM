@@ -1,7 +1,5 @@
 #pragma once
 
-#include <set>
-
 #include <deep_gemm/common/types.hpp>
 
 #include "../../utils/math.hpp"
@@ -9,10 +7,6 @@
 #include "../../utils/system.hpp"
 
 namespace deep_gemm {
-
-static uint32_t dtype_to_key(at::ScalarType dt) {
-    return static_cast<uint32_t>(dt);
-}
 
 struct MulticastConfig {
     int num_multicast;
@@ -111,7 +105,7 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
                                           const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                           const int& num_stages, const MulticastConfig& multicast_config) {
     const int& ab_elem_size = static_cast<int>(get_element_size(mma_kind));
-    const int& cd_elem_size = c10::elementSize(cd_dtype);
+    const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
 
     const int& load_block_m = ArchSpec::get_ab_load_block_m(multicast_config, block_m);
     const int& load_block_n = ArchSpec::get_ab_load_block_n(multicast_config, block_n);
@@ -164,14 +158,14 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const at::ScalarType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms,
                                   const int& max_block_n = 256, const bool& enable_overlap = false) {
-    const auto mma_kind = (((a_dtype) == (at::kBFloat16)) ? MmaKind::BF16 : MmaKind::MXFP8FP4);
+    const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
     if (mma_kind == MmaKind::BF16) {
-        DG_HOST_ASSERT(((a_dtype) == (at::kBFloat16)) and ((b_dtype) == (at::kBFloat16)));
+        DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
     } else {
-        DG_HOST_ASSERT(((a_dtype) == (at::kFloat8_e4m3fn)) or ((a_dtype) == (deep_gemm::kPackedFP4)));
-        DG_HOST_ASSERT(((b_dtype) == (at::kFloat8_e4m3fn)) or ((b_dtype) == (deep_gemm::kPackedFP4)));
+        DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
+        DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
     }
-    DG_HOST_ASSERT(((cd_dtype) == (at::kBFloat16)) or ((cd_dtype) == (at::kFloat)));
+    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
     auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
@@ -183,9 +177,9 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
-    if (((a_dtype) == (deep_gemm::kPackedFP4)) and major_a == cute::UMMA::Major::MN)
+    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
         block_ms = std::vector{128};
-    if (((b_dtype) == (deep_gemm::kPackedFP4)) and major_b == cute::UMMA::Major::MN)
+    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
         block_ns = std::vector{128};
 
     // K block size is selected in a fixed manner
@@ -247,9 +241,9 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
-    if (((a_dtype) == (deep_gemm::kPackedFP4)) and major_a == cute::UMMA::Major::MN)
+    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
         is_legal_on_a = false;
-    if (((b_dtype) == (deep_gemm::kPackedFP4)) and major_b == cute::UMMA::Major::MN)
+    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
         is_legal_on_b = false;
 
     const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
@@ -325,7 +319,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
-                                   mma_kind, dtype_to_key(a_dtype), dtype_to_key(b_dtype), dtype_to_key(cd_dtype), with_accumulation, num_sms);
+                                   mma_kind, a_dtype, b_dtype, cd_dtype, with_accumulation, num_sms);
         static std::set<decltype(key)> printed;
         if (printed.count(key) == 0) {
             printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
@@ -335,7 +329,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                    "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
                    static_cast<int>(major_a), static_cast<int>(major_b), static_cast<int>(mma_kind),
-                   dtype_to_string(a_dtype).c_str(), dtype_to_string(b_dtype).c_str(), dtype_to_string(cd_dtype).c_str(),
+                   c10::toString(a_dtype), c10::toString(b_dtype), c10::toString(cd_dtype),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),

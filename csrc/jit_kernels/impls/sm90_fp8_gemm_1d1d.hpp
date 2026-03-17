@@ -1,7 +1,6 @@
 #pragma once
 
-#include <torch/torch.h>
-#include "../../utils/torch_compat.hpp"
+#include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -83,7 +82,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and ((d.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -149,7 +148,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                          const torch::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and ((d.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // Get config using max K for better performance

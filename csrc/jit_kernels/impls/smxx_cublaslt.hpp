@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cublasLt.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
 #include <cute/arch/mma_sm100_umma.hpp>
 
 #include "../../jit/device_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/compatibility.hpp"
-#include <torch/torch.h>
-#include "../../utils/torch_compat.hpp"
 
 namespace deep_gemm {
 
@@ -52,15 +52,15 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
 
 #if DG_FP8_COMPATIBLE and DG_CUBLASLT_ADVANCED_FEATURES_COMPATIBLE
     bool fp8_fast_accumulate = false;
-    if (((a.scalar_type()) == (at::kFloat8_e4m3fn)))
+    if (a.scalar_type() == torch::kFloat8_e4m3fn)
         DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fp8_fast_accumulate, sizeof(fp8_fast_accumulate)));
 #endif
 
     // Get cuBLASLt handle, workspace, and stream
     const auto& handle = device_runtime->get_cublaslt_handle();
-    auto* workspace_ptr = device_runtime->get_cublaslt_workspace_ptr();
-    const auto workspace_bytes = device_runtime->get_cublaslt_workspace_bytes();
-    cudaStream_t stream = get_current_cuda_stream();
+    const auto& workspace = device_runtime->get_cublaslt_workspace();
+    const auto& workspace_bytes = workspace.nbytes();
+    const auto& stream = at::cuda::getCurrentCUDAStream();
 
     // Algorithm selection
     cublasLtMatmulPreference_t pref;
@@ -87,7 +87,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                                      d.data_ptr(), layout_d,                // C
                                      d.data_ptr(), layout_d,                // D
                                      &heuristic.algo,                       // Algorithm
-                                     workspace_ptr, workspace_bytes,        // Workspace
+                                     workspace.data_ptr(), workspace_bytes, // Workspace
                                      stream));                              // Stream
 
     // Free memory
@@ -110,25 +110,16 @@ static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
     // TODO: remove this
     if (acc.has_value()) {
         if (acc->data_ptr() == out.data_ptr()) {
-            bool layout_match = (acc->dim() == out.dim());
-            if (layout_match) {
-                for (int i = 0; i < out.dim(); ++i) {
-                    if (acc->size(i) != out.size(i) || acc->stride(i) != out.stride(i)) {
-                        layout_match = false;
-                        break;
-                    }
-                }
-            }
-            DG_HOST_ASSERT(layout_match);
+            DG_HOST_ASSERT(acc->sizes() == out.sizes() and acc->strides() == out.strides());
         } else {
-            DG_CUDA_RUNTIME_CHECK(cudaMemcpy(out.data_ptr(), acc->data_ptr(), out.nbytes(), cudaMemcpyDeviceToDevice));
+            out.copy_(acc.value());
         }
     }
 
     // Matrix layouts
-    const auto& cuda_type_a = dtype_to_cublas(rhs.scalar_type());
-    const auto& cuda_type_b = dtype_to_cublas(lhs.scalar_type());
-    const auto& cuda_type_d = dtype_to_cublas(out.scalar_type());
+    const auto& cuda_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
+    const auto& cuda_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
+    const auto& cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
     const auto& layout_a = b_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_a, k, n, rhs.stride(0))
                                                            : get_cublaslt_layout(cuda_type_a, n, k, rhs.stride(1));
     const auto& layout_b = a_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_b, k, m, lhs.stride(0))

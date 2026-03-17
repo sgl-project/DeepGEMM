@@ -1,7 +1,6 @@
 #pragma once
 
-#include <torch/torch.h>
-#include "../../utils/torch_compat.hpp"
+#include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -130,7 +129,7 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                 const std::string& compiled_dims) {
-    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 
@@ -185,7 +184,7 @@ static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
                                             const int& expected_m,
                                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                             const std::string& compiled_dims) {
-    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 

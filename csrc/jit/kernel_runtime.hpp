@@ -3,8 +3,6 @@
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/system.hpp"
-#include <torch/torch.h>
-#include "../utils/torch_compat.hpp"
 #include "device_runtime.hpp"
 #include "handle.hpp"
 
@@ -31,13 +29,17 @@ public:
     KernelHandle kernel;
 
     explicit KernelRuntime(const std::filesystem::path& dir_path) {
+        // Check `prepare_init`
         DG_HOST_ASSERT(not cuda_home.empty());
 
+        // NOLINT(*-pro-type-member-init)
         const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump";
         const auto& cubin_path = dir_path / "kernel.cubin";
         if (get_env<int>("DG_JIT_DEBUG"))
             printf("Loading CUBIN: %s\n", cubin_path.c_str());
 
+        // Find the only symbol
+        // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
         const auto& [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
         DG_HOST_ASSERT(exit_code == 0);
@@ -58,6 +60,7 @@ public:
             printf("\n");
         }
 
+        // Load from the library
         DG_HOST_ASSERT(symbol_names.size() == 1);
         kernel = load_kernel(cubin_path, symbol_names[0], &library);
     }
@@ -92,8 +95,7 @@ public:
     template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         const auto& kernel = kernel_runtime->kernel;
-        cudaStream_t stream = get_current_cuda_stream();
-
+        const auto& stream = at::cuda::getCurrentCUDAStream();
         const LaunchArgs& launch_args = args.launch_args;
 
         const dim3& grid_dim = {static_cast<unsigned>(launch_args.grid_dim.first),
@@ -103,10 +105,11 @@ public:
         auto config = construct_launch_config(kernel, stream, launch_args.smem_size,
                                               grid_dim, block_dim, launch_args.cluster_dim);
 
+        // Launch in the derived class
         if (get_env<int>("DG_JIT_DEBUG")) {
-            printf("Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: %d\n",
+            printf("Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: %d, stream: %ld\n",
                    launch_args.grid_dim.first, launch_args.grid_dim.second, launch_args.num_threads,
-                   launch_args.smem_size, launch_args.cluster_dim);
+                   launch_args.smem_size, launch_args.cluster_dim, stream.id());
         }
         Derived::launch_impl(kernel, config, args);
     }

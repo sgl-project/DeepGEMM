@@ -1,9 +1,13 @@
 #pragma once
 
-#include <torch/torch.h>
-#include "torch_compat.hpp"
+#include <torch/python.h>
+
+#include "exception.hpp"
 
 namespace deep_gemm {
+
+// TODO: Use `torch::kFloat4_e2m1fn_x2`
+constexpr auto kPackedFP4 = torch::kUInt8;
 
 template <typename T>
 static T ceil_div(const T& a, const T& b) {
