@@ -49,12 +49,6 @@ def get_package_version():
     revision = ''
     if DG_USE_LOCAL_VERSION:
         try:
-            status_cmd = ['git', 'status', '--porcelain']
-            status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
-            if status_output:
-                print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
-                assert False, 'Git working directory is not clean'
-
             cmd = ['git', 'rev-parse', '--short', 'HEAD']
             revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
