@@ -17,17 +17,17 @@
 namespace deep_gemm::gemm {
 
 static bool early_return(const int& m, const int &n, const int& k,
-                         const DGTensorView& d, const std::optional<DGTensorView>& c) {
+                         const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     if (m == 0 or n == 0)
         return true;
 
     const bool is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
     if (is_cd_same)
-        DG_HOST_ASSERT(c->same_shape(d) and c->same_strides(d));
+        DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
     if (c.has_value()) {
         check_major_type_cd(c.value());
-        DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
-        DG_HOST_ASSERT(dg_dtype_eq(c.value().scalar_type(), dg_dtype::Float32));
+        DG_HOST_ASSERT(((d.scalar_type()) == (at::kFloat)));
+        DG_HOST_ASSERT(((c.value().scalar_type()) == (at::kFloat)));
     }
 
     if (k == 0) {
@@ -49,10 +49,10 @@ static bool early_return(const int& m, const int &n, const int& k,
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 
-static void fp8_fp4_gemm_nt(const DGTensorView& a_data, const DGTensorView& a_sf,
-                            const DGTensorView& b_data, const DGTensorView& b_sf,
-                            const DGTensorView& d,
-                            const std::optional<DGTensorView>& c,
+static void fp8_fp4_gemm_nt(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                            const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                            const torch::Tensor& d,
+                            const std::optional<torch::Tensor>& c,
                             std::optional<std::tuple<int, int, int>> recipe,
                             std::optional<std::tuple<int, int>> recipe_a,
                             std::optional<std::tuple<int, int>> recipe_b,
@@ -72,7 +72,7 @@ static void fp8_fp4_gemm_nt(const DGTensorView& a_data, const DGTensorView& a_sf
     const auto [n , k_] = check_ab_fp8_fp4(b_data, major_b, arch_major);
     const auto [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16) or dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)) or ((d.scalar_type()) == (at::kFloat)));
 
     if (early_return(m, n, k, d, c))
         return;
@@ -84,7 +84,7 @@ static void fp8_fp4_gemm_nt(const DGTensorView& a_data, const DGTensorView& a_sf
     const auto gran_k_a = sf_result.gran_k_a;
     const auto gran_k_b = sf_result.gran_k_b;
 
-    if (arch_major == 9 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Float32)) {
+    if (arch_major == 9 and ((sfa.scalar_type()) == (at::kFloat))) {
         const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
         if (gran_n == 1) {
             sm90_fp8_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
@@ -92,7 +92,7 @@ static void fp8_fp4_gemm_nt(const DGTensorView& a_data, const DGTensorView& a_sf
             const auto& major_sfb = get_major_type_ab(sfb);
             sm90_fp8_gemm_1d2d(a_data, sfa, b_data, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
-    } else if (arch_major == 10 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Int32)) {
+    } else if (arch_major == 10 and ((sfa.scalar_type()) == (at::kInt))) {
         sm100_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims);
     } else {
@@ -100,10 +100,10 @@ static void fp8_fp4_gemm_nt(const DGTensorView& a_data, const DGTensorView& a_sf
     }
 }
 
-static void fp8_fp4_gemm_nn(const DGTensorView& a_data, const DGTensorView& a_sf,
-                            const DGTensorView& b_data, const DGTensorView& b_sf,
-                            const DGTensorView& d,
-                            const std::optional<DGTensorView>& c,
+static void fp8_fp4_gemm_nn(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                            const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                            const torch::Tensor& d,
+                            const std::optional<torch::Tensor>& c,
                             const std::optional<std::tuple<int, int, int>>& recipe,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
@@ -113,10 +113,10 @@ static void fp8_fp4_gemm_nn(const DGTensorView& a_data, const DGTensorView& a_sf
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
 }
 
-static void fp8_fp4_gemm_tn(const DGTensorView& a_data, const DGTensorView& a_sf,
-                            const DGTensorView& b_data, const DGTensorView& b_sf,
-                            const DGTensorView& d,
-                            const std::optional<DGTensorView>& c,
+static void fp8_fp4_gemm_tn(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                            const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                            const torch::Tensor& d,
+                            const std::optional<torch::Tensor>& c,
                             const std::optional<std::tuple<int, int, int>>& recipe,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
@@ -127,10 +127,10 @@ static void fp8_fp4_gemm_tn(const DGTensorView& a_data, const DGTensorView& a_sf
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
 }
 
-static void fp8_fp4_gemm_tt(const DGTensorView& a_data, const DGTensorView& a_sf,
-                            const DGTensorView& b_data, const DGTensorView& b_sf,
-                            const DGTensorView& d,
-                            const std::optional<DGTensorView>& c,
+static void fp8_fp4_gemm_tt(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                            const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                            const torch::Tensor& d,
+                            const std::optional<torch::Tensor>& c,
                             const std::optional<std::tuple<int, int, int>>& recipe,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
@@ -140,10 +140,10 @@ static void fp8_fp4_gemm_tt(const DGTensorView& a_data, const DGTensorView& a_sf
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
 }
 
-static void m_grouped_fp8_fp4_gemm_nt_contiguous(const DGTensorView& a_data, const DGTensorView& a_sf,
-                                                 const DGTensorView& b_data, const DGTensorView& b_sf,
-                                                 const DGTensorView& d,
-                                                 const DGTensorView& grouped_layout,
+static void m_grouped_fp8_fp4_gemm_nt_contiguous(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                                 const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& grouped_layout,
                                                  std::optional<std::tuple<int, int, int>> recipe,
                                                  std::optional<std::tuple<int, int>> recipe_a,
                                                  std::optional<std::tuple<int, int>> recipe_b,
@@ -164,8 +164,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const DGTensorView& a_data, con
     const auto [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(grouped_layout.scalar_type(), dg_dtype::Int32));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((grouped_layout.scalar_type()) == (at::kInt)));
 
     if (use_psum_layout) {
         const auto& [num_groups_] = get_shape<1>(grouped_layout);
@@ -188,12 +188,12 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const DGTensorView& a_data, con
     const auto gran_k_a = sf_result.gran_k_a;
     const auto gran_k_b = sf_result.gran_k_b;
 
-    if (arch_major == 9 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Float32)) {
+    if (arch_major == 9 and ((sfa.scalar_type()) == (at::kFloat))) {
         const auto& major_sfb = get_major_type_ab(sfb);
         DG_HOST_ASSERT(not use_psum_layout);
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a_data, sfa, b_data, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb, compiled_dims);
-    } else if (arch_major == 10 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Int32)) {
+    } else if (arch_major == 10 and ((sfa.scalar_type()) == (at::kInt))) {
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a_data, sfa, b_data, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
@@ -202,10 +202,10 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const DGTensorView& a_data, con
     }
 }
 
-static void m_grouped_fp8_fp4_gemm_nn_contiguous(const DGTensorView& a_data, const DGTensorView& a_sf,
-                                                 const DGTensorView& b_data, const DGTensorView& b_sf,
-                                                 const DGTensorView& d,
-                                                 const DGTensorView& grouped_layout,
+static void m_grouped_fp8_fp4_gemm_nn_contiguous(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                                 const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                                 const torch::Tensor& d,
+                                                 const torch::Tensor& grouped_layout,
                                                  const std::optional<std::tuple<int, int, int>>& recipe,
                                                  const std::optional<std::tuple<int, int>>& recipe_a,
                                                  const std::optional<std::tuple<int, int>>& recipe_b,
@@ -217,10 +217,10 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const DGTensorView& a_data, con
 }
 
 static std::tuple<std::optional<int64_t>, std::optional<int64_t>> m_grouped_fp8_fp4_gemm_nt_masked(
-                                             const DGTensorView& a_data, const DGTensorView& a_sf,
-                                             const DGTensorView& b_data, const DGTensorView& b_sf,
-                                             const DGTensorView& d,
-                                             const DGTensorView& masked_m,
+                                             const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                             const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                             const torch::Tensor& d,
+                                             const torch::Tensor& masked_m,
                                              const int& expected_m,
                                              std::optional<std::tuple<int, int, int>> recipe,
                                              std::optional<std::tuple<int, int>> recipe_a,
@@ -229,7 +229,7 @@ static std::tuple<std::optional<int64_t>, std::optional<int64_t>> m_grouped_fp8_
                                              const bool& disable_ue8m0_cast,
                                              const int& max_block_n,
                                              const bool& enable_overlap,
-                                             const std::optional<DGTensorView>& signal) {
+                                             const std::optional<torch::Tensor>& signal) {
     const auto& major_a = get_major_type_ab(a_data);
     const auto& major_b = get_major_type_ab(b_data);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
@@ -243,8 +243,8 @@ static std::tuple<std::optional<int64_t>, std::optional<int64_t>> m_grouped_fp8_
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(masked_m.scalar_type(), dg_dtype::Int32));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((masked_m.scalar_type()) == (at::kInt)));
 
     check_major_type_cd(d);
 
@@ -256,12 +256,12 @@ static std::tuple<std::optional<int64_t>, std::optional<int64_t>> m_grouped_fp8_
     const auto gran_k_b = sf_result.gran_k_b;
 
     std::optional<std::pair<int, int>> overlap_result = std::nullopt;
-    if (arch_major == 9 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Float32)) {
+    if (arch_major == 9 and ((sfa.scalar_type()) == (at::kFloat))) {
         const auto& major_sfb = get_major_type_ab(sfb);
         overlap_result = sm90_m_grouped_fp8_gemm_masked_1d2d(a_data, sfa, b_data, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims,
                                             max_block_n, enable_overlap, signal);
-    } else if (arch_major == 10 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Int32)) {
+    } else if (arch_major == 10 and ((sfa.scalar_type()) == (at::kInt))) {
         DG_HOST_ASSERT(not enable_overlap);
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a_data, sfa, b_data, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
@@ -279,12 +279,12 @@ static std::tuple<std::optional<int64_t>, std::optional<int64_t>> m_grouped_fp8_
     );
 }
 
-static void k_grouped_fp8_gemm_tn_contiguous(const DGTensorView& a_data, const DGTensorView& a_sf,
-                                             const DGTensorView& b_data, const DGTensorView& b_sf,
-                                             const DGTensorView& d,
+static void k_grouped_fp8_gemm_tn_contiguous(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                             const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                             const torch::Tensor& d,
                                              const std::vector<int>& ks,
-                                             const DGTensorView& ks_tensor,
-                                             const std::optional<DGTensorView>& c,
+                                             const torch::Tensor& ks_tensor,
+                                             const std::optional<torch::Tensor>& c,
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims) {
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
@@ -317,12 +317,12 @@ static void k_grouped_fp8_gemm_tn_contiguous(const DGTensorView& a_data, const D
     }
 }
 
-static void k_grouped_fp8_gemm_nt_contiguous(const DGTensorView& a_data, const DGTensorView& a_sf,
-                                             const DGTensorView& b_data, const DGTensorView& b_sf,
-                                             const DGTensorView& d,
+static void k_grouped_fp8_gemm_nt_contiguous(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                             const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                             const torch::Tensor& d,
                                              const std::vector<int>& ks,
-                                             const DGTensorView& ks_tensor,
-                                             const std::optional<DGTensorView>& c,
+                                             const torch::Tensor& ks_tensor,
+                                             const std::optional<torch::Tensor>& c,
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims) {
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
@@ -349,10 +349,9 @@ static void k_grouped_fp8_gemm_nt_contiguous(const DGTensorView& a_data, const D
 
     // Allocate tensormap buffer (double buffering for both A and B: 2 * 2 = 4)
     const auto& num_sms = device_runtime->get_num_sms();
-    const size_t tm_buf_size = static_cast<size_t>(num_sms) * 4 * sizeof(CUtensorMap);
-    DGBuffer tm_buf(tm_buf_size);
-    DGTensorView tensor_map_buffer = DGTensorView::from_ptr(
-        tm_buf.ptr, dg_dtype::UInt8, {static_cast<int64_t>(tm_buf_size)}, a_data.device_id_val());
+    const int64_t tm_buf_size = static_cast<int64_t>(num_sms) * 4 * sizeof(CUtensorMap);
+    auto tensor_map_buffer = torch::empty({tm_buf_size},
+        torch::TensorOptions().dtype(at::kByte).device(a_data.device()));
 
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
@@ -365,10 +364,10 @@ static void k_grouped_fp8_gemm_nt_contiguous(const DGTensorView& a_data, const D
 #endif
 
 #if DG_TENSORMAP_COMPATIBLE
-static void bf16_gemm_nt(const DGTensorView& a,
-                         const DGTensorView& b,
-                         const DGTensorView& d,
-                         const std::optional<DGTensorView>& c,
+static void bf16_gemm_nt(const torch::Tensor& a,
+                         const torch::Tensor& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims) {
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
@@ -379,9 +378,9 @@ static void bf16_gemm_nt(const DGTensorView& a,
     const auto& [n , k_] = get_shape<2>(b);
     const auto& [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16) or dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)) or ((d.scalar_type()) == (at::kFloat)));
 
     if (early_return(m, n, k, d, c))
         return;
@@ -396,32 +395,32 @@ static void bf16_gemm_nt(const DGTensorView& a,
     }
 }
 
-static void bf16_gemm_nn(const DGTensorView& a,
-                         const DGTensorView& b,
-                         const DGTensorView& d,
-                         const std::optional<DGTensorView>& c,
+static void bf16_gemm_nn(const torch::Tensor& a,
+                         const torch::Tensor& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims) {
     bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims);
 }
 
-static void bf16_gemm_tn(const DGTensorView& a,
-                         const DGTensorView& b,
-                         const DGTensorView& d,
-                         const std::optional<DGTensorView>& c,
+static void bf16_gemm_tn(const torch::Tensor& a,
+                         const torch::Tensor& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims) {
     bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims);
 }
 
-static void bf16_gemm_tt(const DGTensorView& a,
-                         const DGTensorView& b,
-                         const DGTensorView& d,
-                         const std::optional<DGTensorView>& c,
+static void bf16_gemm_tt(const torch::Tensor& a,
+                         const torch::Tensor& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims) {
     bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims);
 }
 
-static void m_grouped_bf16_gemm_nt_contiguous(const DGTensorView& a, const DGTensorView& b,
-                                              const DGTensorView& d, const DGTensorView& grouped_layout,
+static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
+                                              const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
                                               const std::optional<int>& expected_m_for_psum_layout) {
@@ -435,10 +434,10 @@ static void m_grouped_bf16_gemm_nt_contiguous(const DGTensorView& a, const DGTen
     const auto& [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(grouped_layout.scalar_type(), dg_dtype::Int32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((grouped_layout.scalar_type()) == (at::kInt)));
 
     if (use_psum_layout) {
         const auto& [num_groups_] = get_shape<1>(grouped_layout);
@@ -468,16 +467,16 @@ static void m_grouped_bf16_gemm_nt_contiguous(const DGTensorView& a, const DGTen
     }
 }
 
-static void m_grouped_bf16_gemm_nn_contiguous(const DGTensorView& a, const DGTensorView& b,
-                                              const DGTensorView& d, const DGTensorView& grouped_layout,
+static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torch::Tensor& b,
+                                              const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout) {
     m_grouped_bf16_gemm_nt_contiguous(a, b.transpose(1, 2),
                                       d, grouped_layout, compiled_dims, use_psum_layout, std::nullopt);
 }
 
-static void m_grouped_bf16_gemm_nt_masked(const DGTensorView& a, const DGTensorView& b,
-                                          const DGTensorView& d, const DGTensorView& masked_m,
+static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
+                                          const torch::Tensor& d, const torch::Tensor& masked_m,
                                           const int& expected_m, const std::string& compiled_dims) {
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
@@ -491,10 +490,10 @@ static void m_grouped_bf16_gemm_nt_masked(const DGTensorView& a, const DGTensorV
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(masked_m.scalar_type(), dg_dtype::Int32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((masked_m.scalar_type()) == (at::kInt)));
 
     check_major_type_cd(d);
 
@@ -510,12 +509,12 @@ static void m_grouped_bf16_gemm_nt_masked(const DGTensorView& a, const DGTensorV
     }
 }
 
-static void k_grouped_bf16_gemm_tn_contiguous(const DGTensorView& a,
-                                              const DGTensorView& b,
-                                              const DGTensorView& d,
+static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
+                                              const torch::Tensor& b,
+                                              const torch::Tensor& d,
                                               const std::vector<int>& ks,
-                                              const DGTensorView& ks_tensor,
-                                              const std::optional<DGTensorView>& c,
+                                              const torch::Tensor& ks_tensor,
+                                              const std::optional<torch::Tensor>& c,
                                               const std::string& compiled_dims) {
     const auto& [num_groups, m, n] = get_shape<3>(d);
     const auto& [sum_k_ , m_] = get_shape<2>(a);
@@ -544,8 +543,8 @@ static void k_grouped_bf16_gemm_tn_contiguous(const DGTensorView& a,
 }
 #endif
 
-static void cublaslt_gemm_nt(const DGTensorView& a, const DGTensorView& b,
-                             const DGTensorView& d, const std::optional<DGTensorView>& c) {
+static void cublaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     const auto& major_a = get_major_type_ab(a);
     const auto& major_b = get_major_type_ab(b);
 
@@ -560,18 +559,18 @@ static void cublaslt_gemm_nt(const DGTensorView& a, const DGTensorView& b,
     cublaslt_gemm(a, b, c, d, m, n, k, major_a, major_b);
 }
 
-static void cublaslt_gemm_nn(const DGTensorView& a, const DGTensorView& b,
-                             const DGTensorView& d, const std::optional<DGTensorView>& c) {
+static void cublaslt_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     cublaslt_gemm_nt(a, b.transpose(0, 1), d, c);
 }
 
-static void cublaslt_gemm_tn(const DGTensorView& a, const DGTensorView& b,
-                             const DGTensorView& d, const std::optional<DGTensorView>& c) {
+static void cublaslt_gemm_tn(const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     cublaslt_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c);
 }
 
-static void cublaslt_gemm_tt(const DGTensorView& a, const DGTensorView& b,
-                             const DGTensorView& d, const std::optional<DGTensorView>& c) {
+static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
+                             const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 

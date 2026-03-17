@@ -55,8 +55,16 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
     if int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')):
         extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
 
+    # Torch include/lib paths
+    torch_dir = os.path.dirname(torch.__file__)
+    torch_include = os.path.join(torch_dir, 'include')
+    torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
+    torch_lib = os.path.join(torch_dir, 'lib')
+
     extra_include_paths = [
         f'{cuda_home}/include',
+        torch_include,
+        torch_include_csrc,
         os.path.join(root_dir, 'deep_gemm', 'include'),
         os.path.join(root_dir, 'third-party', 'cutlass', 'include'),
         os.path.join(root_dir, 'third-party', 'fmt', 'include'),
@@ -67,10 +75,16 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
 
     extra_ldflags = [
         f'-L{cuda_home}/lib64',
+        f'-L{torch_lib}',
         '-lcudart',
         '-lnvrtc',
         '-lcublasLt',
         '-lcublas',
+        '-ltorch',
+        '-ltorch_cpu',
+        '-lc10',
+        '-lc10_cuda',
+        '-ltorch_cuda',
     ]
 
     build_dir = os.path.join(pkg_dir, '_C_build')

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -72,10 +73,10 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_bf16_gemm(const DGTensorView& a,
-                           const DGTensorView& b,
-                           const std::optional<DGTensorView>& c,
-                           const DGTensorView& d,
+static void sm90_bf16_gemm(const torch::Tensor& a,
+                           const torch::Tensor& b,
+                           const std::optional<torch::Tensor>& c,
+                           const torch::Tensor& d,
                            const int& m, const int& n, const int& k,
                            const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                            const std::string& compiled_dims) {
@@ -122,14 +123,14 @@ static void sm90_bf16_gemm(const DGTensorView& a,
     MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
-static void sm90_m_grouped_bf16_gemm_contiguous(const DGTensorView& a,
-                                                const DGTensorView& b,
-                                                const DGTensorView& d,
-                                                const DGTensorView& m_indices,
+static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
+                                                const torch::Tensor& b,
+                                                const torch::Tensor& d,
+                                                const torch::Tensor& m_indices,
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                 const std::string& compiled_dims) {
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 
@@ -176,15 +177,15 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const DGTensorView& a,
     MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
-static void sm90_bf16_m_grouped_gemm_masked(const DGTensorView& a,
-                                            const DGTensorView& b,
-                                            const DGTensorView& d,
-                                            const DGTensorView& masked_m,
+static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
+                                            const torch::Tensor& b,
+                                            const torch::Tensor& d,
+                                            const torch::Tensor& masked_m,
                                             const int& num_groups, const int& m, const int& n, const int& k,
                                             const int& expected_m,
                                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                             const std::string& compiled_dims) {
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(k % 64 == 0);
 
@@ -231,12 +232,12 @@ static void sm90_bf16_m_grouped_gemm_masked(const DGTensorView& a,
     MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
-static void sm90_bf16_k_grouped_gemm(const DGTensorView& a,
-                                     const DGTensorView& b,
-                                     const std::optional<DGTensorView>& c,
-                                     const DGTensorView& d,
+static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
+                                     const torch::Tensor& b,
+                                     const std::optional<torch::Tensor>& c,
+                                     const torch::Tensor& d,
                                      const int& m, const int& n,
-                                     const std::vector<int>& ks, const DGTensorView& ks_tensor,
+                                     const std::vector<int>& ks, const torch::Tensor& ks_tensor,
                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                      const std::string& compiled_dims) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
@@ -293,9 +294,9 @@ static void sm90_bf16_k_grouped_gemm(const DGTensorView& a,
     MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
-static void sm90_bf16_bhr_hdr_bhd(const DGTensorView& tensor_a,
-                                  const DGTensorView& tensor_b,
-                                  const DGTensorView& tensor_d,
+static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
+                                  const torch::Tensor& tensor_b,
+                                  const torch::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -340,9 +341,9 @@ static void sm90_bf16_bhr_hdr_bhd(const DGTensorView& tensor_a,
     MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
-static void sm90_bf16_bhd_hdr_bhr(const DGTensorView& tensor_a,
-                                  const DGTensorView& tensor_b,
-                                  const DGTensorView& tensor_d,
+static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
+                                  const torch::Tensor& tensor_b,
+                                  const torch::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
     const auto& config = get_best_config<SM90ArchSpec>(

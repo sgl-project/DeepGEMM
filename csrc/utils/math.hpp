@@ -1,6 +1,7 @@
 #pragma once
 
-#include "tensor_view.hpp"
+#include <torch/torch.h>
+#include "torch_compat.hpp"
 
 namespace deep_gemm {
 

@@ -4,13 +4,14 @@
 
 #include "math.hpp"
 #include "exception.hpp"
-#include "tensor_view.hpp"
+#include <torch/torch.h>
+#include "torch_compat.hpp"
 #include "../jit/device_runtime.hpp"
 
 namespace deep_gemm {
 
 // Major-ness helpers
-static void major_check(const DGTensorView& t) {
+static void major_check(const torch::Tensor& t) {
     const auto dim = t.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
     if (dim == 3)
@@ -18,12 +19,12 @@ static void major_check(const DGTensorView& t) {
     DG_HOST_ASSERT(t.stride(-2) == 1 or t.stride(-1) == 1);
 }
 
-static cute::UMMA::Major get_major_type_ab(const DGTensorView& t) {
+static cute::UMMA::Major get_major_type_ab(const torch::Tensor& t) {
     major_check(t);
     return t.stride(-1) == 1 ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
 }
 
-static void check_major_type_cd(const DGTensorView& t) {
+static void check_major_type_cd(const torch::Tensor& t) {
     major_check(t);
     DG_HOST_ASSERT(t.stride(-1) == 1);
 }
@@ -33,19 +34,19 @@ static bool fp8_requires_k_major() {
 }
 
 // Shape/type checks for FP8/FP4 matrices
-static std::tuple<int, int> check_ab_fp8_fp4(const DGTensorView& ab, const cute::UMMA::Major& major, const int& arch_major) {
+static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [mn, k] = get_shape<2>(ab);
-    if (dg_dtype_ne(ab.scalar_type(), dg_dtype::Float8E4M3)) {
-        DG_HOST_ASSERT(dg_dtype_eq(ab.scalar_type(), kPackedFP4) and arch_major == 10);
+    if (((ab.scalar_type()) != (at::kFloat8_e4m3fn))) {
+        DG_HOST_ASSERT(((ab.scalar_type()) == (deep_gemm::kPackedFP4)) and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(mn, k);
 }
 
-static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const DGTensorView& ab, const cute::UMMA::Major& major, const int& arch_major) {
+static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [num_groups, mn, k] = get_shape<3>(ab);
-    if (dg_dtype_ne(ab.scalar_type(), dg_dtype::Float8E4M3)) {
-        DG_HOST_ASSERT(dg_dtype_eq(ab.scalar_type(), kPackedFP4) and arch_major == 10);
+    if (((ab.scalar_type()) != (at::kFloat8_e4m3fn))) {
+        DG_HOST_ASSERT(((ab.scalar_type()) == (deep_gemm::kPackedFP4)) and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(num_groups, mn, k);
@@ -53,14 +54,14 @@ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const DGTensorView& ab
 
 // Recipe helpers
 static std::tuple<int, int, int>
-get_default_recipe(DLDataType sfa_dtype, DLDataType sfb_dtype) {
+get_default_recipe(at::ScalarType sfa_dtype, at::ScalarType sfb_dtype) {
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
-        DG_HOST_ASSERT(dg_dtype_eq(sfa_dtype, dg_dtype::Float32) and dg_dtype_eq(sfb_dtype, dg_dtype::Float32));
+        DG_HOST_ASSERT(((sfa_dtype) == (at::kFloat)) and ((sfb_dtype) == (at::kFloat)));
         return {1, 128, 128};
     } else if (arch_major == 10) {
-        DG_HOST_ASSERT(dg_dtype_eq(sfb_dtype, dg_dtype::Float32) or dg_dtype_eq(sfb_dtype, dg_dtype::Int32));
-        return dg_dtype_eq(sfb_dtype, dg_dtype::Float32) ?
+        DG_HOST_ASSERT(((sfb_dtype) == (at::kFloat)) or ((sfb_dtype) == (at::kInt)));
+        return ((sfb_dtype) == (at::kFloat)) ?
             std::make_tuple(1, 128, 128) :
             std::make_tuple(1,   1, 128);
     }
@@ -68,23 +69,23 @@ get_default_recipe(DLDataType sfa_dtype, DLDataType sfb_dtype) {
 }
 
 // SF layout checks
-static DGTensorView check_sf_layout(const DGTensorView& sf,
+static torch::Tensor check_sf_layout(const torch::Tensor& sf,
                                     const int& mn, const int& k,
                                     const int& gran_mn, const int& gran_k,
                                     const std::optional<int>& num_groups,
                                     const bool& tma_stride_check = false,
                                     const bool& sm90_sfb_check = false,
-                                    const std::optional<DLDataType>& type_check = std::nullopt) {
+                                    const std::optional<at::ScalarType>& type_check = std::nullopt) {
     if (type_check.has_value())
-        DG_HOST_ASSERT(dg_dtype_eq(sf.scalar_type(), type_check.value()));
+        DG_HOST_ASSERT(((sf.scalar_type()) == (type_check.value())));
 
     const auto sf_dtype = sf.scalar_type();
-    DG_HOST_ASSERT(dg_dtype_eq(sf_dtype, dg_dtype::Float32) or dg_dtype_eq(sf_dtype, dg_dtype::Int32));
+    DG_HOST_ASSERT(((sf_dtype) == (at::kFloat)) or ((sf_dtype) == (at::kInt)));
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())
         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
     DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (dg_dtype_eq(sf_dtype, dg_dtype::Float32) ? 1 : 4)));
+    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (((sf_dtype) == (at::kFloat)) ? 1 : 4)));
 
     if (tma_stride_check) {
         if (num_groups.has_value())

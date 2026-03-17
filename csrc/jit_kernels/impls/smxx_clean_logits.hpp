@@ -47,9 +47,9 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void smxx_clean_logits(const DGTensorView& logits,
-                              const std::optional<DGTensorView>& cu_seq_len_k_start,
-                              const DGTensorView& cu_seq_len_k_end,
+static void smxx_clean_logits(const torch::Tensor& logits,
+                              const std::optional<torch::Tensor>& cu_seq_len_k_start,
+                              const torch::Tensor& cu_seq_len_k_end,
                               const int& next_n,
                               const int& seq_len, const int& seq_len_kv,
                               const uint64_t &stride_logits) {

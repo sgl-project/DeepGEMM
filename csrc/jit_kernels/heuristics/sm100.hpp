@@ -22,7 +22,7 @@ struct SM100ArchSpec {
         return candidates;
     }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const DLDataType& cd_dtype, const int& max_block_n) {
+    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype, const int& max_block_n) {
         // 16 is for better SM usage
         // Stride 32 is due to low-performance swizzle-16/32B
         std::vector<int> candidates = {16};
@@ -48,7 +48,7 @@ struct SM100ArchSpec {
         return block_n;
     }
 
-    static bool enable_cd_swizzle(const DLDataType& cd_dtype) {
+    static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
         return true;
     }
 
@@ -64,7 +64,7 @@ struct SM100ArchSpec {
 
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const MmaKind& mma_kind, const DLDataType& cd_dtype,
+                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // Layout A/D does not support `block_n % 16 != 0`
@@ -93,7 +93,7 @@ struct SM100ArchSpec {
         return major_b == cute::UMMA::Major::K or (block_n * get_element_size(mma_kind)) % 64 == 0;
     }
 
-    static bool is_num_stages_legal(const MmaKind& mma_kind, const DLDataType& cd_dtype,
+    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& num_stages,
                                     const int& block_m, const int& block_n, const int& block_k) {
         return true;
@@ -118,14 +118,14 @@ struct SM100ArchSpec {
     static int get_smem_cd_size(const KernelType& kernel_type,
                                 const int& block_m, const int& block_n,
                                 const int& swizzle_cd_mode,
-                                const DLDataType& cd_dtype) {
+                                const at::ScalarType& cd_dtype) {
         constexpr static int layout_ad_m = 128;
         return std::min(block_m, layout_ad_m) * swizzle_cd_mode * 2;
     }
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const MmaKind& mma_kind, const DLDataType& cd_dtype) {
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
         if (mma_kind == MmaKind::BF16)
             return {0, 0};
 

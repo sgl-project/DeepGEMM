@@ -3,7 +3,8 @@
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/system.hpp"
-#include "../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../utils/torch_compat.hpp"
 #include "device_runtime.hpp"
 #include "handle.hpp"
 
@@ -91,7 +92,7 @@ public:
     template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         const auto& kernel = kernel_runtime->kernel;
-        cudaStream_t stream = dg_get_current_cuda_stream();
+        cudaStream_t stream = get_current_cuda_stream();
 
         const LaunchArgs& launch_args = args.launch_args;
 

@@ -51,8 +51,8 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void smxx_paged_mqa_logits_metadata(const DGTensorView& context_lens,
-                                           const DGTensorView& schedule_metadata,
+static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                           const torch::Tensor& schedule_metadata,
                                            const int& batch_size, const int& next_n,
                                            const int& block_kv, const int& num_sms,
                                            const bool& is_context_lens_2d) {
@@ -158,14 +158,14 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void smxx_fp8_paged_mqa_logits(const DGTensorView& q,
-                                      const DGTensorView& kv_cache,
-                                      const DGTensorView& kv_cache_scales,
-                                      const DGTensorView& weights,
-                                      const DGTensorView& context_lens,
-                                      const DGTensorView& logits,
-                                      const DGTensorView& block_table,
-                                      const DGTensorView& schedule_meta,
+static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
+                                      const torch::Tensor& kv_cache,
+                                      const torch::Tensor& kv_cache_scales,
+                                      const torch::Tensor& weights,
+                                      const torch::Tensor& context_lens,
+                                      const torch::Tensor& logits,
+                                      const torch::Tensor& block_table,
+                                      const torch::Tensor& schedule_meta,
                                       const int& batch_size, const int& next_n,
                                       const int& num_heads, const int& head_dim,
                                       const int& num_kv_blocks, const int& block_kv,

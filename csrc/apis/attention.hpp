@@ -16,9 +16,9 @@
 namespace deep_gemm::attention {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-static void fp8_gemm_nt_skip_head_mid(const DGTensorView& a_data, const DGTensorView& a_sf,
-                                      const DGTensorView& b_data, const DGTensorView& b_sf,
-                                      const DGTensorView& d,
+static void fp8_gemm_nt_skip_head_mid(const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                                      const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                                      const torch::Tensor& d,
                                       const std::tuple<int, int, int>& head_splits,
                                       std::optional<std::tuple<int, int, int>> recipe,
                                       const std::string& compiled_dims,
@@ -37,9 +37,9 @@ static void fp8_gemm_nt_skip_head_mid(const DGTensorView& a_data, const DGTensor
     const auto& [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(a_data.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(b_data.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16) or dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((a_data.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((b_data.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)) or ((d.scalar_type()) == (at::kFloat)));
 
     const auto& [left, mid, right] = head_splits;
     DG_HOST_ASSERT(n % (left + right) == 0 and n_ == n + n / (left + right) * mid);
@@ -56,10 +56,10 @@ static void fp8_gemm_nt_skip_head_mid(const DGTensorView& a_data, const DGTensor
 
     const auto& arch_major = device_runtime->get_arch_major();
     const auto& epilogue_type = fmt::format("EpilogueHeadSplits<{}, {}, {}>", left, mid, right);
-    if (arch_major == 9 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Float32) and std::get<1>(recipe.value()) != 1) {
+    if (arch_major == 9 and ((sfa.scalar_type()) == (at::kFloat)) and std::get<1>(recipe.value()) != 1) {
         const auto& major_sfb = get_major_type_ab(sfb);
         sm90_fp8_gemm_1d2d(a_data, sfa, b_data, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
-    } else if (arch_major == 10 and dg_dtype_eq(sfa.scalar_type(), dg_dtype::Int32)) {
+    } else if (arch_major == 10 and ((sfa.scalar_type()) == (at::kInt))) {
         sm100_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, std::nullopt, d, m, n, k,
                                 128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else {
@@ -68,13 +68,13 @@ static void fp8_gemm_nt_skip_head_mid(const DGTensorView& a_data, const DGTensor
 }
 
 // logits: pre-allocated buffer of shape (seq_len, visible_cols) with stride(0) = stride_logits
-static void fp8_mqa_logits(const DGTensorView& q,
-                           const DGTensorView& kv_data,
-                           const DGTensorView& kv_sf,
-                           const DGTensorView& weights,
-                           const DGTensorView& cu_seq_len_k_start,
-                           const DGTensorView& cu_seq_len_k_end,
-                           DGTensorView logits,
+static void fp8_mqa_logits(const torch::Tensor& q,
+                           const torch::Tensor& kv_data,
+                           const torch::Tensor& kv_sf,
+                           const torch::Tensor& weights,
+                           const torch::Tensor& cu_seq_len_k_start,
+                           const torch::Tensor& cu_seq_len_k_end,
+                           torch::Tensor logits,
                            const int& stride_logits,
                            const bool& clean_logits,
                            const int& max_seqlen_k) {
@@ -95,13 +95,13 @@ static void fp8_mqa_logits(const DGTensorView& q,
     DG_HOST_ASSERT(cu_seq_len_k_start.is_contiguous());
     DG_HOST_ASSERT(cu_seq_len_k_end.is_contiguous());
 
-    DG_HOST_ASSERT(dg_dtype_eq(q.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(kv_data.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(kv_sf.scalar_type(), dg_dtype::Float32));
-    DG_HOST_ASSERT(dg_dtype_eq(weights.scalar_type(), dg_dtype::Float32));
-    DG_HOST_ASSERT(dg_dtype_eq(cu_seq_len_k_start.scalar_type(), dg_dtype::Int32));
-    DG_HOST_ASSERT(dg_dtype_eq(cu_seq_len_k_end.scalar_type(), dg_dtype::Int32));
-    DG_HOST_ASSERT(dg_dtype_eq(logits.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((q.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((kv_data.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((kv_sf.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(((weights.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(((cu_seq_len_k_start.scalar_type()) == (at::kInt)));
+    DG_HOST_ASSERT(((cu_seq_len_k_end.scalar_type()) == (at::kInt)));
+    DG_HOST_ASSERT(((logits.scalar_type()) == (at::kFloat)));
 
     constexpr int seq_len_alignment = 4;
     const auto seq_len_kv_visible = (max_seqlen_k == 0) ? seq_len_kv : max_seqlen_k;
@@ -129,8 +129,8 @@ static void fp8_mqa_logits(const DGTensorView& q,
 }
 
 // schedule_metadata: pre-allocated output of shape (num_sms + 1, 2), dtype Int32
-static void get_paged_mqa_logits_metadata(const DGTensorView& context_lens, int block_kv, int num_sms,
-                                          DGTensorView schedule_metadata) {
+static void get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms,
+                                          torch::Tensor schedule_metadata) {
     const bool is_context_lens_2d = context_lens.dim() == 2;
     int batch_size = 0, next_n = 0;
     if (is_context_lens_2d) {
@@ -140,7 +140,7 @@ static void get_paged_mqa_logits_metadata(const DGTensorView& context_lens, int 
         DG_HOST_ASSERT(context_lens.dim() == 1);
         batch_size = context_lens.size(0);
     }
-    DG_HOST_ASSERT(dg_dtype_eq(context_lens.scalar_type(), dg_dtype::Int32));
+    DG_HOST_ASSERT(((context_lens.scalar_type()) == (at::kInt)));
     DG_HOST_ASSERT(context_lens.is_contiguous());
 
     const auto& arch_major = device_runtime->get_arch_major();
@@ -152,14 +152,14 @@ static void get_paged_mqa_logits_metadata(const DGTensorView& context_lens, int 
 }
 
 // logits: pre-allocated output of shape (batch_size * next_n, aligned_max_context_len), dtype Float32
-static void fp8_paged_mqa_logits(const DGTensorView& q,
-                                 const DGTensorView& fused_kv_cache,
-                                 const DGTensorView& weights,
-                                 const DGTensorView& context_lens,
-                                 const DGTensorView& block_table,
-                                 const DGTensorView& schedule_meta,
+static void fp8_paged_mqa_logits(const torch::Tensor& q,
+                                 const torch::Tensor& fused_kv_cache,
+                                 const torch::Tensor& weights,
+                                 const torch::Tensor& context_lens,
+                                 const torch::Tensor& block_table,
+                                 const torch::Tensor& schedule_meta,
                                  const int& max_context_len,
-                                 DGTensorView logits,
+                                 torch::Tensor logits,
                                  const bool& clean_logits) {
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
     const auto& [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
@@ -199,28 +199,28 @@ static void fp8_paged_mqa_logits(const DGTensorView& q,
     DG_HOST_ASSERT(block_table.stride(1) == 1);
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
 
-    DG_HOST_ASSERT(dg_dtype_eq(q.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(fused_kv_cache.scalar_type(), dg_dtype::UInt8));
-    DG_HOST_ASSERT(dg_dtype_eq(weights.scalar_type(), dg_dtype::Float32));
-    DG_HOST_ASSERT(dg_dtype_eq(context_lens.scalar_type(), dg_dtype::Int32));
-    DG_HOST_ASSERT(dg_dtype_eq(block_table.scalar_type(), dg_dtype::Int32));
-    DG_HOST_ASSERT(dg_dtype_eq(schedule_meta.scalar_type(), dg_dtype::Int32));
-    DG_HOST_ASSERT(dg_dtype_eq(logits.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((q.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((fused_kv_cache.scalar_type()) == (at::kByte)));
+    DG_HOST_ASSERT(((weights.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(((context_lens.scalar_type()) == (at::kInt)));
+    DG_HOST_ASSERT(((block_table.scalar_type()) == (at::kInt)));
+    DG_HOST_ASSERT(((schedule_meta.scalar_type()) == (at::kInt)));
+    DG_HOST_ASSERT(((logits.scalar_type()) == (at::kFloat)));
 
     // Derive FP8 values and SF tensor from KV cache via pointer manipulation
-    const auto kv_cache = DGTensorView::from_ptr_strided(
+    const auto kv_cache = tensor_from_ptr_strided(
         fused_kv_cache.data_ptr(),
-        dg_dtype::Float8E4M3,
+        at::kFloat8_e4m3fn,
         {static_cast<int64_t>(num_kv_blocks), static_cast<int64_t>(block_kv), static_cast<int64_t>(head_dim)},
         {static_cast<int64_t>(kv_cache_stride_bytes), static_cast<int64_t>(head_dim), 1LL},
-        fused_kv_cache.device_id_val());
+        fused_kv_cache.device().index());
 
-    const auto kv_cache_scales = DGTensorView::from_ptr_strided(
+    const auto kv_cache_scales = tensor_from_ptr_strided(
         static_cast<uint8_t*>(fused_kv_cache.data_ptr()) + block_kv * head_dim,
-        dg_dtype::Float32,
+        at::kFloat,
         {static_cast<int64_t>(num_kv_blocks), static_cast<int64_t>(block_kv)},
         {static_cast<int64_t>(kv_cache_stride_bytes) / static_cast<int64_t>(sizeof(float)), 1LL},
-        fused_kv_cache.device_id_val());
+        fused_kv_cache.device().index());
 
     // Slice logits to max_context_len
     constexpr int split_kv = 256;

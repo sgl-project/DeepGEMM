@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -59,9 +60,9 @@ static void __instantiate_kernel() {{
 };
 
 
-static void sm90_bmn_bnk_mn_gemm(const DGTensorView &a,
-                                 const DGTensorView &b,
-                                 const DGTensorView &d,
+static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
+                                 const torch::Tensor &b,
+                                 const torch::Tensor &d,
                                  const int &s, const int &m, const int &n, const int &k) {
     constexpr int block_m = 128;
     constexpr int block_n = 128;

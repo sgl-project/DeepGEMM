@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -83,10 +84,10 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm100_fp8_fp4_gemm_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                                    const DGTensorView& b, const DGTensorView& sfb,
-                                    const std::optional<DGTensorView>& c,
-                                    const DGTensorView& d,
+static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                    const torch::Tensor& b, const torch::Tensor& sfb,
+                                    const std::optional<torch::Tensor>& c,
+                                    const torch::Tensor& d,
                                     const int& m, const int& n, const int& k,
                                     const int& gran_k_a, const int& gran_k_b,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -144,10 +145,10 @@ static void sm100_fp8_fp4_gemm_1d1d(const DGTensorView& a, const DGTensorView& s
     MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
-static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                                                         const DGTensorView& b, const DGTensorView& sfb,
-                                                         const DGTensorView& d,
-                                                         const DGTensorView& grouped_layout,
+static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                         const torch::Tensor& b, const torch::Tensor& sfb,
+                                                         const torch::Tensor& d,
+                                                         const torch::Tensor& grouped_layout,
                                                          const int& num_groups, const int& m, const int& n, const int& k,
                                                          const int& gran_k_a, const int& gran_k_b,
                                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -213,10 +214,10 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const DGTensorView& a, 
     MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
-static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                                                     const DGTensorView& b, const DGTensorView& sfb,
-                                                     const DGTensorView& d,
-                                                     const DGTensorView& masked_m,
+static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                     const torch::Tensor& b, const torch::Tensor& sfb,
+                                                     const torch::Tensor& d,
+                                                     const torch::Tensor& masked_m,
                                                      const int& num_groups, const int& m, const int& n, const int& k,
                                                      const int& expected_m,
                                                      const int& gran_k_a, const int& gran_k_b,
@@ -274,12 +275,12 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const DGTensorView& a, cons
     MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
-static void sm100_k_grouped_fp8_gemm_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                                          const DGTensorView& b, const DGTensorView& sfb,
-                                          const std::optional<DGTensorView>& c,
-                                          const DGTensorView& d,
+static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                          const torch::Tensor& b, const torch::Tensor& sfb,
+                                          const std::optional<torch::Tensor>& c,
+                                          const torch::Tensor& d,
                                           const int& m, const int& n,
-                                          const std::vector<int>& ks, const DGTensorView& ks_tensor,
+                                          const std::vector<int>& ks, const torch::Tensor& ks_tensor,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                           const std::string& compiled_dims) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
@@ -345,10 +346,10 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const DGTensorView& a, const DGTensorV
     MAYBE_LAUNCH(SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args));
 }
 
-static void sm100_fp8_bmm(const DGTensorView& a, const DGTensorView& sfa,
-                          const DGTensorView& b, const DGTensorView& sfb,
-                          const std::optional<DGTensorView>& c,
-                          const DGTensorView& d,
+static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
+                          const torch::Tensor& b, const torch::Tensor& sfb,
+                          const std::optional<torch::Tensor>& c,
+                          const torch::Tensor& d,
                           const int& batch_size, const int& m, const int& n, const int& k,
                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                           const std::string& compiled_dims) {

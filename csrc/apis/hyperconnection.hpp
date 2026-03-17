@@ -10,10 +10,10 @@
 namespace deep_gemm::hyperconnection {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-static void tf32_hc_prenorm_gemm(const DGTensorView& a,
-                                 const DGTensorView& b,
-                                 const DGTensorView& d,
-                                 const DGTensorView& sqr_sum,
+static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
+                                 const torch::Tensor& b,
+                                 const torch::Tensor& d,
+                                 const torch::Tensor& sqr_sum,
                                  const std::optional<int>& num_splits) {
     DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(b) == cute::UMMA::Major::K);
@@ -34,10 +34,10 @@ static void tf32_hc_prenorm_gemm(const DGTensorView& a,
         DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     }
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::Float32));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
-    DG_HOST_ASSERT(dg_dtype_eq(sqr_sum.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kFloat)));
+    DG_HOST_ASSERT(((sqr_sum.scalar_type()) == (at::kFloat)));
 
     if (m == 0)
         return;

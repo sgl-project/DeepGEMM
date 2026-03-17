@@ -17,11 +17,11 @@
 namespace deep_gemm::einsum {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-static void bmk_bnk_mn(const DGTensorView& a, const DGTensorView& b, const DGTensorView& d,
-                       const std::optional<DGTensorView>& c) {
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::Float32) &&
+static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
+                       const std::optional<torch::Tensor>& c) {
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kFloat)) &&
                    "bmk_bnk_mn only supports FP32 output; BF16 conversion should be handled externally");
-    DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->same_shape(d) and c->same_strides(d));
+    DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
 
     DG_HOST_ASSERT(a.is_contiguous());
     DG_HOST_ASSERT(b.is_contiguous());
@@ -41,15 +41,15 @@ static void bmk_bnk_mn(const DGTensorView& a, const DGTensorView& b, const DGTen
     }
 }
 
-static void bhr_hdr_bhd(const DGTensorView& A, const DGTensorView& B, const DGTensorView& D, const bool& use_cublaslt) {
+static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D, const bool& use_cublaslt) {
     const auto& [b , h  , r ] = get_shape<3>(A);
     const auto& [h_, d  , r_] = get_shape<3>(B);
     const auto& [b_, h__, d_] = get_shape<3>(D);
     DG_HOST_ASSERT(b == b_ and h == h_ and r == r_ and d == d_ and h == h__);
 
-    DG_HOST_ASSERT(dg_dtype_eq(A.scalar_type(), dg_dtype::BFloat16) and A.stride(2) == 1);
-    DG_HOST_ASSERT(dg_dtype_eq(B.scalar_type(), dg_dtype::BFloat16) and B.stride(2) == 1);
-    DG_HOST_ASSERT(dg_dtype_eq(D.scalar_type(), dg_dtype::BFloat16) and D.stride(2) == 1);
+    DG_HOST_ASSERT(((A.scalar_type()) == (at::kBFloat16)) and A.stride(2) == 1);
+    DG_HOST_ASSERT(((B.scalar_type()) == (at::kBFloat16)) and B.stride(2) == 1);
+    DG_HOST_ASSERT(((D.scalar_type()) == (at::kBFloat16)) and D.stride(2) == 1);
 
     const auto& arch_major = device_runtime->get_arch_major();
     if (use_cublaslt) {
@@ -63,15 +63,15 @@ static void bhr_hdr_bhd(const DGTensorView& A, const DGTensorView& B, const DGTe
     }
 }
 
-static void bhd_hdr_bhr(const DGTensorView& A, const DGTensorView& B, const DGTensorView& D, const bool& use_cublaslt) {
+static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D, const bool& use_cublaslt) {
     const auto& [b , h  , d ] = get_shape<3>(A);
     const auto& [h_, d_ , r ] = get_shape<3>(B);
     const auto& [b_, h__, r_] = get_shape<3>(D);
     DG_HOST_ASSERT(b == b_ and h == h_ and r == r_ and d == d_ and h == h__);
 
-    DG_HOST_ASSERT(dg_dtype_eq(A.scalar_type(), dg_dtype::BFloat16) and A.stride(2) == 1);
-    DG_HOST_ASSERT(dg_dtype_eq(B.scalar_type(), dg_dtype::BFloat16) and B.stride(2) == 1);
-    DG_HOST_ASSERT(dg_dtype_eq(D.scalar_type(), dg_dtype::BFloat16) and D.stride(2) == 1);
+    DG_HOST_ASSERT(((A.scalar_type()) == (at::kBFloat16)) and A.stride(2) == 1);
+    DG_HOST_ASSERT(((B.scalar_type()) == (at::kBFloat16)) and B.stride(2) == 1);
+    DG_HOST_ASSERT(((D.scalar_type()) == (at::kBFloat16)) and D.stride(2) == 1);
 
     const auto& arch_major = device_runtime->get_arch_major();
     if (use_cublaslt) {
@@ -86,22 +86,22 @@ static void bhd_hdr_bhr(const DGTensorView& A, const DGTensorView& B, const DGTe
 }
 
 static void einsum(const std::string& expr,
-                   const DGTensorView& a,
-                   const DGTensorView& b,
-                   const DGTensorView& d,
-                   const std::optional<DGTensorView>& c,
+                   const torch::Tensor& a,
+                   const torch::Tensor& b,
+                   const torch::Tensor& d,
+                   const std::optional<torch::Tensor>& c,
                    const bool& use_cublaslt) {
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::BFloat16));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16) or dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kBFloat16)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)) or ((d.scalar_type()) == (at::kFloat)));
     if (c.has_value()) {
-        DG_HOST_ASSERT(dg_dtype_eq(c->scalar_type(), dg_dtype::Float32));
-        DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+        DG_HOST_ASSERT(((c->scalar_type()) == (at::kFloat)));
+        DG_HOST_ASSERT(((d.scalar_type()) == (at::kFloat)));
     }
 
     if (expr == "bmk,bnk->mn") {
         DG_HOST_ASSERT(not use_cublaslt);
-        DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::Float32) &&
+        DG_HOST_ASSERT(((d.scalar_type()) == (at::kFloat)) &&
                        "BF16 output for bmk,bnk->mn requires external conversion; use FP32 output");
         bmk_bnk_mn(a, b, d, c);
     } else if (expr == "bhr,hdr->bhd") {
@@ -115,10 +115,10 @@ static void einsum(const std::string& expr,
     }
 }
 
-static void fp8_bmm(const DGTensorView& a, const DGTensorView& sfa,
-                    const DGTensorView& b, const DGTensorView& sfb,
-                    const DGTensorView& d,
-                    const std::optional<DGTensorView>& c,
+static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
+                    const torch::Tensor& b, const torch::Tensor& sfb,
+                    const torch::Tensor& d,
+                    const std::optional<torch::Tensor>& c,
                     std::optional<std::tuple<int, int, int>> recipe,
                     const std::string& compiled_dims) {
     const auto& major_a = a.stride(-1) == 1 ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
@@ -132,9 +132,9 @@ static void fp8_bmm(const DGTensorView& a, const DGTensorView& sfa,
     const auto& [batch_size__, m_, n_] = get_shape<3>(d);
     DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size__);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
-    DG_HOST_ASSERT(dg_dtype_eq(a.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(b.scalar_type(), dg_dtype::Float8E4M3));
-    DG_HOST_ASSERT(dg_dtype_eq(d.scalar_type(), dg_dtype::BFloat16) or dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((a.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((b.scalar_type()) == (at::kFloat8_e4m3fn)));
+    DG_HOST_ASSERT(((d.scalar_type()) == (at::kBFloat16)) or ((d.scalar_type()) == (at::kFloat)));
 
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
@@ -154,10 +154,10 @@ static void fp8_bmm(const DGTensorView& a, const DGTensorView& sfa,
 }
 
 static void fp8_einsum(const std::string& expr,
-                       const DGTensorView& a_data, const DGTensorView& a_sf,
-                       const DGTensorView& b_data, const DGTensorView& b_sf,
-                       const DGTensorView& d,
-                       const std::optional<DGTensorView>& c,
+                       const torch::Tensor& a_data, const torch::Tensor& a_sf,
+                       const torch::Tensor& b_data, const torch::Tensor& b_sf,
+                       const torch::Tensor& d,
+                       const std::optional<torch::Tensor>& c,
                        const std::tuple<int, int, int>& recipe) {
     const auto arch_major = device_runtime->get_arch_major();
     if (expr == "bhr,hdr->bhd") {

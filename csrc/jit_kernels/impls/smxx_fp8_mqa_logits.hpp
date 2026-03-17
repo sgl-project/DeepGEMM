@@ -80,12 +80,12 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void smxx_fp8_mqa_logits(const DGTensorView& q,
-                                const DGTensorView& kv, const DGTensorView& kv_scales,
-                                const DGTensorView& weights,
-                                const DGTensorView& cu_seq_len_k_start,
-                                const DGTensorView& cu_seq_len_k_end,
-                                const DGTensorView& logits,
+static void smxx_fp8_mqa_logits(const torch::Tensor& q,
+                                const torch::Tensor& kv, const torch::Tensor& kv_scales,
+                                const torch::Tensor& weights,
+                                const torch::Tensor& cu_seq_len_k_start,
+                                const torch::Tensor& cu_seq_len_k_end,
+                                const torch::Tensor& logits,
                                 const int& seq_len, const int& seq_len_kv,
                                 const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,

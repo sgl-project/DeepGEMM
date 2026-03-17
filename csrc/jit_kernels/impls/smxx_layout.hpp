@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/kernel_runtime.hpp"
 #include "../../jit/compiler.hpp"
@@ -99,10 +100,10 @@ static void __instantiate_kernel() {{
     }
 };
 
-static std::tuple<int, int, int, int, int, DGTensorView> preprocess_sf(const DGTensorView& sf) {
+static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const torch::Tensor& sf) {
     const auto& dim = sf.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
-    DG_HOST_ASSERT(dg_dtype_eq(sf.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(((sf.scalar_type()) == (at::kFloat)));
     const auto& batched_sf = dim == 2 ? sf.unsqueeze(0) : sf;
 
     const auto& [num_groups, mn, sf_k] = get_shape<3>(batched_sf);
@@ -110,7 +111,7 @@ static std::tuple<int, int, int, int, int, DGTensorView> preprocess_sf(const DGT
     return {dim, num_groups, mn, sf_k, tma_aligned_mn, batched_sf};
 }
 
-static bool get_mn_major_tma_aligned_tensor(const DGTensorView& sf, DGTensorView out) {
+static bool get_mn_major_tma_aligned_tensor(const torch::Tensor& sf, torch::Tensor out) {
     const auto& [dim, num_groups, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
 
     if (not batched_sf.is_contiguous())
@@ -134,7 +135,7 @@ static bool get_mn_major_tma_aligned_tensor(const DGTensorView& sf, DGTensorView
     return true;
 }
 
-static bool get_mn_major_tma_aligned_packed_ue8m0_tensor(const DGTensorView& sf, DGTensorView out) {
+static bool get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::Tensor& sf, torch::Tensor out) {
     const auto& [dim, num_groups, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
     const auto& packed_sf_k = ceil_div(sf_k, 4);
 
@@ -184,10 +185,10 @@ static bool get_mn_major_tma_aligned_packed_ue8m0_tensor(const DGTensorView& sf,
     return true;
 }
 
-static bool get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(const DGTensorView& sf,
-                                                                    const DGTensorView& ks_tensor,
+static bool get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::Tensor& sf,
+                                                                    const torch::Tensor& ks_tensor,
                                                                     const std::vector<int>& ks,
-                                                                    DGTensorView out) {
+                                                                    torch::Tensor out) {
     const auto& [sf_k, mn] = get_shape<2>(sf);
     const auto& num_groups = static_cast<int>(ks.size());
 

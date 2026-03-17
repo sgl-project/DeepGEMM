@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../../utils/tensor_view.hpp"
+#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -75,14 +76,14 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm90_fp8_gemm_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                               const DGTensorView& b, const DGTensorView& sfb,
-                               const std::optional<DGTensorView>& c,
-                               const DGTensorView& d,
+static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                               const torch::Tensor& b, const torch::Tensor& sfb,
+                               const std::optional<torch::Tensor>& c,
+                               const torch::Tensor& d,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(c.has_value() and ((d.scalar_type()) == (at::kFloat)));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -139,16 +140,16 @@ static void sm90_fp8_gemm_1d1d(const DGTensorView& a, const DGTensorView& sfa,
     MAYBE_LAUNCH(SM90FP8Gemm1D1DRuntime::launch(runtime, args));
 }
 
-static void sm90_k_grouped_fp8_gemm_1d1d(const DGTensorView& a, const DGTensorView& sfa,
-                                         const DGTensorView& b, const DGTensorView& sfb,
-                                         const std::optional<DGTensorView>& c,
-                                         const DGTensorView& d,
+static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                         const torch::Tensor& b, const torch::Tensor& sfb,
+                                         const std::optional<torch::Tensor>& c,
+                                         const torch::Tensor& d,
                                          const int& m, const int& n,
-                                         const std::vector<int>& ks, const DGTensorView& ks_tensor,
-                                         const DGTensorView& tensor_map_buffer,
+                                         const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                         const torch::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and dg_dtype_eq(d.scalar_type(), dg_dtype::Float32));
+    DG_HOST_ASSERT(c.has_value() and ((d.scalar_type()) == (at::kFloat)));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // Get config using max K for better performance
