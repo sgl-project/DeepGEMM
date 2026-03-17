@@ -15,11 +15,6 @@
 namespace deep_gemm {
 
 // ---------------------------------------------------------------------------
-// Scalar-type constants for readability (match upstream torch names)
-// ---------------------------------------------------------------------------
-inline constexpr auto kPackedFP4 = at::kByte;
-
-// ---------------------------------------------------------------------------
 // Scalar-type → CUDA / cuBLAS / TensorMap conversions
 // ---------------------------------------------------------------------------
 inline std::string dtype_to_cuda_type_string(at::ScalarType dtype) {
@@ -52,17 +47,6 @@ inline CUtensorMapDataType dtype_to_tensormap(at::ScalarType dtype, bool allow_t
 
 inline std::string dtype_to_string(at::ScalarType dtype) {
     return std::string(c10::toString(dtype));
-}
-
-// ---------------------------------------------------------------------------
-// get_shape<N>: extract N-dim shape as a tuple (for structured bindings)
-// ---------------------------------------------------------------------------
-template <int N>
-static auto get_shape(const torch::Tensor& t) {
-    DG_HOST_ASSERT(t.dim() == N);
-    return [&t]<size_t... Is>(std::index_sequence<Is...>) {
-        return std::make_tuple(static_cast<int>(t.size(Is))...);
-    }(std::make_index_sequence<N>());
 }
 
 // ---------------------------------------------------------------------------

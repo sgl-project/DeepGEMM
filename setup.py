@@ -93,8 +93,18 @@ def build_tvm_ffi_module(build_lib_dir):
     if DG_JIT_USE_RUNTIME_API:
         extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
 
+    import sysconfig
+    torch_dir = os.path.dirname(torch.__file__)
+    torch_include = os.path.join(torch_dir, 'include')
+    torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
+    torch_lib = os.path.join(torch_dir, 'lib')
+    python_include = sysconfig.get_path('include')
+
     extra_include_paths = [
         f'{CUDA_HOME}/include',
+        python_include,
+        torch_include,
+        torch_include_csrc,
         os.path.join(current_dir, 'deep_gemm', 'include'),
         os.path.join(current_dir, 'third-party', 'cutlass', 'include'),
         os.path.join(current_dir, 'third-party', 'fmt', 'include'),
@@ -105,8 +115,16 @@ def build_tvm_ffi_module(build_lib_dir):
 
     extra_ldflags = [
         f'-L{CUDA_HOME}/lib64',
+        f'-L{torch_lib}',
         '-lcudart',
         '-lnvrtc',
+        '-lcublasLt',
+        '-lcublas',
+        '-ltorch',
+        '-ltorch_cpu',
+        '-lc10',
+        '-lc10_cuda',
+        '-ltorch_cuda',
     ]
 
     output_dir = os.path.join(build_lib_dir, 'deep_gemm')
@@ -157,7 +175,7 @@ class CustomBuildPy(build_py):
 
             if os.path.exists(dst_dir):
                 shutil.rmtree(dst_dir)
-            shutil.copytree(src_dir, dst_dir)
+            shutil.copytree(src_dir, dst_dir, ignore_dangling_symlinks=True)
 
 
 if __name__ == '__main__':

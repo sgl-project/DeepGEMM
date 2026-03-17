@@ -62,19 +62,7 @@ try:
         else:
             out = torch.as_strided(flat, (ng, mn_pp, sf_k_pp), (sf_k_pp * tma_mn, 1, tma_mn))
 
-        success = C.get_mn_major_tma_aligned_tensor(sf, out)
-        if not success:
-            remove_dim = False
-            if sf.dim() == 2:
-                sf = sf.unsqueeze(0)
-                remove_dim = True
-            b, m, k = sf.shape
-            tma_mn_f = get_tma_aligned_size(m, sf.element_size())
-            t = torch.zeros((b, k, tma_mn_f), dtype=sf.dtype, device=sf.device).mT
-            t[:, :m, :k] = sf
-            out = t[:, :m, :]
-            if remove_dim:
-                out = out.squeeze(0)
+        C.get_mn_major_tma_aligned_tensor(sf, out)
         return out
 
     def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf: torch.Tensor) -> torch.Tensor:
@@ -93,9 +81,7 @@ try:
         else:
             out = torch.as_strided(flat, (ng, mn_pp, packed_sf_k), (packed_sf_k * tma_mn_int, 1, tma_mn_int))
 
-        success = C.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf, out)
-        if not success:
-            return _pack_fp32_into_ue8m0_fallback(sf)
+        C.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf, out)
         return out
 
     def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
@@ -106,18 +92,13 @@ try:
         num_groups = len(ks)
 
         packed_sf_k = sum(ceil_div(k, 512) for k in ks)
-        tma_mn_int = get_tma_aligned_size(mn, 4)
 
-        out_numel = packed_sf_k * tma_mn_int
-        flat = torch.empty(out_numel, dtype=torch.int32, device=sf.device)
-        # C++ output: shape (mn, packed_sf_k) with strides (1, tma_mn_int) — MN-major
-        out = torch.as_strided(flat, (mn, packed_sf_k), (1, tma_mn_int))
+        out = torch.empty((packed_sf_k, mn), dtype=torch.int32, device=sf.device)
 
         ks_list_tensor = torch.tensor(ks, dtype=torch.int32, device='cpu')
         C.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
             sf, ks_tensor, ks_list_tensor, num_groups, out)
-        # Return transposed: (packed_sf_k, mn) for compatibility with split
-        return out.T
+        return out
 
 except AttributeError:
     pass
