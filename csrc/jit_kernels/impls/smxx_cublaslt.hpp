@@ -59,8 +59,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     const auto& handle = device_runtime->get_cublaslt_handle();
     auto* workspace_ptr = device_runtime->get_cublaslt_workspace_ptr();
     const auto workspace_bytes = device_runtime->get_cublaslt_workspace_bytes();
-    cudaStream_t stream = nullptr;
-    DG_CUDA_RUNTIME_CHECK(cudaGetDefaultStream(&stream));
+    cudaStream_t stream = dg_get_current_cuda_stream();
 
     // Algorithm selection
     cublasLtMatmulPreference_t pref;

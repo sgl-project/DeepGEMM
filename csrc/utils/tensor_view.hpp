@@ -308,15 +308,9 @@ static auto get_shape(const DGTensorView& t) {
 // Falls back to the default stream if unavailable.
 // ---------------------------------------------------------------------------
 inline cudaStream_t dg_get_current_cuda_stream() {
-    cudaStream_t stream = nullptr;
-    cudaStreamGetCurrent(&stream);
-    if (stream == nullptr) {
-        int device_id;
-        cudaGetDevice(&device_id);
-        cudaDeviceGetDefaultMemPool(nullptr, device_id);
-        stream = nullptr;
-    }
-    return stream;
+    // Use the default CUDA stream (stream 0).
+    // With tvm-ffi, the framework manages stream context externally.
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

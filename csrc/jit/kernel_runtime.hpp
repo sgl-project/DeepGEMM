@@ -91,10 +91,7 @@ public:
     template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         const auto& kernel = kernel_runtime->kernel;
-        cudaStream_t stream = nullptr;
-        DG_CUDA_RUNTIME_CHECK(cudaStreamGetCaptureInfo_v2(nullptr, nullptr, nullptr, &stream, nullptr));
-        if (stream == nullptr)
-            DG_CUDA_RUNTIME_CHECK(cudaGetDefaultStream(&stream));
+        cudaStream_t stream = dg_get_current_cuda_stream();
 
         const LaunchArgs& launch_args = args.launch_args;
 

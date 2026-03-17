@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include <deep_gemm/common/types.hpp>
 
 #include "../../utils/math.hpp"
