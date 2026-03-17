@@ -61,8 +61,12 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
     torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
     torch_lib = os.path.join(torch_dir, 'lib')
 
+    import sysconfig
+    python_include = sysconfig.get_path('include')
+
     extra_include_paths = [
         f'{cuda_home}/include',
+        python_include,
         torch_include,
         torch_include_csrc,
         os.path.join(root_dir, 'deep_gemm', 'include'),
