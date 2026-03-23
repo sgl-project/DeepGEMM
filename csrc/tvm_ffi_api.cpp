@@ -12,6 +12,8 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/runtime.hpp"
+#include "tvm/ffi/container/tuple.h"
+#include "tvm/ffi/object.h"
 #include "utils/torch_compat.hpp"
 
 using namespace deep_gemm;
@@ -184,83 +186,83 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cublaslt_gemm_tt, dg_cublaslt_gemm_tt);
 // ---------------------------------------------------------------------------
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 
-void dg_fp8_fp4_gemm_nt(TensorView a_data, TensorView a_sf,
-                         TensorView b_data, TensorView b_sf,
-                         TensorView d,
-                         int64_t has_c, TensorView c_or_dummy,
-                         int64_t r0, int64_t r1, int64_t r2,
-                         int64_t ra0, int64_t ra1,
-                         int64_t rb0, int64_t rb1,
-                         std::string compiled_dims,
-                         bool disable_ue8m0_cast) {
-    auto c_opt = has_c ? std::make_optional(convert_to_torch_tensor(c_or_dummy)) : std::nullopt;
-    auto recipe = r0 >= 0 ? std::make_optional(std::make_tuple((int)r0, (int)r1, (int)r2)) : std::nullopt;
-    auto recipe_a = ra0 >= 0 ? std::make_optional(std::make_tuple((int)ra0, (int)ra1)) : std::nullopt;
-    auto recipe_b = rb0 >= 0 ? std::make_optional(std::make_tuple((int)rb0, (int)rb1)) : std::nullopt;
-    gemm::fp8_fp4_gemm_nt(std::make_pair(convert_to_torch_tensor(a_data), convert_to_torch_tensor(a_sf)),
-                           std::make_pair(convert_to_torch_tensor(b_data), convert_to_torch_tensor(b_sf)),
+void dg_fp8_fp4_gemm_nt(TensorView a, TensorView a_sf,
+                        TensorView b, TensorView b_sf,
+                        TensorView d,
+                        Optional<TensorView> c,
+                        Optional<Tuple<int64_t, int64_t, int64_t>> recipe,
+                        Optional<Tuple<int64_t, int64_t>> recipe_a,
+                        Optional<Tuple<int64_t, int64_t>> recipe_b,
+                        std::string compiled_dims,
+                        bool disable_ue8m0_cast) {
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
+    auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
+    auto recipe_b_opt = recipe_b.has_value() ? std::make_optional(std::make_tuple((int)recipe_b.value().get<0>(), (int)recipe_b.value().get<1>())) : std::nullopt;
+    gemm::fp8_fp4_gemm_nt(std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+                           std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
-                           recipe, recipe_a, recipe_b,
+                           recipe_opt, recipe_a_opt, recipe_b_opt,
                            compiled_dims, disable_ue8m0_cast);
 }
 
-void dg_fp8_fp4_gemm_nn(TensorView a_data, TensorView a_sf,
-                         TensorView b_data, TensorView b_sf,
-                         TensorView d,
-                         int64_t has_c, TensorView c_or_dummy,
-                         int64_t r0, int64_t r1, int64_t r2,
-                         int64_t ra0, int64_t ra1,
-                         int64_t rb0, int64_t rb1,
-                         std::string compiled_dims,
-                         bool disable_ue8m0_cast) {
-    auto c_opt = has_c ? std::make_optional(convert_to_torch_tensor(c_or_dummy)) : std::nullopt;
-    auto recipe = r0 >= 0 ? std::make_optional(std::make_tuple((int)r0, (int)r1, (int)r2)) : std::nullopt;
-    auto recipe_a = ra0 >= 0 ? std::make_optional(std::make_tuple((int)ra0, (int)ra1)) : std::nullopt;
-    auto recipe_b = rb0 >= 0 ? std::make_optional(std::make_tuple((int)rb0, (int)rb1)) : std::nullopt;
-    gemm::fp8_fp4_gemm_nn(std::make_pair(convert_to_torch_tensor(a_data), convert_to_torch_tensor(a_sf)),
-                           std::make_pair(convert_to_torch_tensor(b_data), convert_to_torch_tensor(b_sf)),
+void dg_fp8_fp4_gemm_nn(TensorView a, TensorView a_sf,
+                        TensorView b, TensorView b_sf,
+                        TensorView d,
+                        Optional<TensorView> c,
+                        Optional<Tuple<int64_t, int64_t, int64_t>> recipe,
+                        Optional<Tuple<int64_t, int64_t>> recipe_a,
+                        Optional<Tuple<int64_t, int64_t>> recipe_b,
+                        std::string compiled_dims,
+                        bool disable_ue8m0_cast) {
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
+    auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
+    auto recipe_b_opt = recipe_b.has_value() ? std::make_optional(std::make_tuple((int)recipe_b.value().get<0>(), (int)recipe_b.value().get<1>())) : std::nullopt;
+    gemm::fp8_fp4_gemm_nn(std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+                           std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
-                           recipe, recipe_a, recipe_b,
+                           recipe_opt, recipe_a_opt, recipe_b_opt,
                            compiled_dims, disable_ue8m0_cast);
 }
 
-void dg_fp8_fp4_gemm_tn(TensorView a_data, TensorView a_sf,
-                         TensorView b_data, TensorView b_sf,
-                         TensorView d,
-                         int64_t has_c, TensorView c_or_dummy,
-                         int64_t r0, int64_t r1, int64_t r2,
-                         int64_t ra0, int64_t ra1,
-                         int64_t rb0, int64_t rb1,
-                         std::string compiled_dims,
-                         bool disable_ue8m0_cast) {
-    auto c_opt = has_c ? std::make_optional(convert_to_torch_tensor(c_or_dummy)) : std::nullopt;
-    auto recipe = r0 >= 0 ? std::make_optional(std::make_tuple((int)r0, (int)r1, (int)r2)) : std::nullopt;
-    auto recipe_a = ra0 >= 0 ? std::make_optional(std::make_tuple((int)ra0, (int)ra1)) : std::nullopt;
-    auto recipe_b = rb0 >= 0 ? std::make_optional(std::make_tuple((int)rb0, (int)rb1)) : std::nullopt;
-    gemm::fp8_fp4_gemm_tn(std::make_pair(convert_to_torch_tensor(a_data), convert_to_torch_tensor(a_sf)),
-                           std::make_pair(convert_to_torch_tensor(b_data), convert_to_torch_tensor(b_sf)),
+void dg_fp8_fp4_gemm_tn(TensorView a, TensorView a_sf,
+                        TensorView b, TensorView b_sf,
+                        TensorView d,
+                        Optional<TensorView> c,
+                        Optional<Tuple<int64_t, int64_t, int64_t>> recipe,
+                        Optional<Tuple<int64_t, int64_t>> recipe_a,
+                        Optional<Tuple<int64_t, int64_t>> recipe_b,
+                        std::string compiled_dims,
+                        bool disable_ue8m0_cast) {
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
+    auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
+    auto recipe_b_opt = recipe_b.has_value() ? std::make_optional(std::make_tuple((int)recipe_b.value().get<0>(), (int)recipe_b.value().get<1>())) : std::nullopt;
+    gemm::fp8_fp4_gemm_tn(std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+                           std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
-                           recipe, recipe_a, recipe_b,
+                           recipe_opt, recipe_a_opt, recipe_b_opt,
                            compiled_dims, disable_ue8m0_cast);
 }
 
-void dg_fp8_fp4_gemm_tt(TensorView a_data, TensorView a_sf,
-                         TensorView b_data, TensorView b_sf,
-                         TensorView d,
-                         int64_t has_c, TensorView c_or_dummy,
-                         int64_t r0, int64_t r1, int64_t r2,
-                         int64_t ra0, int64_t ra1,
-                         int64_t rb0, int64_t rb1,
-                         std::string compiled_dims,
-                         bool disable_ue8m0_cast) {
-    auto c_opt = has_c ? std::make_optional(convert_to_torch_tensor(c_or_dummy)) : std::nullopt;
-    auto recipe = r0 >= 0 ? std::make_optional(std::make_tuple((int)r0, (int)r1, (int)r2)) : std::nullopt;
-    auto recipe_a = ra0 >= 0 ? std::make_optional(std::make_tuple((int)ra0, (int)ra1)) : std::nullopt;
-    auto recipe_b = rb0 >= 0 ? std::make_optional(std::make_tuple((int)rb0, (int)rb1)) : std::nullopt;
-    gemm::fp8_fp4_gemm_tt(std::make_pair(convert_to_torch_tensor(a_data), convert_to_torch_tensor(a_sf)),
-                           std::make_pair(convert_to_torch_tensor(b_data), convert_to_torch_tensor(b_sf)),
+void dg_fp8_fp4_gemm_tt(TensorView a, TensorView a_sf,
+                        TensorView b, TensorView b_sf,
+                        TensorView d,
+                        Optional<TensorView> c,
+                        Optional<Tuple<int64_t, int64_t, int64_t>> recipe,
+                        Optional<Tuple<int64_t, int64_t>> recipe_a,
+                        Optional<Tuple<int64_t, int64_t>> recipe_b,
+                        std::string compiled_dims,
+                        bool disable_ue8m0_cast) {
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
+    auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
+    auto recipe_b_opt = recipe_b.has_value() ? std::make_optional(std::make_tuple((int)recipe_b.value().get<0>(), (int)recipe_b.value().get<1>())) : std::nullopt;
+    gemm::fp8_fp4_gemm_tt(std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+                           std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
-                           recipe, recipe_a, recipe_b,
+                           recipe_opt, recipe_a_opt, recipe_b_opt,
                            compiled_dims, disable_ue8m0_cast);
 }
 

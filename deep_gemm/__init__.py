@@ -173,20 +173,16 @@ def _dummy_tensor(ref):
 
 try:
     def fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
-        r = _opt_recipe(recipe); ra = _opt_recipe_ab(recipe_a); rb = _opt_recipe_ab(recipe_b)
-        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, int(c is not None), c if c is not None else _dummy_tensor(d), r[0], r[1], r[2], ra[0], ra[1], rb[0], rb[1], compiled_dims, disable_ue8m0_cast)
+        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
     def fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
-        r = _opt_recipe(recipe); ra = _opt_recipe_ab(recipe_a); rb = _opt_recipe_ab(recipe_b)
-        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, int(c is not None), c if c is not None else _dummy_tensor(d), r[0], r[1], r[2], ra[0], ra[1], rb[0], rb[1], compiled_dims, disable_ue8m0_cast)
+        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
     def fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
-        r = _opt_recipe(recipe); ra = _opt_recipe_ab(recipe_a); rb = _opt_recipe_ab(recipe_b)
-        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, int(c is not None), c if c is not None else _dummy_tensor(d), r[0], r[1], r[2], ra[0], ra[1], rb[0], rb[1], compiled_dims, disable_ue8m0_cast)
+        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
     def fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
-        r = _opt_recipe(recipe); ra = _opt_recipe_ab(recipe_a); rb = _opt_recipe_ab(recipe_b)
-        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, int(c is not None), c if c is not None else _dummy_tensor(d), r[0], r[1], r[2], ra[0], ra[1], rb[0], rb[1], compiled_dims, disable_ue8m0_cast)
+        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
     fp8_gemm_nt = fp8_fp4_gemm_nt
     fp8_gemm_nn = fp8_fp4_gemm_nn

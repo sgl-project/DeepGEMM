@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <tuple>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -106,12 +105,12 @@ inline at::ScalarType dl_dtype_to_torch(DLDataType dtype) {
         case kDLUInt:
             if (dtype.bits == 8) return at::kByte;
             break;
-        case 6: // kDLFloat8_e4m3fn
+        case kDLFloat8_e4m3fn: // kDLFloat8_e4m3fn
             return at::kFloat8_e4m3fn;
         default:
             break;
     }
-    DG_HOST_UNREACHABLE("Unsupported DLDataType for torch conversion");
+    DG_HOST_UNREACHABLE("Unsupported DLDataType for torch conversion: " + tvm::ffi::DLDataTypeToString(dtype));
 }
 
 inline torch::Tensor convert_to_torch_tensor(tvm::ffi::TensorView tensor) {
