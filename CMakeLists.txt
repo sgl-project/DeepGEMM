@@ -6,6 +6,8 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -fPIC -Wno-psabi")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC -Wno-psabi")
 set(CUDA_SEPARABLE_COMPILATION ON)
+set(CMAKE_PREFIX_PATH "/usr/local/lib/python3.12/dist-packages/torch/share/cmake")
+
 list(APPEND CUDA_NVCC_FLAGS "-DENABLE_FAST_DEBUG")
 list(APPEND CUDA_NVCC_FLAGS "-O3")
 list(APPEND CUDA_NVCC_FLAGS "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage")
@@ -23,6 +25,7 @@ set(CMAKE_CUDA_STANDARD 17)
 
 include_directories(deep_gemm/include third-party/cutlass/include third-party/cutlass/tools/util/include third-party/fmt/include)
 include_directories(${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/include ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
+include_directories(/usr/local/lib/python3.12/dist-packages/tvm_ffi/include)
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs)
 
 # The main Python API entrance

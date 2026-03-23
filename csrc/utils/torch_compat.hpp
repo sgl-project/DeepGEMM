@@ -9,6 +9,8 @@
 
 #include <torch/torch.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/tvm_ffi.h>
 
 #include "exception.hpp"
 
@@ -112,18 +114,18 @@ inline at::ScalarType dl_dtype_to_torch(DLDataType dtype) {
     DG_HOST_UNREACHABLE("Unsupported DLDataType for torch conversion");
 }
 
-inline torch::Tensor dl_to_torch(DLTensor* dl) {
-    auto scalar_type = dl_dtype_to_torch(dl->dtype);
-    int device_id = dl->device.device_id;
-    void* data = static_cast<char*>(dl->data) + dl->byte_offset;
+inline torch::Tensor convert_to_torch_tensor(tvm::ffi::TensorView tensor) {
+    auto scalar_type = dl_dtype_to_torch(tensor.dtype());
+    int device_id = tensor.device().device_id;
+    void* data = static_cast<char*>(tensor.data_ptr()) + tensor.byte_offset();
 
-    auto sizes = std::vector<int64_t>(dl->shape, dl->shape + dl->ndim);
+    auto sizes = std::vector<int64_t>(tensor.shape().begin(), tensor.shape().end());
     auto opts = torch::TensorOptions().dtype(scalar_type)
                     .device(torch::kCUDA, device_id)
                     .requires_grad(false);
 
-    if (dl->strides) {
-        auto strides = std::vector<int64_t>(dl->strides, dl->strides + dl->ndim);
+    if (tensor.strides().data()) {
+        auto strides = std::vector<int64_t>(tensor.strides().begin(), tensor.strides().end());
         return torch::from_blob(data, sizes, strides, opts);
     }
     return torch::from_blob(data, sizes, opts);
