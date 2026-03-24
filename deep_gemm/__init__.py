@@ -153,24 +153,6 @@ cublaslt_gemm_tt = _C.cublaslt_gemm_tt
 # ---------------------------------------------------------------------------
 # GEMM / Attention / Einsum wrappers (handle optional params in Python)
 # ---------------------------------------------------------------------------
-def _opt_recipe(recipe):
-    if recipe is None:
-        return -1, -1, -1
-    return recipe[0], recipe[1], recipe[2]
-
-def _opt_recipe_ab(recipe_ab):
-    if recipe_ab is None:
-        return -1, -1
-    return recipe_ab[0], recipe_ab[1]
-
-_DUMMY = None
-
-def _dummy_tensor(ref):
-    global _DUMMY
-    if _DUMMY is None or _DUMMY.device != ref.device:
-        _DUMMY = torch.zeros(1, device=ref.device, dtype=torch.float32)
-    return _DUMMY
-
 try:
     def fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
         _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
@@ -188,40 +170,57 @@ try:
     fp8_gemm_nn = fp8_fp4_gemm_nn
     fp8_gemm_tn = fp8_fp4_gemm_tn
     fp8_gemm_tt = fp8_fp4_gemm_tt
+    
+    def m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, use_psum_layout=False, expected_m_for_psum_layout=None):
+        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout)
+
+    def m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, use_psum_layout=False):
+        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout)
+
+    m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
+    m_grouped_fp8_gemm_nn_contiguous = m_grouped_fp8_fp4_gemm_nn_contiguous
 
     def bf16_gemm_nt(a, b, d, c=None, compiled_dims=''):
-        _C.bf16_gemm_nt(a, b, d, int(c is not None), c if c is not None else _dummy_tensor(d), compiled_dims)
+        _C.bf16_gemm_nt(a, b, d, c, compiled_dims)
 
     def bf16_gemm_nn(a, b, d, c=None, compiled_dims=''):
-        _C.bf16_gemm_nn(a, b, d, int(c is not None), c if c is not None else _dummy_tensor(d), compiled_dims)
+        _C.bf16_gemm_nn(a, b, d, c, compiled_dims)
 
     def bf16_gemm_tn(a, b, d, c=None, compiled_dims=''):
-        _C.bf16_gemm_tn(a, b, d, int(c is not None), c if c is not None else _dummy_tensor(d), compiled_dims)
+        _C.bf16_gemm_tn(a, b, d, c, compiled_dims)
 
     def bf16_gemm_tt(a, b, d, c=None, compiled_dims=''):
-        _C.bf16_gemm_tt(a, b, d, int(c is not None), c if c is not None else _dummy_tensor(d), compiled_dims)
+        _C.bf16_gemm_tt(a, b, d, c, compiled_dims)
 
     def einsum(expr, a, b, d, c=None, use_cublaslt=False):
-        _C.einsum(expr, a, b, d, int(c is not None), c if c is not None else _dummy_tensor(d), use_cublaslt)
+        _C.einsum(expr, a, b, d, c, use_cublaslt)
 
     def fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, c=None, recipe=(1, 128, 128)):
-        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, int(c is not None), c if c is not None else _dummy_tensor(d), recipe[0], recipe[1], recipe[2])
+        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, c, recipe)
 
     def fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe=None, compiled_dims='', disable_ue8m0_cast=False):
-        r = _opt_recipe(recipe)
-        _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits[0], head_splits[1], head_splits[2], r[0], r[1], r[2], compiled_dims, disable_ue8m0_cast)
+        _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
-    fp8_mqa_logits = _C.fp8_mqa_logits
+    def fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
+        _C.fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+
+    def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+        _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+
     get_paged_mqa_logits_metadata = _C.get_paged_mqa_logits_metadata
-    fp8_paged_mqa_logits = _C.fp8_paged_mqa_logits
 
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
-        _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits if num_splits is not None else -1)
+        _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
-    transform_sf_into_required_layout = _C.transform_sf_into_required_layout
+    def transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab = None, num_groups=None, is_sfa=False, disable_ue8m0_cast=False):
+        _C.transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab, num_groups, is_sfa, disable_ue8m0_cast)
+
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
-    fp8_m_grouped_gemm_nt_masked = None
+    def m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal):
+        _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal)
+
+    fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = None
 
 except AttributeError:
