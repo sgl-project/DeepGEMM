@@ -150,20 +150,33 @@ cublaslt_gemm_nn = _C.cublaslt_gemm_nn
 cublaslt_gemm_tn = _C.cublaslt_gemm_tn
 cublaslt_gemm_tt = _C.cublaslt_gemm_tt
 
+def _parse_tensor_or_tuple(input):
+    if type(input) is tuple or type(input) is list:
+        return input[0], input[1]
+    elif isinstance(input, torch.Tensor):
+        scale = torch.Tensor([1.0], dtype=torch.float32, device=input.device)
+        return input, scale
+
+    assert False, "Expected Tensor, (Tensor, Tensor) tuple, or [Tensor, Tensor] list"
+
 # ---------------------------------------------------------------------------
 # GEMM / Attention / Einsum wrappers (handle optional params in Python)
 # ---------------------------------------------------------------------------
 try:
-    def fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+    def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
-    def fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+    def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
-    def fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+    def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
-    def fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+    def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
     fp8_gemm_nt = fp8_fp4_gemm_nt
@@ -202,10 +215,10 @@ try:
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
     def fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
-        _C.fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+        return _C.fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
 
     def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
-        _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
     get_paged_mqa_logits_metadata = _C.get_paged_mqa_logits_metadata
 
@@ -213,12 +226,13 @@ try:
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
     def transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab = None, num_groups=None, is_sfa=False, disable_ue8m0_cast=False):
-        _C.transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab, num_groups, is_sfa, disable_ue8m0_cast)
+        return _C.transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab, num_groups, is_sfa, disable_ue8m0_cast)
 
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
-    def m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal):
-        _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal)
+    def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, max_block_n=256, enable_overlap=False, signal=None):
+        (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal)
 
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = None
