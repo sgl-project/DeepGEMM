@@ -255,25 +255,29 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 
 #endif
 
-// static void register_apis(pybind11::module_& m) {
-// #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-//     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
-//           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
-//           py::arg("recipe") = std::nullopt,
-//           py::arg("compiled_dims") = "nk",
-//           py::arg("disable_ue8m0_cast") = false);
-//     m.def("fp8_mqa_logits", &fp8_mqa_logits,
-//           py::arg("q"), py::arg("kv"), py::arg("weights"),
-//           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
-//           py::arg("clean_logits") = true,
-//           py::arg("max_seqlen_k") = 0);
-//     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
-//           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"));
-//     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
-//           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
-//           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-//           py::arg("max_context_len"), py::arg("clean_logits") = false);
-// #endif
-// }
+#if 0
+
+static void register_apis(pybind11::module_& m) {
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
+          py::arg("recipe") = std::nullopt,
+          py::arg("compiled_dims") = "nk",
+          py::arg("disable_ue8m0_cast") = false);
+    m.def("fp8_mqa_logits", &fp8_mqa_logits,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
+          py::arg("clean_logits") = true,
+          py::arg("max_seqlen_k") = 0);
+    m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
+          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"));
+    m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+          py::arg("max_context_len"), py::arg("clean_logits") = false);
+#endif
+}
+
+#endif
 
 } // namespace deep_gemm::attention
