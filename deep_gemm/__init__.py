@@ -184,10 +184,12 @@ try:
     fp8_gemm_tn = fp8_fp4_gemm_tn
     fp8_gemm_tt = fp8_fp4_gemm_tt
     
-    def m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, use_psum_layout=False, expected_m_for_psum_layout=None):
+    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, expected_m_for_psum_layout=None):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout)
 
-    def m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, use_psum_layout=False):
+    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout)
 
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
@@ -208,10 +210,12 @@ try:
     def einsum(expr, a, b, d, c=None, use_cublaslt=False):
         _C.einsum(expr, a, b, d, c, use_cublaslt)
 
-    def fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, c=None, recipe=(1, 128, 128)):
+    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128)):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, c, recipe)
 
-    def fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe=None, compiled_dims='', disable_ue8m0_cast=False):
+    def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
     def fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
@@ -220,7 +224,8 @@ try:
     def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
         return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
-    get_paged_mqa_logits_metadata = _C.get_paged_mqa_logits_metadata
+    def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms):
+        return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)
 
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
