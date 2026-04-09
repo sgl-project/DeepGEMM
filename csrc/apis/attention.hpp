@@ -255,6 +255,8 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 
 #endif
 
+#if 0
+
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
@@ -275,5 +277,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_context_len"), py::arg("clean_logits") = false);
 #endif
 }
+
+#endif
 
 } // namespace deep_gemm::attention

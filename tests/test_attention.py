@@ -48,11 +48,11 @@ def test_gemm_skip_head_mid() -> None:
                 d = apply_skip_head_mid(d, head_splits)
                 ref_d = apply_skip_head_mid(ref_d, head_splits)
 
-                deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
+                deep_gemm.fp8_gemm_nt_skip_head_mid(a[0], a[1], b[0], b[1], d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
                 diff = calc_diff(d, ref_d)
                 assert diff < 0.001, f'{m=}, {n=}, {k=}, {kernel_opt}, {diff:.5f}'
 
-                t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast),
+                t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt_skip_head_mid(a[0], a[1], b[0], b[1], d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast),
                                 'fp8_gemm', suppress_kineto_output=True)
                 print(f' > Perf (m={m:5}, n={n:5}, k={k:5}, {kernel_opt}): '
                     f'{t * 1e6:4.0f} us | '
@@ -238,11 +238,11 @@ def test_paged_mqa_logits():
                         context_lens_2d = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
                         context_lens_2d[:, next_n-1] = context_lens
                         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens_2d, blocksize, deep_gemm.get_num_sms())
-                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, False)
                         ref_neginf_mask = ~(positions < context_lens_2d.view(-1).unsqueeze(1))
                     else:
                         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
-                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, True)
                         row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
                         next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
                         ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
@@ -259,10 +259,10 @@ def test_paged_mqa_logits():
                     input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
                     output_bytes = sum_lens * next_n * 4
                     if is_context_lens_2d:
-                        t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False),
+                        t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, False),
                                          'fp8_paged_mqa_logits')
                     else:
-                        t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
+                        t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, True),
                                                   ('fp8_paged_mqa_logits', 'clean_logits'))
                         clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
                     print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '

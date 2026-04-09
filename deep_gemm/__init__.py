@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import os
+import shutil
 import subprocess
+from typing import TYPE_CHECKING
+
 import torch
+import tvm_ffi
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 # Set some default environment provided at setup
 try:
-    # noinspection PyUnresolvedReferences
     from .envs import persistent_envs
     for key, value in persistent_envs.items():
         if key not in os.environ:
@@ -12,68 +20,229 @@ try:
 except ImportError:
     pass
 
-# Configs
-from . import _C
-from ._C import (
-    set_num_sms,
-    get_num_sms,
-    set_compile_mode,
-    get_compile_mode,
-    set_tc_util,
-    get_tc_util,
-)
+# ---------------------------------------------------------------------------
+# Build & load the tvm-ffi _C module
+# ---------------------------------------------------------------------------
+def _find_cuda_home() -> str:
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    if cuda_home is None:
+        try:
+            with open(os.devnull, 'w') as devnull:
+                nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
+                cuda_home = os.path.dirname(os.path.dirname(nvcc))
+        except Exception:
+            cuda_home = '/usr/local/cuda'
+            if not os.path.exists(cuda_home):
+                cuda_home = None
+    assert cuda_home is not None
+    return cuda_home
+
+
+def _build_module(pkg_dir: str, cuda_home: str) -> str:
+    """Build the _C shared library using tvm_ffi.cpp.build()."""
+    import tvm_ffi.cpp
+
+    root_dir = os.path.dirname(pkg_dir)
+    cxx_abi = int(torch.compiled_with_cxx11_abi())
+
+    os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', _get_cuda_arch())
+
+    extra_cflags = [
+        '-std=c++17', '-O3', '-fPIC',
+        '-Wno-psabi', '-Wno-deprecated-declarations',
+        f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
+    ]
+    if int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')):
+        extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
+
+    # Torch include/lib paths
+    torch_dir = os.path.dirname(torch.__file__)
+    torch_include = os.path.join(torch_dir, 'include')
+    torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
+    torch_lib = os.path.join(torch_dir, 'lib')
+
+    import sysconfig
+    python_include = sysconfig.get_path('include')
+
+    extra_include_paths = [
+        f'{cuda_home}/include',
+        python_include,
+        torch_include,
+        torch_include_csrc,
+        os.path.join(root_dir, 'deep_gemm', 'include'),
+        os.path.join(root_dir, 'third-party', 'cutlass', 'include'),
+        os.path.join(root_dir, 'third-party', 'fmt', 'include'),
+    ]
+    cccl_path = f'{cuda_home}/include/cccl'
+    if os.path.exists(cccl_path):
+        extra_include_paths.append(cccl_path)
+
+    extra_ldflags = [
+        f'-L{cuda_home}/lib64',
+        f'-L{torch_lib}',
+        '-lcudart',
+        '-lnvrtc',
+        '-lcublasLt',
+        '-lcublas',
+        '-ltorch',
+        '-ltorch_cpu',
+        '-lc10',
+        '-lc10_cuda',
+        '-ltorch_cuda',
+    ]
+
+    build_dir = os.path.join(pkg_dir, '_C_build')
+    os.makedirs(build_dir, exist_ok=True)
+
+    lib_path = tvm_ffi.cpp.build(
+        name='_C',
+        cpp_files=[os.path.join(root_dir, 'csrc', 'tvm_ffi_api.cpp')],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        extra_include_paths=extra_include_paths,
+        build_directory=build_dir,
+    )
+    # Copy the .so into the package directory for easy loading
+    target = os.path.join(pkg_dir, '_C.so')
+    shutil.copy2(lib_path, target)
+    return target
+
+
+def _get_cuda_arch() -> str:
+    try:
+        status = subprocess.run(
+            args=['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            capture_output=True, check=True,
+        )
+        return status.stdout.decode('utf-8').strip().split('\n')[0]
+    except Exception:
+        return '9.0'
+
+
+def _load_module() -> Module:
+    """Load (or build then load) the compiled tvm-ffi module."""
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    lib_path = os.path.join(pkg_dir, '_C.so')
+
+    if not os.path.exists(lib_path):
+        cuda_home = _find_cuda_home()
+        print(f'[DeepGEMM] Building _C module with tvm-ffi (CUDA_HOME={cuda_home})...')
+        lib_path = _build_module(pkg_dir, cuda_home)
+        print(f'[DeepGEMM] Built _C module: {lib_path}')
+
+    return tvm_ffi.load_module(lib_path)
+
+_C: Module = _load_module()
+
+# ---------------------------------------------------------------------------
+# Runtime config
+# ---------------------------------------------------------------------------
+set_num_sms = _C.set_num_sms
+get_num_sms = _C.get_num_sms
+set_compile_mode = _C.set_compile_mode
+get_compile_mode = _C.get_compile_mode
+set_tc_util = _C.set_tc_util
+get_tc_util = _C.get_tc_util
 
 # cuBLASLt Kernels
-from ._C import (
-    cublaslt_gemm_nt, cublaslt_gemm_nn,
-    cublaslt_gemm_tn, cublaslt_gemm_tt,
-)
+cublaslt_gemm_nt = _C.cublaslt_gemm_nt
+cublaslt_gemm_nn = _C.cublaslt_gemm_nn
+cublaslt_gemm_tn = _C.cublaslt_gemm_tn
+cublaslt_gemm_tt = _C.cublaslt_gemm_tt
 
+def _parse_tensor_or_tuple(input):
+    if type(input) is tuple or type(input) is list:
+        return input[0], input[1]
+    elif isinstance(input, torch.Tensor):
+        scale = torch.Tensor([1.0], dtype=torch.float32, device=input.device)
+        return input, scale
+
+    assert False, "Expected Tensor, (Tensor, Tensor) tuple, or [Tensor, Tensor] list"
+
+# ---------------------------------------------------------------------------
+# GEMM / Attention / Einsum wrappers (handle optional params in Python)
+# ---------------------------------------------------------------------------
 try:
-    # DeepGEMM Kernels
-    from ._C import (
-        # FP8 FP4 GEMMs
-        fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
-        fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
-        m_grouped_fp8_fp4_gemm_nt_contiguous,
-        m_grouped_fp8_fp4_gemm_nn_contiguous,
-        m_grouped_fp8_fp4_gemm_nt_masked,
-        # FP8 GEMMs
-        fp8_gemm_nt, fp8_gemm_nn,
-        fp8_gemm_tn, fp8_gemm_tt,
-        fp8_gemm_nt_skip_head_mid,
-        m_grouped_fp8_gemm_nt_contiguous,
-        m_grouped_fp8_gemm_nn_contiguous,
-        m_grouped_fp8_gemm_nt_masked,
-        k_grouped_fp8_gemm_nt_contiguous,
-        k_grouped_fp8_gemm_tn_contiguous,
-        # BF16 GEMMs
-        bf16_gemm_nt, bf16_gemm_nn,
-        bf16_gemm_tn, bf16_gemm_tt,
-        m_grouped_bf16_gemm_nt_contiguous,
-        m_grouped_bf16_gemm_nn_contiguous,
-        m_grouped_bf16_gemm_nt_masked,
-        k_grouped_bf16_gemm_tn_contiguous,
-        # Einsum kernels
-        einsum,
-        fp8_einsum,
-        # Attention kernels
-        fp8_mqa_logits,
-        get_paged_mqa_logits_metadata,
-        fp8_paged_mqa_logits,
-        # Hyperconnection kernels
-        tf32_hc_prenorm_gemm,
-        # Layout kernels
-        transform_sf_into_required_layout,
-        get_mk_alignment_for_contiguous_layout
-    )
+    def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
-    # Some alias for legacy supports
-    # TODO: remove these later
-    fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
-    bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
-except ImportError:
-    # Expected behavior for CUDA runtime version before 12.1
+    def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+
+    def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+
+    def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+
+    fp8_gemm_nt = fp8_fp4_gemm_nt
+    fp8_gemm_nn = fp8_fp4_gemm_nn
+    fp8_gemm_tn = fp8_fp4_gemm_tn
+    fp8_gemm_tt = fp8_fp4_gemm_tt
+    
+    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, expected_m_for_psum_layout=None):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout)
+
+    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout)
+
+    m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
+    m_grouped_fp8_gemm_nn_contiguous = m_grouped_fp8_fp4_gemm_nn_contiguous
+
+    def bf16_gemm_nt(a, b, d, c=None, compiled_dims=''):
+        _C.bf16_gemm_nt(a, b, d, c, compiled_dims)
+
+    def bf16_gemm_nn(a, b, d, c=None, compiled_dims=''):
+        _C.bf16_gemm_nn(a, b, d, c, compiled_dims)
+
+    def bf16_gemm_tn(a, b, d, c=None, compiled_dims=''):
+        _C.bf16_gemm_tn(a, b, d, c, compiled_dims)
+
+    def bf16_gemm_tt(a, b, d, c=None, compiled_dims=''):
+        _C.bf16_gemm_tt(a, b, d, c, compiled_dims)
+
+    def einsum(expr, a, b, d, c=None, use_cublaslt=False):
+        _C.einsum(expr, a, b, d, c, use_cublaslt)
+
+    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128)):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d, c, recipe)
+
+    def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
+
+    def fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
+        return _C.fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+
+    def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+
+    def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms):
+        return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)
+
+    def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
+        _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
+
+    def transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab = None, num_groups=None, is_sfa=False, disable_ue8m0_cast=False):
+        return _C.transform_sf_into_required_layout(sf, mn, k, recipe, recipe_ab, num_groups, is_sfa, disable_ue8m0_cast)
+
+    get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
+
+    def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, max_block_n=256, enable_overlap=False, signal=None):
+        (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, max_block_n, enable_overlap, signal)
+
+    fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
+    bf16_m_grouped_gemm_nt_masked = None
+
+except AttributeError:
     pass
 
 # Some utils
@@ -88,27 +257,9 @@ except Exception as e:
     print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
 
 # Initialize CPP modules
-def _find_cuda_home() -> str:
-    # TODO: reuse PyTorch API later
-    # For some PyTorch versions, the original `_find_cuda_home` will initialize CUDA, which is incompatible with process forks
-    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
-    if cuda_home is None:
-        # noinspection PyBroadException
-        try:
-            with open(os.devnull, 'w') as devnull:
-                nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
-                cuda_home = os.path.dirname(os.path.dirname(nvcc))
-        except Exception:
-            cuda_home = '/usr/local/cuda'
-            if not os.path.exists(cuda_home):
-                cuda_home = None
-    assert cuda_home is not None
-    return cuda_home
-
-
 _C.init(
-    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
-    _find_cuda_home()                           # CUDA home
+    os.path.dirname(os.path.abspath(__file__)),
+    _find_cuda_home()
 )
 
 __version__ = '2.3.0'
