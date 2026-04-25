@@ -2,22 +2,24 @@
 #include <optional>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/tuple.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/tvm_ffi.h>
+#include <tvm/ffi/object.h>
+#include <torch/torch.h>
+#include <ATen/DLConvertor.h>
 
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
-#include "tvm/ffi/container/tuple.h"
-#include "tvm/ffi/object.h"
+#include "apis/mega.hpp"
 #include "utils/torch_compat.hpp"
-#include <torch/torch.h>
-#include <ATen/DLConvertor.h>
+
 
 using namespace deep_gemm;
 using namespace tvm::ffi;
@@ -459,9 +461,86 @@ Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
+Tensor dg_fp8_fp4_mqa_logits(TensorView q, TensorView q_sf, TensorView kv_data, TensorView kv_sf,
+                            TensorView weights, TensorView cu_seq_len_k_start,
+                            TensorView cu_seq_len_k_end, bool clean_logits, int64_t max_seqlen_k,
+                            DLDataType logits_dtype) {
+    auto result = attention::fp8_fp4_mqa_logits(
+        std::make_pair(convert_to_torch_tensor(q), convert_to_torch_tensor(q_sf)),
+        std::make_pair(convert_to_torch_tensor(kv_data), convert_to_torch_tensor(kv_sf)),
+        convert_to_torch_tensor(weights), convert_to_torch_tensor(cu_seq_len_k_start),
+        convert_to_torch_tensor(cu_seq_len_k_end), clean_logits, static_cast<int>(max_seqlen_k),
+        dl_dtype_to_torch(logits_dtype));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
+Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, TensorView q_sf, TensorView fused_kv_cache,
+                              TensorView weights, TensorView context_lens,
+                              TensorView block_table, TensorView schedule_meta,
+                              int64_t max_context_len, bool clean_logits, DLDataType logits_dtype) {
+    auto result = attention::fp8_fp4_paged_mqa_logits(
+        std::make_pair(convert_to_torch_tensor(q), convert_to_torch_tensor(q_sf)),
+        convert_to_torch_tensor(fused_kv_cache),
+        convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
+        convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
+        static_cast<int>(max_context_len), clean_logits, dl_dtype_to_torch(logits_dtype));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm_nt_skip_head_mid, dg_fp8_gemm_nt_skip_head_mid);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mqa_logits, dg_fp8_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata, dg_get_paged_mqa_logits_metadata);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_logits, dg_fp8_paged_mqa_logits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mqa_logits, dg_fp8_fp4_mqa_logits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_paged_mqa_logits, dg_fp8_fp4_paged_mqa_logits);
+
+// Mega MoE
+int64_t dg_get_token_alignment_for_mega_moe() {
+    return (int64_t)mega::get_token_alignment_for_mega_moe();
+}
+
+Tuple<int64_t, TypedFunction<Tuple<TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView>(TensorView)>>
+dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
+                                    int64_t intermediate_hidden, bool use_fp8_dispatch, std::string activation) {
+    auto num_bytes, fn =  mega::get_symm_buffer_size_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, use_fp8_dispatch, hidden, intermediate_hidden, activation);
+    auto slice_input_buffers = [=](TensorView buffer) {
+        auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] =  fn(buffer);
+        return Tuple<TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView>(
+            Tensor::FromDLPack(at::toDLPack(x)), Tensor::FromDLPack(at::toDLPack(x_sf)), Tensor::FromDLPack(at::toDLPack(topk_idx)), Tensor::FromDLPack(at::toDLPack(topk_weights)),
+            Tensor::FromDLPack(at::toDLPack(l1_acts)), Tensor::FromDLPack(at::toDLPack(l1_acts_sf)), Tensor::FromDLPack(at::toDLPack(l2_acts)), Tensor::FromDLPack(at::toDLPack(l2_acts_sf))
+        );
+    };
+    return Tuple<int64_t, TypedFunction<Tuple<TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView, TensorView>(TensorView)>>(
+        num_bytes, slice_input_buffers);
+}
+
+void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf
+                        Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
+                        int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
+                        Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math) {
+    auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
+    auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
+    std::vector<int> sym_buffer_ptrs_val;
+    sym_buffer_ptrs_val.reserve(sym_buffer_ptrs.size());
+
+    for (Array<int64_t>::iterator it = sym_buffer_ptrs.begin(); it != sym_buffer_ptrs.end(); ++it) {
+        sym_buffer_ptrs_val.push_back(static_cast<int>(*it));
+    }
+    auto recipe_val = std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>());
+
+    mega::fp8_fp4_mega_moe(
+        convert_to_torch_tensor(y),
+        std::make_pair(convert_to_torch_tensor(l1_weights), convert_to_torch_tensor(l1_weights_sf)),
+        std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
+        c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
+        static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
+        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math
+    );
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);
+
 
 #endif  // DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
