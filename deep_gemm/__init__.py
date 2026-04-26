@@ -218,20 +218,22 @@ try:
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
-    def fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
-        return _C.fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
+    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False):
+        return _C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits)
 
-    def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+    def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+        (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
         return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
-    def fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
+    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
         logits_dtype_str = str(logits_dtype).split('.')[-1]
-        return _C.fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str, indices)
-
-    def fp8_fp4_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float):
         (q, q_sf) = _parse_tensor_or_tuple(q)
+        return _C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str, indices)
+
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float):
+        (q, q_sf), (kv_data, kv_sf) = _parse_tensor_or_tuple(q), _parse_tensor_or_tuple(kv)
         logits_dtype_str = str(logits_dtype).split('.')[-1]
-        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k, logits_dtype_str)
+        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype_str)
 
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
         return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
@@ -239,9 +241,10 @@ try:
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
-    def transform_sf_into_required_layout(sf, mn, k, recipe, num_groups=None, is_sfa=False, disable_ue8m0_cast=False):
+    def transform_sf_into_required_layout(sf, mn, k, recipe, num_groups=None, is_sfa=None, disable_ue8m0_cast=False):
         (recipe_a, recipe_b, recipe_c) = recipe if len(recipe) == 3 else (recipe[0], recipe[1], None)
         return _C.transform_sf_into_required_layout(sf, mn, k, recipe_a, recipe_b, recipe_c, num_groups, is_sfa, disable_ue8m0_cast)
+
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
     def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False):
