@@ -224,12 +224,14 @@ try:
     def fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
         return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
-    def fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype='float32'):
-        return _C.fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, tvm_ffi.dtype(logits_dtype))
+    def fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float):
+        logits_dtype_str = str(logits_dtype).split('.')[-1]
+        return _C.fp8_fp4_paged_mqa_logits(q, kv_data, kv_sf, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str)
 
-    def fp8_fp4_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0, logits_dtype='float32'):
+    def fp8_fp4_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float):
         (q, q_sf) = _parse_tensor_or_tuple(q)
-        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k, tvm_ffi.dtype(logits_dtype))
+        logits_dtype_str = str(logits_dtype).split('.')[-1]
+        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k, logits_dtype_str)
 
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms):
         return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)

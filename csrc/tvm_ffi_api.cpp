@@ -467,13 +467,13 @@ Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
 Tensor dg_fp8_fp4_mqa_logits(TensorView q, TensorView q_sf, TensorView kv_data, TensorView kv_sf,
                             TensorView weights, TensorView cu_seq_len_k_start,
                             TensorView cu_seq_len_k_end, bool clean_logits, int64_t max_seqlen_k,
-                            DLDataType logits_dtype) {
+                            std::string logits_dtype) {
     auto result = attention::fp8_fp4_mqa_logits(
         std::make_pair(convert_to_torch_tensor(q), convert_to_torch_tensor(q_sf)),
         std::make_pair(convert_to_torch_tensor(kv_data), convert_to_torch_tensor(kv_sf)),
         convert_to_torch_tensor(weights), convert_to_torch_tensor(cu_seq_len_k_start),
         convert_to_torch_tensor(cu_seq_len_k_end), clean_logits, static_cast<int>(max_seqlen_k),
-        dl_dtype_to_torch(logits_dtype));
+        string_to_dtype(logits_dtype));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
@@ -481,7 +481,7 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, TensorView q_sf, TensorView fus
                               TensorView weights, TensorView context_lens,
                               TensorView block_table, TensorView schedule_meta,
                               int64_t max_context_len, bool clean_logits,
-                              DLDataType logits_dtype, Optional<TensorView> indices) {
+                              std::string logits_dtype, Optional<TensorView> indices) {
     auto indices_val = indices.has_value()?
         std::optional<torch::Tensor>(convert_to_torch_tensor(indices.value()))
         : std::nullopt;
@@ -491,7 +491,7 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, TensorView q_sf, TensorView fus
         convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
         convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
         static_cast<int>(max_context_len), clean_logits,
-        dl_dtype_to_torch(logits_dtype), indices_val);
+        string_to_dtype(logits_dtype), indices_val);
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 

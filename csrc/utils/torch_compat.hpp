@@ -50,6 +50,14 @@ inline std::string dtype_to_string(at::ScalarType dtype) {
     return std::string(c10::toString(dtype));
 }
 
+inline at::ScalarType string_to_dtype(const std::string& dtype_str) {
+   auto it = c10::getStringToDtypeMap().find(dtype_str);
+   if (it == c10::getStringToDtypeMap().end()) {
+       DG_HOST_UNREACHABLE("Unsupported dtype string");
+   }
+   return it->second;
+}
+
 // ---------------------------------------------------------------------------
 // CUDA stream helper
 // ---------------------------------------------------------------------------
