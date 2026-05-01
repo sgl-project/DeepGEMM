@@ -1,0 +1,179 @@
+# Manually-triggered release pipeline for the `sgl-deepgemm` PyPI package.
+#
+# This workflow lives on the `release` branch. It is independent of upstream
+# DeepGEMM versioning: the operator supplies an `sgl-deepgemm` version string
+# and a commit SHA on this repo, and the workflow builds wheels from that
+# commit and uploads them to PyPI.
+#
+# To publish:
+#   1. Go to Actions -> "Release sgl-deepgemm to PyPI" -> Run workflow
+#   2. Fill in `version` (e.g. 0.1.0) and `commit` (full or short SHA).
+#   3. The job builds wheels for each Python in the matrix, then uploads them
+#      to PyPI using the PYPI_API_TOKEN repository secret.
+#
+# Notes:
+# - PyPI requires manylinux platform tags; we rebrand `linux_x86_64` produced
+#   by ubuntu-22.04 (glibc 2.35) to `manylinux_2_35_x86_64`.
+# - The release branch uses tvm-ffi for the C++ extension, so the wheel is
+#   torch-version-agnostic; we build with a single torch version.
+
+name: Release sgl-deepgemm to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "sgl-deepgemm version to publish (e.g. 0.1.0). PEP 440. No local segment."
+        required: true
+        type: string
+      commit:
+        description: "Commit SHA on sgl-project/DeepGEMM (release branch) to build from"
+        required: true
+        type: string
+      python-versions:
+        description: "JSON list of Python versions to build for"
+        required: false
+        type: string
+        default: '["3.10", "3.11", "3.12"]'
+      torch-version:
+        description: "PyTorch version used at build time (build-only dep)"
+        required: false
+        type: string
+        default: "2.8.0"
+      cuda-version:
+        description: "CUDA toolkit version to install on the runner"
+        required: false
+        type: string
+        default: "12.9.1"
+      dry-run:
+        description: "Build wheels but skip the PyPI upload"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+jobs:
+  build-wheel:
+    name: Build wheel (py${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    steps:
+      - name: Checkout at ${{ inputs.commit }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set helper env vars
+        run: |
+          echo "MATRIX_CUDA_VERSION=$(echo ${{ inputs.cuda-version }} | awk -F. '{print $1$2}')" >> $GITHUB_ENV
+          echo "MATRIX_TORCH_VERSION=$(echo ${{ inputs.torch-version }} | awk -F. '{print $1"."$2}')" >> $GITHUB_ENV
+          echo "MATRIX_PYTHON_VERSION=$(echo ${{ matrix.python-version }} | awk -F. '{print $1$2}')" >> $GITHUB_ENV
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Set up swap
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
+
+      - name: Install CUDA ${{ inputs.cuda-version }}
+        uses: Jimver/cuda-toolkit@v0.2.26
+        with:
+          cuda: ${{ inputs.cuda-version }}
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+
+      - name: Install additional CUDA libraries
+        run: |
+          CUDA_VERSION=$(echo ${{ inputs.cuda-version }} | awk -F. '{print $1"-"$2}')
+          sudo apt-get update
+          sudo apt-get install -y libcusparse-$CUDA_VERSION libcusolver-$CUDA_VERSION
+          sudo apt-get clean
+
+      - name: Install PyTorch ${{ inputs.torch-version }}
+        run: |
+          pip install --upgrade pip
+          pip install typing-extensions==4.12.2
+          export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
+            minv = {'2.4': 118, '2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'2.4': 124, '2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129}[env['MATRIX_TORCH_VERSION']]; \
+            print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)")
+          pip install --no-cache-dir torch==${{ inputs.torch-version }} --index-url https://download.pytorch.org/whl/cu${TORCH_CUDA_VERSION}
+          nvcc --version
+          python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)"
+
+      - name: Build wheel
+        env:
+          DG_USE_LOCAL_VERSION: "0"
+          SGL_DEEPGEMM_PACKAGE: "sgl-deepgemm"
+          SGL_DEEPGEMM_VERSION: ${{ inputs.version }}
+        run: |
+          pip install setuptools==75.8.0 ninja packaging wheel apache-tvm-ffi
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+          export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
+          export NVCC_THREADS=2
+          export TORCH_CUDA_ARCH_LIST="9.0 10.0+PTX"
+
+          rm -rf build dist *.egg-info
+          python setup.py bdist_wheel --dist-dir=dist
+          ls dist/
+
+      - name: Rebrand wheel platform tag for PyPI
+        run: |
+          # PyPI rejects `linux_x86_64`. ubuntu-22.04 ships glibc 2.35, so the
+          # produced binaries are compatible with manylinux_2_35_x86_64.
+          pip install wheel
+          for whl in dist/*linux_x86_64.whl; do
+            new=$(basename "$whl" | sed 's/linux_x86_64/manylinux_2_35_x86_64/')
+            mv "$whl" "dist/$new"
+          done
+          ls dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build-wheel
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: List wheels to upload
+        run: ls -lah dist/
+
+      - name: Upload to PyPI via twine
+        env:
+          TWINE_USERNAME: "__token__"
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install twine
+          python -m twine upload --non-interactive --verbose dist/*.whl

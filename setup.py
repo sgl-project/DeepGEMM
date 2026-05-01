@@ -16,6 +16,13 @@ DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
+# Distribution identity overrides (used by the sgl-deepgemm release workflow).
+# These let a downstream packager publish to PyPI under a different name and
+# version without touching deep_gemm/__init__.py. The on-disk import name stays
+# `deep_gemm`; only the dist metadata changes.
+SGL_DEEPGEMM_PACKAGE = os.getenv('SGL_DEEPGEMM_PACKAGE', '').strip()
+SGL_DEEPGEMM_VERSION = os.getenv('SGL_DEEPGEMM_VERSION', '').strip()
+
 current_dir = os.path.dirname(os.path.realpath(__file__))
 
 third_party_include_dirs = [
@@ -42,6 +49,9 @@ CUDA_HOME = _find_cuda_home()
 
 
 def get_package_version():
+    if SGL_DEEPGEMM_VERSION:
+        return SGL_DEEPGEMM_VERSION
+
     with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
@@ -174,7 +184,7 @@ class CustomBuildPy(build_py):
 
 if __name__ == '__main__':
     setuptools.setup(
-        name='deep_gemm',
+        name=SGL_DEEPGEMM_PACKAGE or 'deep_gemm',
         version=get_package_version(),
         packages=find_packages('.'),
         package_data={
