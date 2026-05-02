@@ -5,6 +5,8 @@ and handle output tensor allocation on the Python side.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 from .math import align, ceil_div
 
@@ -20,6 +22,12 @@ def get_tma_aligned_size(mn: int, element_size: int) -> int:
 
 def get_mk_alignment_for_contiguous_layout() -> int:
     return int(_get_C().get_mk_alignment_for_contiguous_layout())
+
+def set_mk_alignment_for_contiguous_layout(new_value: int):
+    _get_C().set_mk_alignment_for_contiguous_layout(new_value)
+
+def get_theoretical_mk_alignment_for_contiguous_layout(expected_m: Optional[int] = None) -> int:
+    return int(_get_C().get_theoretical_mk_alignment_for_contiguous_layout(expected_m))
 
 get_m_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
 get_k_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
@@ -57,10 +65,10 @@ try:
         return _get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
     def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf: torch.Tensor, ks_tensor: torch.Tensor, ks: list[int]) -> torch.Tensor:
+            sf: torch.Tensor, ks_tensor: torch.Tensor, ks: list[int], gran_k: int) -> torch.Tensor:
         """Pack k-grouped FP32 scaling factors into UE8M0 int32 in MN-major TMA-aligned layout."""
         return _get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf, ks_tensor, ks)
+            sf, ks_tensor, ks, gran_k)
 
 except AttributeError:
     pass

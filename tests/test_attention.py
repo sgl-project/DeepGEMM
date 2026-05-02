@@ -48,7 +48,7 @@ def test_gemm_skip_head_mid() -> None:
                 d = apply_skip_head_mid(d, head_splits)
                 ref_d = apply_skip_head_mid(ref_d, head_splits)
 
-                deep_gemm.fp8_gemm_nt_skip_head_mid(a[0], a[1], b[0], b[1], d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
+                deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
                 diff = calc_diff(d, ref_d)
                 assert diff < 0.001, f'{m=}, {n=}, {k=}, {kernel_opt}, {diff:.5f}'
 

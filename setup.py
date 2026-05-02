@@ -10,6 +10,7 @@ from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
