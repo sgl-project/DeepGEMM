@@ -34,6 +34,27 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    // ====== Stream A0.1 — DG_USE_FP4_ACTS ======
+    // When true, the L1 epilogue quantizes its SwiGLU outputs to E2M1 (FP4) +
+    // UE8M0 SF instead of E4M3 (FP8) + UE8M0 SF. The per-row gmem footprint
+    // halves (intermediate_hidden / 2 packed bytes vs intermediate_hidden FP8
+    // bytes) and the smem CD staging is sized accordingly. The L2 phase still
+    // reads its activations as FP8 in this step (separate flag for A0.2), so
+    // end-to-end output is intentionally not bit-equivalent to the FP8 path —
+    // the accuracy harness compares L1's quantized output decoded back to BF16.
+    bool kUseFp4Acts = false,
+    // ====== Stream A0.5 — DG_USE_MXF4_KIND ======
+    // When true (and `kUseFp4Acts` also true), L1 + L2 mainloops swap from
+    // `kind::mxf8f6f4.block_scale.block32` (K=32 with-padding FP4 smem) to
+    // `kind::mxf4.block_scale.block32` (K=64 dense FP4 smem). Per the
+    // `recipes/mxf4_vs_mxf8f6f4` microbench, `kind::mxf4` delivers 2× FLOPS/
+    // cycle in isolation; the standalone GEMM (`kernels/fused_gemm_mxf4_native_1cta`)
+    // realizes +22%, the fused capstone (`kernels/fused_swiglu_mxf4_native_two_gemm`)
+    // realizes +20.6%. This kernel ports the same swap into the production
+    // mega_moe path. `kind::mxf4` is K-major-only (PTX ISA Table 53) and
+    // accepts only E2M1 inputs — see the host-side `DG_HOST_ASSERT(not
+    // use_mxf4_kind or use_fp4_acts)` in `mega.hpp`.
+    bool kUseMxf4Kind = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -48,6 +69,7 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
+                            int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -91,10 +113,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Workspaces
     const auto workspace = layout::Workspace(
-        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, BLOCK_M);
+        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     // Token and buffer layouts
-    constexpr auto fp8_token_layout = layout::Data(kHidden);
+    // ====== Stream A0.0b — DG_USE_FP4_ACTS L1 input path ======
+    // When `kUseFp4Acts`, the symmetric `x` slot (and the L1 token pool that
+    // mirrors it) holds packed E2M1 (FP4) instead of dense E4M3 (FP8). The
+    // packed footprint is `kHidden / 2` bytes per token. The SF slot is
+    // unchanged (`kHidden / 32` bytes — `gran_k=32` for both FP4 and FP8 acts
+    // under `kind::mxf8f6f4`).
+    constexpr uint32_t kInputTokenBytes = kUseFp4Acts ? (kHidden / 2) : kHidden;
+    constexpr auto fp8_token_layout = layout::Data(kInputTokenBytes);
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
     constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
@@ -161,22 +190,52 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
+    // Stream A0.2: when `kUseFp4Acts` is on, the L2 phase reads acts as
+    // E2M1 instead of E4M3. Both share the same byte footprint in smem
+    // (FP8 = 1 B, FP4 unpacksmem = 1 B with `_ALIGN16B` padding), so the
+    // smem A allocation, swizzle mode (128 B), and umma_desc stride math
+    // are identical. Only the *MMA instruction descriptor*'s A-dtype field
+    // and the source-side TMA `expect_tx` differ between phases.
+    using l2_a_dtype_t = cute::conditional_t<kUseFp4Acts, b_dtype_t, a_dtype_t>;
+    // Stream A0.0b: same deal for L1 — when `kUseFp4Acts` is on, the L1
+    // phase reads its A operand from the L1 token pool as packed E2M1.
+    // Same `_ALIGN16B` padded smem layout as L2; same MMA instruction
+    // descriptor flip from E4M3 to E2M1.
+    using l1_a_dtype_t = cute::conditional_t<kUseFp4Acts, b_dtype_t, a_dtype_t>;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
-    constexpr uint32_t UMMA_K = 32;
+    // Stream A0.5: kind::mxf4 runs K=64 dense per call (vs K=32 for
+    // kind::mxf8f6f4). BLOCK_K stays 128 elements; the # of MMA calls per
+    // K-tile (`BLOCK_K / UMMA_K`) halves from 4 to 2.
+    constexpr uint32_t UMMA_K = kUseMxf4Kind ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
-    DG_STATIC_ASSERT(BLOCK_M % 32 == 0, "Invalid block M");
+    DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
 
     // Swizzle configs
-    constexpr uint32_t kSwizzleAMode = BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t kSwizzleBMode = BLOCK_K * sizeof(b_dtype_t);
+    // Stream A0.5: under `kUseMxf4Kind`, A and B smem use the dense FP4
+    // layout (`_ALIGN8B`, 2 nibbles/byte) instead of the with-padding
+    // layout (`_ALIGN16B`, 1 byte per element). Per-K-row byte stride
+    // halves: BLOCK_K elements × 0.5 B/elem = BLOCK_K / 2 bytes. Swizzle
+    // mode tracks the row-byte width.
+    constexpr uint32_t kSwizzleAMode = kUseMxf4Kind
+        ? (BLOCK_K / 2)
+        : (BLOCK_K * static_cast<uint32_t>(sizeof(a_dtype_t)));
+    constexpr uint32_t kSwizzleBMode = kUseMxf4Kind
+        ? (BLOCK_K / 2)
+        : (BLOCK_K * static_cast<uint32_t>(sizeof(b_dtype_t)));
+    // Stream A0.2: l2_a_dtype must keep the same smem footprint as
+    // a_dtype so SMEM_A_SIZE_PER_STAGE / kSwizzleAMode are unchanged.
+    DG_STATIC_ASSERT(sizeof(l2_a_dtype_t) == sizeof(a_dtype_t),
+                     "L2 A dtype must match A in smem footprint");
+    DG_STATIC_ASSERT(sizeof(l1_a_dtype_t) == sizeof(a_dtype_t),
+                     "L1 A dtype must match A in smem footprint");
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
@@ -191,16 +250,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Shared memory sizes
     // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
+    // ====== Stream A0.1 ======
+    // FP4 path packs 2 elements per byte → row footprint halves. We keep
+    // `L1_OUT_BLOCK_N` in *elements* and introduce a row-byte-stride that
+    // depends on the flag, so the existing offset arithmetic (`row *
+    // L1_OUT_BLOCK_N_BYTES`) still works for both paths.
+    constexpr uint32_t L1_OUT_ROW_BYTES = kUseFp4Acts ? (L1_OUT_BLOCK_N / 2) : L1_OUT_BLOCK_N;
     constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    // Stream A0.5: under `kUseMxf4Kind`, dense FP4 smem (2 nibbles/byte)
+    // halves the per-stage byte footprint vs the with-padding layout.
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kUseMxf4Kind
+        ? (LOAD_BLOCK_M * BLOCK_K / 2)
+        : (LOAD_BLOCK_M * BLOCK_K * static_cast<uint32_t>(sizeof(a_dtype_t)));
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = kUseMxf4Kind
+        ? (LOAD_BLOCK_N * BLOCK_K / 2)
+        : (LOAD_BLOCK_N * BLOCK_K * static_cast<uint32_t>(sizeof(b_dtype_t)));
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
+    // L1 CD smem: FP8 path = STORE_BLOCK_M * L1_OUT_BLOCK_N bytes/stage,
+    // FP4 path = STORE_BLOCK_M * L1_OUT_BLOCK_N / 2 bytes/stage.
     constexpr uint32_t SMEM_CD_L1_SIZE =
-        kNumEpilogueWarpgroups * STORE_BLOCK_M * L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t) * kNumTMAStoreStages;
+        kNumEpilogueWarpgroups * STORE_BLOCK_M * L1_OUT_ROW_BYTES * kNumTMAStoreStages;
     constexpr uint32_t SMEM_CD_L2_SIZE =
         kNumEpilogueWarpgroups * STORE_BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
@@ -269,7 +342,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumEpilogueWarps * 2);
 
     // A cluster sync is essential for 2CTA tensor memory allocation
-    cute::cluster_sync();
+    comm::cluster_sync_with_relaxed_arrive();
 
     // Initialization
     if (warp_idx == 0) {
@@ -307,7 +380,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
-    cute::cluster_sync();
+    // NOTES: Using `.relaxed` is allowed here since `fence_barrier_init` is `.release.cluster`,
+    // and `barrier.cluster.wait.aligned` is by default `.acquire`
+    comm::cluster_sync_with_relaxed_arrive();
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -542,12 +617,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
             // TMA load token from remote rank into shared memory
+            // Stream A0.0b: under `kUseFp4Acts`, the source slot in the
+            // remote rank's symmetric `x` buffer is packed E2M1 (kHidden/2
+            // bytes), so the per-token NVLink pull halves. The local pull
+            // buffer / l1 token buffer is sized off `fp8_token_layout` which
+            // already reflects the FP4 footprint (see `kInputTokenBytes`).
             if (cute::elect_one_sync()) {
                 ptx::tma_load_1d(
                     pull_buffer.get_base_ptr(),
                     sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
                                    current_rank_in_expert_idx),
-                    pull_mbarrier, kHidden);
+                    pull_mbarrier, kInputTokenBytes);
             }
             __syncwarp();
 
@@ -578,7 +658,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
                 // Wait for TMA token load to complete
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                // Stream A0.0b: expect_tx halves with the FP4 packed footprint.
+                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kInputTokenBytes);
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
                 // Store token to local L1 buffer via TMA
@@ -599,7 +680,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
-        // Clean workspace for the next usage
+        // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -623,19 +704,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                // Clean expert token count
-                if (thread_idx == 0)
+                // Clean expert token count, and add cumulative results
+                DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
+                if (warp_idx == 0) {
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                } else if (warp_idx == 1) {
+                    if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+                        ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                    __syncwarp();
+                }
 
                 // Clean per-rank token count
                 for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
                     *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                __syncwarp();
 
                 // Clean L1 and L2 arrival stuffs
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
                     *workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + j) = 0;
                     *workspace.get_l2_arrival_mask_ptr(expert_pool_block_offset + j) = 0;
                 }
+                __syncwarp();
             }
         }
 
@@ -672,23 +761,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected);
+            } else {
+                // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
+                // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
+                // with L2, but this optimization is negative when `num_experts_per_wave`
+                // guarantees L1's completion when L2 starts. So we remove it.
+                // In the future, if `num_experts_per_wave` is not large enough
+                // due to small `num_experts_per_rank`, we may need to add it back or add a switch
+                DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
+                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
+                // to avoid undefined behavior when `num_k_blocks == 32`
+                const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
+                while (ptx::ld_acq_gpu(ptr) != expected);
             }
 
-            uint64_t cached_l2_arrival_mask = 0;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait current K block arrival
-                if (block_phase == sched::BlockPhase::Linear2) {
-                    // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2 L1 blocks' arrival
-                    DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
-                    const uint64_t needed = 3ull << (k_block_idx * 2);
-                    if ((cached_l2_arrival_mask & needed) != needed) {
-                        const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                        do {
-                            cached_l2_arrival_mask = ptx::ld_acq_gpu(ptr);
-                        } while ((cached_l2_arrival_mask & needed) != needed);
-                    }
-                }
-
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -702,14 +790,50 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (not is_leader_cta)
                     m_idx += scheduler.template get_valid_m<true>() / 2;
 
-                // TMA copy tokens and SFA, then arrive at full barrier
+                // TMA copy tokens and SFA, then arrive at full barrier.
+                // Stream A0.2 + A0.0b: under FP4 acts, BOTH L1 and L2 phases
+                // load A as packed E2M1 (`l1_a_dtype_t == l2_a_dtype_t == b_dtype_t`).
+                // Same per-byte smem layout as FP8 A (1 B/elem under `_ALIGN16B`),
+                // but source-side packed bytes are halved → expect_tx halved.
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
+                    if constexpr (kUseMxf4Kind) {
+                        // Stream A0.5: dense FP4 smem (`_ALIGN8B`). The TMA
+                        // descriptor's inner box covers BLOCK_K elements in
+                        // BLOCK_K/2 bytes per row; one cluster-multicast TMA
+                        // call fills the full A stage. Bypass `tma::copy`
+                        // because its `BLOCK_INNER_ATOM = kSwizzleMode /
+                        // sizeof(dtype_t)` math assumes ≥1-byte elements
+                        // and would mis-stride sub-byte FP4 destinations.
+                        cute::SM100_TMA_2SM_LOAD_2D::copy(
+                            tensor_map_a_ptr,
+                            reinterpret_cast<uint64_t*>(full_barriers[stage_idx]),
+                            static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                            reinterpret_cast<uint8_t*>(smem_a[stage_idx]),
+                            k_idx, m_idx);
+                    } else if constexpr (kUseFp4Acts) {
+                        // Both Linear1 (L1) and Linear2 (L2) take the FP4 path.
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, l1_a_dtype_t>(
+                            tensor_map_a_ptr, full_barriers[stage_idx],
+                            reinterpret_cast<l1_a_dtype_t*>(smem_a[stage_idx]),
+                            k_idx, m_idx, 2);
+                    } else {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
+                            k_idx, m_idx, 2);
+                    }
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * 2 + SF_BLOCK_M * sizeof(uint32_t) * 2);
+                        // Stream A0.5: under `kUseMxf4Kind`, smem A is dense
+                        // FP4 (LOAD_BLOCK_M * BLOCK_K / 2 bytes per CTA, equal
+                        // to source-side packed bytes — no `_ALIGN16B` doubling).
+                        // For 2 CTAs (cluster multicast), tx-count is
+                        // `2 * SMEM_A_SIZE_PER_STAGE` — same multiplier as the
+                        // FP8 dense path.
+                        const uint32_t expect_a_bytes = (kUseFp4Acts and not kUseMxf4Kind)
+                            ? SMEM_A_SIZE_PER_STAGE       // FP4 _ALIGN16B: source = LOAD_BLOCK_M * BLOCK_K / 2 per CTA × 2 CTAs (smem 2× larger)
+                            : SMEM_A_SIZE_PER_STAGE * 2;  // FP8 dense or FP4 dense (mxf4): source = smem footprint × 2 CTAs
+                        full_barriers[stage_idx]->arrive_and_expect_tx(expect_a_bytes + SF_BLOCK_M * sizeof(uint32_t) * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
@@ -747,12 +871,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                        tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 2);
+                    if constexpr (kUseMxf4Kind) {
+                        // Stream A0.5: dense FP4 smem; one cluster-multicast
+                        // TMA call covers the full B stage. See A-side comment.
+                        cute::SM100_TMA_2SM_LOAD_2D::copy(
+                            tensor_map_b_ptr,
+                            reinterpret_cast<uint64_t*>(full_barriers[stage_idx]),
+                            static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                            reinterpret_cast<uint8_t*>(smem_b[stage_idx]),
+                            k_idx, n_idx);
+                    } else {
+                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 2);
+                    }
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t) * 2);
+                        // Stream A0.5: B-side tx-count for cluster-multicast
+                        // counts SOURCE BYTES PER PEER × 2 PEERS (broadcast: both
+                        // peers receive a copy of the same source bytes). For the
+                        // existing FP4 unpacksmem path, that happens to equal
+                        // `LOAD_BLOCK_N * BLOCK_K * 1B = SMEM_B_SIZE_PER_STAGE`
+                        // (sizeof(b_dtype_t)=1 makes "smem footprint" a coincidental
+                        // alias for source-bytes-summed). Under mxf4 dense FP4,
+                        // SMEM_B_SIZE_PER_STAGE halves to `LOAD_BLOCK_N * BLOCK_K / 2`,
+                        // so we need `* 2` to get the same source-bytes-summed value.
+                        const uint32_t expect_b_bytes = kUseMxf4Kind
+                            ? SMEM_B_SIZE_PER_STAGE * 2
+                            : SMEM_B_SIZE_PER_STAGE;
+                        full_barriers[stage_idx]->arrive_and_expect_tx(expect_b_bytes + BLOCK_N * sizeof(uint32_t) * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
@@ -773,11 +920,53 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
+            // Stream A0.2 + A0.0b: when both L1 and L2 read FP4 acts under
+            // `kUseFp4Acts`, we need a separate instruction descriptor whose
+            // A-dtype field is E2M1 (not E4M3). All other fields (block-scale
+            // shape, UMMA M/N/K, K-major) are unchanged. The smem layout
+            // descriptors don't change because both dtypes have `sizeof = 1`
+            // (FP4 has the `_ALIGN16B` 1-byte-per-element padded smem layout).
+            // Single shared idesc — both `l1_a_dtype_t` and `l2_a_dtype_t`
+            // resolve to `b_dtype_t` (E2M1 unpacksmem) under the flag.
+            //
+            // Stream A0.5: under `kUseMxf4Kind`, the descriptor's a/b_format
+            // fields encode E2M1 as `MXF4Format::E2M1 = 1`, NOT
+            // `MXF8F6F4Format::E2M1 = 5`. CUTLASS picks the right enum via
+            // `to_UMMAFormat<T>()`: passing `cute::float_e2m1_t` (dense) yields
+            // `MXF4Format::E2M1=1`; passing `cutlass::detail::float_e2m1_unpacksmem_t`
+            // yields `MXF8F6F4Format::E2M1=5`. Wrong encoding → the kernel
+            // launches but throws `cudaErrorIllegalInstruction` on first MMA.
+            using mxf4_e2m1_t = cute::float_e2m1_t;
+            using fp4_a_dtype_for_idesc = cute::conditional_t<
+                kUseMxf4Kind, mxf4_e2m1_t, b_dtype_t>;
+            using fp4_b_dtype_for_idesc = cute::conditional_t<
+                kUseMxf4Kind, mxf4_e2m1_t, l1_a_dtype_t>;
+            auto instr_desc_fp4 = cute::UMMA::make_instr_desc_block_scaled<
+                fp4_a_dtype_for_idesc, fp4_b_dtype_for_idesc,
+                float, cutlass::float_ue8m0_t,
+                UMMA_M, UMMA_N,
+                cute::UMMA::Major::K, cute::UMMA::Major::K
+            >();
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
-            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+            // Stream A0.5: under `kUseMxf4Kind`, smem A and B carry dense
+            // FP4 (2 nibbles/byte). The `make_umma_desc` helper asserts
+            // `kSwizzleMode == BLOCK_K * sizeof(dtype_t)`, so we pass a
+            // BLOCK_K of `BLOCK_K / 2` (the byte count) and `dtype_t =
+            // uint8_t` to get the right byte-stride math. The smem ptrs
+            // are reinterpreted to `uint8_t*` since the underlying buffer
+            // is just bytes.
+            cute::UMMA::SmemDescriptor a_desc, b_desc;
+            if constexpr (kUseMxf4Kind) {
+                a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K / 2, kSwizzleAMode>(
+                    reinterpret_cast<uint8_t*>(smem_a[0]), 0, 0);
+                b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K / 2, kSwizzleBMode>(
+                    reinterpret_cast<uint8_t*>(smem_b[0]), 0, 0);
+            } else {
+                a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
+                b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+            }
             uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
             uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -795,6 +984,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                          const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                 // Dynamic update of UMMA N based on effective M
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, scheduler.template get_valid_m<true>());
+                if constexpr (kUseFp4Acts)
+                    mma::sm100::update_instr_desc_with_umma_n(instr_desc_fp4, scheduler.template get_valid_m<true>());
 
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
@@ -841,19 +1032,51 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                         }
 
-                        // Issue UMMA
+                        // Issue UMMA. Stream A0.2: L2 phase under FP4 acts
+                        // uses `instr_desc_l2` (A=E2M1) instead of `instr_desc`
+                        // (A=E4M3). The smem K-stride for A is the same
+                        // (sizeof(l2_a_dtype_t) == sizeof(a_dtype_t) == 1) so
+                        // `advance_umma_desc_lo` on `a_dtype_t` is correct
+                        // for both phases.
+                        // Stream A0.5: under `kUseMxf4Kind`, swap the MMA to
+                        // `kind::mxf4` (cta_group::2). UMMA_K=64 (vs 32),
+                        // so K_PER_TILE=2 (vs 4). The SF address top-2 bits
+                        // are HALF-WORD offsets {0, 2} for scale_vec::2X
+                        // (NOT byte offsets {0..3}); encode as `k * 2`, not `k`.
+                        // Smem K-stride for the dense FP4 layout is `BLOCK_K/2`
+                        // bytes/row, so `advance_umma_desc_lo` is templated on
+                        // `uint8_t` and `BLOCK_K / 2` to match.
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                            const auto runtime_instr_desc =
-                                mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k);
-                            a_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, 0, k * UMMA_K);
-                            b_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
-                            ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                k_block_idx > 0 or k > 0, runtime_instr_desc,
-                                kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            if constexpr (kUseMxf4Kind) {
+                                const auto sf_id = k * 2u;  // half-word offset for scale_vec::2X
+                                const auto runtime_instr_desc =
+                                    mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc_fp4, sf_id, sf_id);
+                                a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, uint8_t>(
+                                        a_desc_base_lo, 0, k * UMMA_K / 2);
+                                b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, uint8_t>(
+                                        b_desc_base_lo, 0, k * UMMA_K / 2);
+                                ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
+                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                    kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            } else {
+                                // Stream A0.0b: under `kUseFp4Acts`, both L1 and L2 read
+                                // A as E2M1. Pick the FP4 idesc unconditionally when the flag is on.
+                                const auto runtime_instr_desc = kUseFp4Acts
+                                    ? mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc_fp4, k, k)
+                                    : mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, k, k);
+                                a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, 0, k * UMMA_K);
+                                b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                    cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
+                                ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
+                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                    kTmemStartColOfSFB, kTmemStartColOfSFA);
+                            }
                         }
                     }
                     __syncwarp();
@@ -953,8 +1176,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        DG_STATIC_ASSERT(WG_BLOCK_M % 32 == 0, "Invalid block size");
-                        if ((j * ATOM_M) % 32 == 0) {
+                        if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .get_base_ptr<float>();
@@ -1029,7 +1251,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Cast to FP8 E4M3 and store into shared memory
+                    // Cast to FP8 E4M3 (or FP4 E2M1 under `kUseFp4Acts`) and
+                    // store into shared memory.
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         // Reduce amax
@@ -1038,54 +1261,147 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
                         amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
 
-                        // Calculate SF
+                        // Calculate SF (UE8M0 byte; only the finfo divisor differs:
+                        // 1/448 for FP8 E4M3, 1/6 for FP4 E2M1).
                         float2 sf, sf_inv;
-                        math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        if constexpr (kUseFp4Acts) {
+                            math::get_e2m1_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        } else {
+                            math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        }
 
-                        // Cast
+                        // Apply scale, cast, store into shared memory.
                         const float2 upper = __fmul2_rn(swiglu_values[i * 2 + 0], sf_inv);
                         const float2 lower = __fmul2_rn(swiglu_values[i * 2 + 1], sf_inv);
-                        const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
+                        if constexpr (kUseFp4Acts) {
+                            // FP4 epilogue: write packed E2M1 nibbles to canonical
+                            // dense smem (TMA descriptor built with swizzle=0 →
+                            // byte-exact smem→gmem copy → canonical packed FP4
+                            // layout `[M, intermediate_hidden/2]` in gmem).
+                            //
+                            // Layout under SwapAB: `tcgen05.ld.16x256b.x1` puts
+                            // lane T's accumulator values (upper.x, upper.y,
+                            // lower.x, lower.y) at smem positions:
+                            //   upper.x → row 2*(T%4),   col_in_stripe T/4
+                            //   upper.y → row 2*(T%4)+1, col_in_stripe T/4
+                            //   lower.x → row 2*(T%4),   col_in_stripe T/4 + 8
+                            //   lower.y → row 2*(T%4)+1, col_in_stripe T/4 + 8
+                            // (16-byte stripe per warp_idx_in_wg ∈ 0..3, 64 B row.)
+                            // Adjacent N-cols therefore sit on lanes T and T XOR 4,
+                            // so packing two values into one FP4 byte requires a
+                            // `__shfl_xor 4` to pull the buddy. Half-warp gate
+                            // (group = lane/4, group%2==0) means each "active"
+                            // lane writes 4 bytes (upper.x, upper.y, lower.x,
+                            // lower.y) and the inactive half is a donor.
+                            //
+                            // The cross-quad shuffle and half-warp gate are
+                            // structural: they're a consequence of SwapAB's
+                            // datapoint=N orientation. Replacing with
+                            // `tcgen05.ld.32x32b.x8` would require dropping
+                            // SwapAB at the mainloop level. See
+                            // DeepGEMM/FP4_EPILOGUE_STORE_MICROBENCH.md for the
+                            // full microbench analysis (P-A through P-D) and
+                            // the negative results from bank-conflict
+                            // elimination + atom-interleaving.
+                            const float buddy_ux = __shfl_xor_sync(0xffffffffu, upper.x, 4);
+                            const float buddy_uy = __shfl_xor_sync(0xffffffffu, upper.y, 4);
+                            const float buddy_lx = __shfl_xor_sync(0xffffffffu, lower.x, 4);
+                            const float buddy_ly = __shfl_xor_sync(0xffffffffu, lower.y, 4);
 
-                        // STSM
-                        uint32_t row = lane_idx;
-                        uint32_t col = warp_idx_in_wg;
-                        const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
-                                                                     + i * ATOM_M * L1_OUT_BLOCK_N
-                                                                     + row * L1_OUT_BLOCK_N
-                                                                     + (col ^ (row / 2)) * kNumBankGroupBytes;
-                        ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
+                            const uint32_t frag  = lane_idx % 4;          // row-pair index 0..3
+                            const uint32_t group = lane_idx / 4;          // col-group index 0..7
+                            const bool     is_active = (group % 2u) == 0u;
+
+                            // Active lanes pack (own_val, buddy_val) into a byte
+                            // (own=low nibble, buddy=high) and write 4 bytes per
+                            // atom. `cvt_pack_f32_to_e2m1x2(a, b)` → {low=a, high=b}.
+                            if (is_active) {
+                                const uint8_t byte_ux = static_cast<uint8_t>(
+                                    math::cvt_pack_f32_to_e2m1x2(upper.x, buddy_ux));
+                                const uint8_t byte_uy = static_cast<uint8_t>(
+                                    math::cvt_pack_f32_to_e2m1x2(upper.y, buddy_uy));
+                                const uint8_t byte_lx = static_cast<uint8_t>(
+                                    math::cvt_pack_f32_to_e2m1x2(lower.x, buddy_lx));
+                                const uint8_t byte_ly = static_cast<uint8_t>(
+                                    math::cvt_pack_f32_to_e2m1x2(lower.y, buddy_ly));
+
+                                constexpr uint32_t kFp4WarpStripeBytes = 8;  // 16 elements / 2
+                                const uint32_t byte_pos_upper = group / 2u;             // 0..3
+                                const uint32_t byte_pos_lower = 4u + group / 2u;        // 4..7
+                                const uint32_t row_even = i * ATOM_M + 2u * frag;
+                                const uint32_t row_odd  = row_even + 1u;
+                                const auto base = smem_cd[tma_stage_idx]
+                                                + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_ROW_BYTES
+                                                + warp_idx_in_wg * kFp4WarpStripeBytes;
+                                auto write_byte = [&](uint32_t row, uint32_t bp, uint8_t v) {
+                                    auto p = base + row * L1_OUT_ROW_BYTES + bp;
+                                    asm volatile("st.shared.u8 [%0], %1;\n"
+                                                 :: "l"(__cvta_generic_to_shared(p)),
+                                                    "r"(static_cast<uint32_t>(v)));
+                                };
+                                write_byte(row_even, byte_pos_upper, byte_ux);
+                                write_byte(row_odd,  byte_pos_upper, byte_uy);
+                                write_byte(row_even, byte_pos_lower, byte_lx);
+                                write_byte(row_odd,  byte_pos_lower, byte_ly);
+                            }
+                        } else {
+                            const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
+
+                            // STSM
+                            uint32_t row = lane_idx;
+                            uint32_t col = warp_idx_in_wg;
+                            const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
+                                                                         + i * ATOM_M * L1_OUT_BLOCK_N
+                                                                         + row * L1_OUT_BLOCK_N
+                                                                         + (col ^ (row / 2)) * kNumBankGroupBytes;
+                            ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
+                        }
 
                         // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
                         if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                            // TODO: I believe the expression can be optimized
-                            const uint32_t token_idx_in_expert = m_block_idx * BLOCK_M
-                                + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2;
                             const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2;
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
                             // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
+                            // NOTES: originally there was:
+                            //   - `const uint32_t token_idx_in_expert = m_block_idx * BLOCK_M + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2
+                            //   - `scheduler.get_current_pool_block_offset() * SF_BLOCK_M + transform_sf_token_idx(token_idx_in_expert)`
+                            // We find out that
+                            //   1. `m_block_idx * BLOCK_M` mod `BLOCK_M` is 0, and `epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2` is always < `BLOCK_M`, so we can put `m_block_idx * BLOCK_M` outside
+                            //   2. `lane_idx * 2` controls the lowest 3 bit of `token_idx_in_expert`, and `transform_sf_token_idx` is a bitwise-independent transformation if the input is less than `BLOCK_M`, so we can put `lane_idx * 2` outside
+                            // This reduce the number of computation instructions.
+                            const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                            __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
-                                + transform_sf_token_idx(token_idx_in_expert);
-                            sf_base_ptr[k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx] =
+                                + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
+                            const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
+                            sf_base_ptr[sf_addr] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
-                            sf_base_ptr[k_uint_idx * mn_stride + (sf_pool_token_idx + 4) * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx] =
+                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
                         }
                         __syncwarp();
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Issue TMA store after all atoms in this store block
+                    // Issue TMA store after all atoms in this store block.
+                    // FP8 path: out_n in elements-of-FP8 (= bytes), smem
+                    // base offset by FP8 row width (L1_OUT_BLOCK_N).
+                    // FP4 path: TMA descriptor's element type is uint8 with
+                    // half the inner dim → out_n in packed bytes (=
+                    // L1_OUT_BLOCK_N / 2), smem base offset by
+                    // L1_OUT_ROW_BYTES = L1_OUT_BLOCK_N / 2 bytes.
                     if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                        uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
+                        const uint32_t out_n_idx = kUseFp4Acts
+                            ? (n_block_idx * (L1_OUT_BLOCK_N / 2))
+                            : (n_block_idx * L1_OUT_BLOCK_N);
                         cute::tma_store_fence();
                         cute::SM90_TMA_STORE_2D::copy(
                             &tensor_map_l1_output,
-                            smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N,
+                            smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_ROW_BYTES,
                             out_n_idx,
                             m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
                         cute::tma_store_arrive();
