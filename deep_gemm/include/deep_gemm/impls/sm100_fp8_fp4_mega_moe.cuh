@@ -1738,15 +1738,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Load the first selection
                 int active_slot = move_mask_and_load(load_stage_idx);
 
-                // Accumulate all top-k contributions for this chunk.
-                // BF16 path: FP32 accumulator pairs (float2).
-                // FP8 path: FP16x2 accumulator packed into uint32 (HFMA path —
-                //   half the registers, uses `fma.f16x2`. Production activations
-                //   post-SwiGLU + topk-weighting fit in FP16 dynamic range; if SF
-                //   bytes are outside [112, 143] (= FP16 exp range ±15) the
-                //   accumulator may overflow — disable FP8 combine in that case).
+                // Accumulate all top-k contributions for this chunk in float registers
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-                uint32_t reduced_fp16[kNumLoadUint4PerLane * kNumF32PairsPerLoadUint4] = {};
                 while (active_slot >= 0) {
                     // Prefetch next top-k into the buffer while current is being accumulated.
                     int next_slot = move_mask_and_load(load_stage_idx ^ 1);
@@ -1767,30 +1760,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint32_t sf_idx =
                                 (chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 16) / kCombineGranK;
                             const uint8_t sf_byte = __ldg(sf_token_ptr + sf_idx);
-                            // SF as FP16: 2^(sf_byte - 127), bias FP16=15 → exp_field = sf_byte - 112.
-                            // Pack into FP16x2 (replicated, both halves same value).
-                            const int sf_exp_fp16 = int(sf_byte) - 112;
-                            const uint16_t sf_fp16 =
-                                sf_exp_fp16 <= 0 ? uint16_t(0u)
-                                                 : (sf_exp_fp16 >= 31 ? uint16_t(0x7BFFu)
-                                                                       : uint16_t(uint32_t(sf_exp_fp16) << 10));
-                            const uint32_t sf_pair = (uint32_t(sf_fp16) << 16) | uint32_t(sf_fp16);
+                            const float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
                             const uint32_t* w = reinterpret_cast<const uint32_t*>(&uint4_values);
                             #pragma unroll
                             for (uint32_t l = 0; l < 4; ++ l) {
-                                // Each uint32 = 4 FP8 = 2 FP8x2 → 2 FP16x2 via cvt.rn.f16x2.e4m3x2.
+                                // Each uint32 = 4 FP8 = 2 FP8x2 — convert via FP16 intermediate.
                                 uint32_t f16_lo, f16_hi;
                                 asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
                                              : "=r"(f16_lo) : "h"(uint16_t(w[l] & 0xFFFFu)));
                                 asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
                                              : "=r"(f16_hi) : "h"(uint16_t(w[l] >> 16)));
-                                // HFMA: acc_fp16x2 += sf_pair * f16x2 (1 instruction per 2 elem).
-                                auto& acc_lo = reduced_fp16[j * kNumF32PairsPerLoadUint4 + l * 2 + 0];
-                                auto& acc_hi = reduced_fp16[j * kNumF32PairsPerLoadUint4 + l * 2 + 1];
-                                asm volatile("fma.rn.f16x2 %0, %1, %2, %3;"
-                                             : "=r"(acc_lo) : "r"(f16_lo), "r"(sf_pair), "r"(acc_lo));
-                                asm volatile("fma.rn.f16x2 %0, %1, %2, %3;"
-                                             : "=r"(acc_hi) : "r"(f16_hi), "r"(sf_pair), "r"(acc_hi));
+                                float vlx, vly, vhx, vhy;
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(vlx) : "h"(uint16_t(f16_lo & 0xFFFFu)));
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(vly) : "h"(uint16_t(f16_lo >> 16)));
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(vhx) : "h"(uint16_t(f16_hi & 0xFFFFu)));
+                                asm volatile("cvt.f32.f16 %0, %1;" : "=f"(vhy) : "h"(uint16_t(f16_hi >> 16)));
+                                auto& acc_lo = reduced[j * kNumF32PairsPerLoadUint4 + l * 2 + 0];
+                                auto& acc_hi = reduced[j * kNumF32PairsPerLoadUint4 + l * 2 + 1];
+                                acc_lo.x = __fmaf_rn(vlx, sf, acc_lo.x);
+                                acc_lo.y = __fmaf_rn(vly, sf, acc_lo.y);
+                                acc_hi.x = __fmaf_rn(vhx, sf, acc_hi.x);
+                                acc_hi.y = __fmaf_rn(vhy, sf, acc_hi.y);
                             }
                         }
                     } else {
@@ -1814,19 +1804,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kUseFp8Combine) {
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
-                        // FP16x2 acc → float2 → BF16x2 packed.
-                        // Each acc holds 2 FP16 values; 4 FP16x2 = 1 BF16 uint4 (8 BF16).
+                        // Lower BF16 uint4 (8 elements: pairs 0..3 of this input uint4).
                         uint4 lo, hi;
                         auto lo_bf = reinterpret_cast<nv_bfloat162*>(&lo);
                         auto hi_bf = reinterpret_cast<nv_bfloat162*>(&hi);
                         #pragma unroll
                         for (uint32_t l = 0; l < 4; ++ l) {
-                            const uint32_t a_lo = reduced_fp16[j * kNumF32PairsPerLoadUint4 + l];
-                            const uint32_t a_hi = reduced_fp16[j * kNumF32PairsPerLoadUint4 + 4 + l];
-                            __half2 h_lo = *reinterpret_cast<const __half2*>(&a_lo);
-                            __half2 h_hi = *reinterpret_cast<const __half2*>(&a_hi);
-                            lo_bf[l] = __float22bfloat162_rn(__half22float2(h_lo));
-                            hi_bf[l] = __float22bfloat162_rn(__half22float2(h_hi));
+                            lo_bf[l] = __float22bfloat162_rn(reduced[j * kNumF32PairsPerLoadUint4 + l]);
+                            hi_bf[l] = __float22bfloat162_rn(reduced[j * kNumF32PairsPerLoadUint4 + 4 + l]);
                         }
                         if (j == 0) {
                             ptx::tma_store_wait<0>();
