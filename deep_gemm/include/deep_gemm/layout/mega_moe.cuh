@@ -361,7 +361,8 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0) {
+                  const uint32_t& num_shared_experts = 0,
+                  const bool& use_fp4_acts = false) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -372,7 +373,8 @@ struct MegaMoEBuffer {
 
         // Layouts
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
+        const auto input_token_layout = layout::Data(
+            use_fp4_acts ? hidden / 2 : hidden * num_mma_elem_bytes);
         const auto bf16_token_layout = layout::Data(hidden * 2);
         const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
