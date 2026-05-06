@@ -64,12 +64,15 @@ struct MegaMoEConfig {
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& num_tokens) {
+    const int& num_tokens,
+    const bool& use_mxf4_kind = false) {
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
         float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
         if (num_expected_tokens_per_expert <= 8.5) {
-            // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
-            return {2, 16, 8, 256, 2};
+            // Really small token-per-expert (e.g. RL long-tail rollout), use larger BLOCK_K for less synchronization.
+            // Under kind::mxf4, bump block_m so the dense FP4 A/B smem tiles remain comfortably aligned.
+            return use_mxf4_kind ? std::tuple<int, int, int, int, int>{2, 32, 16, 256, 2}
+                                 : std::tuple<int, int, int, int, int>{2, 16, 8, 256, 2};
         } else if (num_expected_tokens_per_expert <= 16.5) {
             // Small batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 128
             return {2, 32, 16, 128, 2};
@@ -150,7 +153,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_bytes_per_pull, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
-    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const bool& use_mxf4_kind = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -185,9 +189,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sfa_per_stage = sf_block_m * (block_k / gran_k);
     const int smem_sfb_per_stage = sf_block_n * (block_k / gran_k);
 
-    // Per-stage: A tile + B tile + SF tiles + full/empty barriers
-    const int smem_a_size_per_stage = load_block_m * block_k;
-    const int smem_b_size_per_stage = block_n * block_k;
+    // Per-stage: A tile + B tile + SF tiles + full/empty barriers.
+    // Dense FP4 kind halves both A and B byte footprints in shared memory.
+    const int smem_a_size_per_stage = use_mxf4_kind ? (load_block_m * block_k / 2) : (load_block_m * block_k);
+    const int smem_b_size_per_stage = use_mxf4_kind ? (block_n * block_k / 2) : (block_n * block_k);
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
@@ -204,11 +209,12 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const int& num_padded_sf_pool_tokens) {
+    const int& num_padded_sf_pool_tokens,
+    const bool& use_mxf4_kind = false) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, use_mxf4_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
@@ -245,7 +251,8 @@ static MegaMoEConfig get_mega_moe_config(
         num_experts, hidden,
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
         sf_block_m, sf_block_n, gran_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        use_mxf4_kind);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
