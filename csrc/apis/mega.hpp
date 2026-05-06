@@ -75,7 +75,13 @@ get_symm_buffer_size_for_mega_moe(
     const bool host_use_fp4_acts = with_sf and num_shared_experts == 0 and
                                    get_env<int>("DG_USE_FP4_ACTS") != 0;
 
-    // Compute num_sf_ring_tokens (max across all candidate block sizes)
+    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the combine slot
+    // holds FP8 E4M3 (kHidden bytes/token) + a separate combine_sf slot
+    // holding UE8M0 SF bytes (kHidden/128 bytes/token, gran_k=128). When off,
+    // the combine slot holds BF16 (kHidden*2 bytes/token) and combine_sf is
+    // unused (zero-sized).
+    const bool host_use_fp8_combine = with_sf and get_env<int>("DG_USE_FP8_COMBINE") != 0;
+    // Padded SF pool tokens
     int num_sf_ring_tokens = 0;
     if (with_sf) {
         for (auto block_m: layout::kCandidateBlockM) {
@@ -90,7 +96,7 @@ get_symm_buffer_size_for_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts, host_use_fp4_acts
+        num_shared_experts, host_use_fp4_acts, host_use_fp8_combine
     );
 
     // Check SF buffer requirements
@@ -282,6 +288,13 @@ static void fp8_fp4_mega_moe(
     // `DG_USE_FP4_ACTS=1` (kind::mxf4 is FP4-only). See A6 capstone /
     // B2 standalone GEMM for the +20-22% headline.
     const bool use_mxf4_kind = use_fp4_acts and get_env<int>("DG_USE_MXF4_KIND") != 0;
+    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the L2 epilogue
+    // ships FP8 E4M3 + per-(token, N=128) UE8M0 SF over NVLink instead of
+    // BF16. The combine reduce dequantizes on the fly. NVLink bytes/token
+    // halve (from kHidden*2 → kHidden + kHidden/128). Independent of the
+    // FP4-acts / MXF4-kind flags above (those control the dispatch a2a +
+    // mainloops; this controls the combine a2a only).
+    const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -302,7 +315,7 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
-                               use_fp4_acts, use_mxf4_kind);
+                               use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

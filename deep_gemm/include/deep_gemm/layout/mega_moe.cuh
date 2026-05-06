@@ -348,7 +348,8 @@ struct MegaMoEBuffer {
            l1_topk_weights_buffer,
            l2_token_buffer,
            l2_sf_buffer,
-           combine_token_buffer;
+           combine_token_buffer,
+           combine_sf_buffer;
 
     CUTLASS_HOST_DEVICE
     MegaMoEBuffer(void* base,
@@ -362,7 +363,8 @@ struct MegaMoEBuffer {
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
                   const uint32_t& num_shared_experts = 0,
-                  const bool& use_fp4_acts = false) {
+                  const bool& use_fp4_acts = false,
+                  const bool& use_fp8_combine = false) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -375,7 +377,10 @@ struct MegaMoEBuffer {
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
         const auto input_token_layout = layout::Data(
             use_fp4_acts ? hidden / 2 : hidden * num_mma_elem_bytes);
-        const auto bf16_token_layout = layout::Data(hidden * 2);
+        const auto combine_token_layout = layout::Data(
+            use_fp8_combine ? hidden : hidden * 2);
+        const auto combine_sf_layout = layout::Data(
+            use_fp8_combine ? hidden / 128 : 0, false);
         const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
         const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
@@ -433,13 +438,16 @@ struct MegaMoEBuffer {
             l2_token_buffer.get_end_ptr());
 
         combine_token_buffer = Buffer(
-            bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
+            combine_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+        combine_sf_buffer = Buffer(
+            combine_sf_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
+            combine_token_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(combine_sf_buffer.get_end_ptr())
                - static_cast<uint8_t*>(workspace.base);
     }
 };
