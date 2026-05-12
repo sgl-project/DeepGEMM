@@ -262,6 +262,7 @@ from .mega import (
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    mega_moe_pre_dispatch,
 )
 
 # Some utils
