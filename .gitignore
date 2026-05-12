@@ -22,4 +22,5 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
-deep_gemm/_C_build
+deep_gemm/_C_buildsgl_deep_gemm/_C.so
+sgl_deep_gemm/_C_build/
