@@ -269,12 +269,6 @@ from . import testing
 from . import utils
 from .utils import *
 
-# Legacy Triton kernels for A100
-try:
-    from . import legacy
-except Exception as e:
-    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
-
 # Initialize CPP modules
 _C.init(
     os.path.dirname(os.path.abspath(__file__)),
