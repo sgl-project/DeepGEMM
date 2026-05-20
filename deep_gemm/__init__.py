@@ -143,6 +143,8 @@ get_num_sms = _C.get_num_sms
 # get_compile_mode = _C.get_compile_mode
 set_tc_util = _C.set_tc_util
 get_tc_util = _C.get_tc_util
+set_pdl = _C.set_pdl
+get_pdl = _C.get_pdl
 
 # cuBLASLt Kernels
 cublaslt_gemm_nt = _C.cublaslt_gemm_nt
