@@ -1,5 +1,16 @@
 # DeepGEMM
 
+
+### Notice for SGLang DeepGemm Fork Developers
+
+- `main` tracks upstream updates and should stay clean.
+- `dev` is the active SGL integration branch and can be force-updated during rebases. Please open pull requests to this branch
+- `release/*` branches are archives for past wheel releases and shouldn't be modified.
+
+For more instructions, please check this [document](https://github.com/sgl-project/DeepGEMM/blob/dev/sgl_deep_gemm/README.md).
+
+------------------------------------------------------------------------------------------------------------------------------
+
 DeepGEMM is a unified, high-performance tensor core kernel library that brings together the key computation primitives of modern large language models — GEMMs (FP8, FP4, BF16), fused MoE with overlapped communication (Mega MoE), MQA scoring for the lightning indexer, HyperConnection (HC), and more — into a single, cohesive CUDA codebase. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.
 
 DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), but avoids heavy reliance on their templates or algebras. The library is designed for simplicity, with only a limited number of core kernel functions, making it a clean and accessible resource for learning NVIDIA GPU kernel optimization techniques.
