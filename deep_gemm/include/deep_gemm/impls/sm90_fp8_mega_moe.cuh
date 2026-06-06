@@ -65,6 +65,43 @@ __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
 }
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
+          uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
+          uint32_t kNumExpertsPerRank,
+          uint32_t kNumExpertsPerWave,
+          uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kNumExpertsPerLane,
+          uint32_t kNumL1BlockNs, uint32_t kNumL2BlockNs,
+          uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
+          typename L1Func, typename L2Func>
+CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
+    sched::MegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K,
+                            L1_SHAPE_N, L1_SHAPE_K,
+                            L2_SHAPE_N, L2_SHAPE_K,
+                            kNumExpertsPerRank,
+                            kNumExpertsPerWave,
+                            kNumSMs, kNumRanks,
+                            kNumExpertsPerLane,
+                            kNumL1BlockNs, kNumL2BlockNs,
+                            kNumL1BlockKs, kNumL2BlockKs>& scheduler,
+    L1Func&& l1_func, L2Func&& l2_func) {
+    scheduler.fetch_expert_recv_count();
+    scheduler.set_expert_idx(0);
+
+    while (true) {
+        CUTE_TIE_DECL(scheduler.get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
+        if (block_phase == sched::BlockPhase::None)
+            break;
+
+        if (block_phase == sched::BlockPhase::Linear1) {
+            l1_func(current_local_expert_idx, kNumL1BlockKs, m_block_idx, n_block_idx);
+        } else {
+            l2_func(current_local_expert_idx, kNumL2BlockKs, m_block_idx, n_block_idx);
+        }
+    }
+}
+
 // ============================================================================
 // SM90 (Hopper) FP8 MegaMoE — full implementation
 // ----------------------------------------------------------------------------
@@ -762,20 +799,22 @@ sm90_fp8_mega_moe_impl(void* y,
         };
 
         if constexpr (kSplitPhaseHotPath) {
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                if (block_phase == sched::BlockPhase::Linear1) {
+            sm90_fp8_mega_moe_for_each_block_split(
+                scheduler,
+                [&](const uint32_t& local_expert_idx,
+                    const uint32_t& num_k_blocks,
+                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                     process_a_sfa_block(
                         std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
                         local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                } else {
+                },
+                [&](const uint32_t& local_expert_idx,
+                    const uint32_t& num_k_blocks,
+                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                     process_a_sfa_block(
                         std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
                         local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                }
-            });
+                });
         } else {
             scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
@@ -1731,20 +1770,22 @@ sm90_fp8_mega_moe_impl(void* y,
         };
 
         if constexpr (kSplitPhaseHotPath) {
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                if (block_phase == sched::BlockPhase::Linear1) {
+            sm90_fp8_mega_moe_for_each_block_split(
+                scheduler,
+                [&](const uint32_t& local_expert_idx,
+                    const uint32_t& num_k_blocks,
+                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                     process_math_block(
                         std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear1>{},
                         local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                } else {
+                },
+                [&](const uint32_t& local_expert_idx,
+                    const uint32_t& num_k_blocks,
+                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                     process_math_block(
                         std::integral_constant<sched::BlockPhase, sched::BlockPhase::Linear2>{},
                         local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                }
-            });
+                });
         } else {
             scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
