@@ -241,12 +241,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     activation_clamp = args.activation_clamp
     assert num_tokens <= num_max_tokens_per_rank
 
-    buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        group, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden
-    )
-
     # Inputs (BF16) + topk routing
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     l1_weights_bf16 = torch.randn(
@@ -262,6 +256,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # FP8 / FP4 quantizations needed by the kernel
     x_fp8 = per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    x_fp4 = per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
     def cast_grouped_weights_to_fp4(bf16_weights):
         num_groups, n, k = bf16_weights.shape
@@ -277,9 +272,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     transformed_l1_weights, transformed_l2_weights = \
         deep_gemm.transform_weights_for_mega_moe(l1_weights_fp4, l2_weights_fp4)
 
-    def run_once():
-        buffer.x[:num_tokens].copy_(x_fp8[0])
-        buffer.x_sf[:num_tokens].copy_(x_fp8[1])
+    def run_once(buffer, x_src):
+        buffer.x[:num_tokens].copy_(x_src[0])
+        buffer.x_sf[:num_tokens].copy_(x_src[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
         cumulative_local_expert_recv_stats.zero_()
@@ -294,27 +289,31 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         return y, cumulative_local_expert_recv_stats.clone()
 
+    # Buffer layout depends on DG_USE_FP4_ACTS; set the env before allocating.
+    def make_buffer(use_fp4_acts):
+        os.environ['DG_USE_FP4_ACTS'] = '1' if use_fp4_acts else '0'
+        os.environ['DG_COMM_KERNEL_DEBUG'] = '0'  # don't zero buffer between calls
+        return deep_gemm.get_symm_buffer_for_mega_moe(
+            group, num_experts,
+            num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden
+        )
+
     # ---- BF16 reference for L1 SwiGLU output (per token×topk) ----
     bf16_ref = _bf16_reference_l1(
         x_bf16, l1_weights_bf16, topk_idx, topk_weights, activation_clamp)
     # bf16_ref: (num_tokens, num_topk, intermediate_hidden) — only nonzero
     # where topk_idx[t, k] is in this rank's expert range.
 
-    # ---- Run FP8 path ----
-    os.environ['DG_USE_FP4_ACTS'] = '0'
-    os.environ['DG_COMM_KERNEL_DEBUG'] = '0'  # don't zero buffer between calls
-    # First run is a warmup. Stream A0.2 verified FP8-vs-FP8 across two
-    # consecutive runs gives a perfect (rel-MAE = 0) `y` match — the kernel
-    # IS deterministic at the `y` level, so any nonzero FP4-vs-FP8 `y`
-    # delta is a real numerical disagreement, not slot-permutation noise.
-    _ = run_once()
+    # ---- Run FP8 path (first call warms up) ----
+    buffer_fp8 = make_buffer(use_fp4_acts=False)
+    _ = run_once(buffer_fp8, x_fp8)
     torch.cuda.synchronize()
-    y_fp8, recv_stats_fp8 = run_once()
+    y_fp8, recv_stats_fp8 = run_once(buffer_fp8, x_fp8)
     torch.cuda.synchronize()
-    y_fp8_a = y_fp8  # keep as alias so the FP8-vs-FP8 baseline below works
-    # Snapshot l2_acts and l2_acts_sf before they get overwritten by next call.
-    l2_acts_fp8 = buffer.l2_acts.clone()
-    l2_acts_sf_fp8 = buffer.l2_acts_sf.clone()
+    y_fp8_a = y_fp8
+    l2_acts_fp8 = buffer_fp8.l2_acts.clone()
+    l2_acts_sf_fp8 = buffer_fp8.l2_acts_sf.clone()
     recv_fp8_list = recv_stats_fp8.cpu().tolist()
     # `recv_stats` is per-expert cumulative — the last element is the running
     # total of tokens routed to this rank's experts (since dispatcher
@@ -322,11 +321,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # take the last value as the slot count.
     total_local_fp8 = int(recv_fp8_list[-1]) if recv_fp8_list else 0
 
-    # ---- Run FP4 path ----
-    os.environ['DG_USE_FP4_ACTS'] = '1'
-    _ = run_once()
+    # ---- Run FP4 path (separate buffer, laid out for packed E2M1) ----
+    buffer = make_buffer(use_fp4_acts=True)
+    _ = run_once(buffer, x_fp4)
     torch.cuda.synchronize()
-    y_fp4, recv_stats_fp4 = run_once()
+    y_fp4, recv_stats_fp4 = run_once(buffer, x_fp4)
     torch.cuda.synchronize()
     l2_acts_fp4 = buffer.l2_acts.clone()
     l2_acts_sf_fp4 = buffer.l2_acts_sf.clone()
