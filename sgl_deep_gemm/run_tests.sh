@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# Run the sgl-deep-gemm test suite against an installed sgl-deep-gemm wheel, as a
-# pre-release gate for sglang's release-whl-deepgemm.yml.
-#
-# Lives beside sgl_deep_gemm/tests/ so this gate versions with the tests it runs.
-# Tests must run from that dir so `import deep_gemm` resolves to the installed
-# wheel (which ships the pre-compiled tvm-ffi _C.so) rather than the source tree's
-# deep_gemm/ package, which differs and JIT-rebuilds _C. The guard below aborts if
-# that resolution is wrong, to avoid a false-positive gate.
+# Pre-release gate for the installed sgl-deep-gemm wheel (sglang's release-whl-deepgemm.yml).
+# Runs from sgl_deep_gemm/tests/ so `import deep_gemm` hits the wheel's prebuilt _C.so, not
+# the source tree (which JIT-rebuilds _C); the guard below aborts if that resolution is wrong.
 #
 # Usage: run_tests.sh [DEEPGEMM_SRC] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
 #   DEEPGEMM_SRC defaults to this script's own repo root.
