@@ -8,6 +8,7 @@
 #endif
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_pre_dispatch.hpp"
 #include "../utils/math.hpp"
 #include "../utils/system.hpp"
@@ -39,6 +40,13 @@ get_symm_buffer_size_for_mega_moe(
     const bool host_use_fp4_acts = get_env<int>("DG_USE_FP4_ACTS") != 0;
     const int input_token_bytes = host_use_fp4_acts ? (hidden / 2) : hidden;
 
+    // Packed FP4xFP4 mega-MoE path (env DG_MEGA_MOE_FP4): the L1 *and* L2
+    // activation pools both hold packed E2M1, so the L2 intermediate token slot
+    // also halves (the 0.1.0 FP4-acts mode above keeps L2 at FP8 width). When
+    // off, L2 stays FP8 — byte-identical to dev's existing sizing.
+    const bool host_use_packed_fp4 = get_env<int>("DG_MEGA_MOE_FP4") != 0;
+    const int intermediate_token_bytes = host_use_packed_fp4 ? (intermediate_hidden / 2) : intermediate_hidden;
+
     // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the combine slot
     // holds FP8 E4M3 (kHidden bytes/token) + a separate combine_sf slot
     // holding UE8M0 SF bytes (kHidden/128 bytes/token, gran_k=128). When off,
@@ -56,7 +64,7 @@ get_symm_buffer_size_for_mega_moe(
     // 7168/128=56 bytes), so disable TMA alignment requirement (the writes
     // are 1-byte stores via `sym_buffer.map`, not TMA).
     const auto combine_sf_layout = layout::Data(combine_sf_bytes_per_token, false);
-    const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
+    const auto fp8_intermediate_token_layout = layout::Data(intermediate_token_bytes);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 32);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
@@ -156,10 +164,12 @@ get_symm_buffer_size_for_mega_moe(
             {num_max_padded_sf_pool_tokens, hidden / 128},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
+        const auto l2_dtype = host_use_packed_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn;
+        const int l2_inner_cols = host_use_packed_fp4 ? (intermediate_hidden / 2) : intermediate_hidden;
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, intermediate_hidden},
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
+            {num_max_pool_tokens, l2_inner_cols},
+            torch::TensorOptions().dtype(l2_dtype).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
             {num_max_padded_sf_pool_tokens, intermediate_hidden / 128},
@@ -260,9 +270,17 @@ static void fp8_fp4_mega_moe(
     // mainloops; this controls the combine a2a only).
     const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
+    // Packed FP4xFP4 mega-MoE path (env DG_MEGA_MOE_FP4): both activations and
+    // weights are packed E2M1, running tcgen05.mma.kind::mxf4 with 128B/64B-
+    // swizzle packed operands. This is the campaign kernel — kernel-level
+    // +4-10% over the FP8/FP4 kUseFp4Acts mode (bit-exact numerics), via the
+    // per-band BLOCK_K=256 selection. Default off → dev's existing dispatch.
+    const bool use_packed_fp4 = get_env<int>("DG_MEGA_MOE_FP4") != 0;
+
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp8_fp4_mega_moe(y,
+        if (use_packed_fp4) {
+            sm100_fp4_mega_moe(y,
                                l1_acts, l1_acts_sf,
                                l2_acts, l2_acts_sf,
                                l1_weights, l2_weights,
@@ -273,8 +291,22 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math,
-                               use_fp4_acts, use_mxf4_kind, use_fp8_combine);
+                               activation_clamp, fast_math);
+        } else {
+            sm100_fp8_fp4_mega_moe(y,
+                                   l1_acts, l1_acts_sf,
+                                   l2_acts, l2_acts_sf,
+                                   l1_weights, l2_weights,
+                                   l1_weights_sf, l2_weights_sf,
+                                   cumulative_local_expert_recv_stats,
+                                   sym_buffer_ptrs,
+                                   rank_idx, num_max_tokens_per_rank,
+                                   num_experts_per_rank,
+                                   num_tokens, num_topk,
+                                   hidden, intermediate_hidden,
+                                   activation_clamp, fast_math,
+                                   use_fp4_acts, use_mxf4_kind, use_fp8_combine);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
