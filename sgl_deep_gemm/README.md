@@ -13,4 +13,4 @@ To release a new set of wheels, please contact SGLang team and run the [release 
 
 For each major version release (0.X.Y -> 0.(X+1).0), a new branch should be created (release/v0.(X+1).0) for stability purpose.
 
-For any incoming pull requests, it should be rebased upon `dev` branch.
+For any incoming pull requests, it should be rebased upon `dev` branch. Any newly added or modified tests should be put under `sgl_deep_gemm/tests`
