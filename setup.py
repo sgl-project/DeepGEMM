@@ -220,6 +220,6 @@ if __name__ == '__main__':
             'build_py': CustomBuildPy,
         },
         install_requires=[
-            'apache-tvm-ffi==0.1.9',
+            'apache-tvm-ffi==0.1.11',
         ],
     )
