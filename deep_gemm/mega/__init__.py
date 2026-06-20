@@ -161,10 +161,21 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
+    assert (shared_l1_weights is None) == (shared_l2_weights is None)
+    if shared_l1_weights is None:
+        shared_l1_weights_data = shared_l1_weights_sf = None
+        shared_l2_weights_data = shared_l2_weights_sf = None
+    else:
+        (shared_l1_weights_data, shared_l1_weights_sf) = shared_l1_weights
+        (shared_l2_weights_data, shared_l2_weights_sf) = shared_l2_weights
     _C.fp8_fp4_mega_moe(
         y,
-        l1_weights, l2_weights,
-        shared_l1_weights, shared_l2_weights,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
+        shared_l1_weights_data, shared_l1_weights_sf,
+        shared_l2_weights_data, shared_l2_weights_sf,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),

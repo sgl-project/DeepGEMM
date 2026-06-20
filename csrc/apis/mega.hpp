@@ -2,7 +2,7 @@
 
 #include <functional>
 #include <string>
-#include <pybind11/functional.h>
+// #include <pybind11/functional.h>
 
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
@@ -393,6 +393,7 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
+#if 0
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
@@ -402,5 +403,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }
+
+#endif
 
 } // namespace deep_gemm::mega
