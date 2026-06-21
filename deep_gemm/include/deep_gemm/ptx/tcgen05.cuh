@@ -171,6 +171,13 @@ struct SM100_MMA_MXF4_2x1SM_SS {
     }
 };
 
+// The packed-FP4 mega-MoE kernel refers to the FP4 MMA wrapper as
+// "SM100_MMA_MXFP4_*"; in DeepGEMM the canonical PTX-kind name is "mxf4", so
+// the wrapper structs above use the PTX naming. These aliases let the packed
+// FP4xFP4 kernel reference the spec name.
+using SM100_MMA_MXFP4_SS = SM100_MMA_MXF4_SS;
+using SM100_MMA_MXFP4_2x1SM_SS = SM100_MMA_MXF4_2x1SM_SS;
+
 struct SM100_MMA_F16BF16_WS_SS {
     CUTLASS_DEVICE static void
     fma(uint64_t const& desc_a,
