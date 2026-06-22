@@ -146,10 +146,20 @@ set_pdl = _C.set_pdl
 get_pdl = _C.get_pdl
 
 # cuBLASLt Kernels
-cublaslt_gemm_nt = _C.cublaslt_gemm_nt
-cublaslt_gemm_nn = _C.cublaslt_gemm_nn
-cublaslt_gemm_tn = _C.cublaslt_gemm_tn
-cublaslt_gemm_tt = _C.cublaslt_gemm_tt
+def cublaslt_gemm_nt(a, b, d, c=None):
+    _C.cublaslt_gemm_nt(a, b, d, c)
+
+
+def cublaslt_gemm_nn(a, b, d, c=None):
+    _C.cublaslt_gemm_nn(a, b, d, c)
+
+
+def cublaslt_gemm_tn(a, b, d, c=None):
+    _C.cublaslt_gemm_tn(a, b, d, c)
+
+
+def cublaslt_gemm_tt(a, b, d, c=None):
+    _C.cublaslt_gemm_tt(a, b, d, c)
 
 def _parse_tensor_or_tuple(input):
     if type(input) is tuple or type(input) is list:
