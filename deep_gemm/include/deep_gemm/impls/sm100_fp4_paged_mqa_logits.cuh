@@ -275,11 +275,9 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
             uint32_t values[4];
             #pragma unroll
             for (uint32_t i = 0; i < 4; ++ i)
-                values[i] = ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+                values[i] = ptx::ld_shared(smem_ptr + i * 32 + lane_idx);
             __syncwarp();
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+            ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
         // Make UMMA desc
@@ -434,7 +432,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
 
                 // Check if this atom pairs two tokens from the same sequence
                 if constexpr (kIsVarlen) {
-                    is_paired_atom = (scheduler.get_atom_advance(q_atom_idx, batch_size) == 2);
+                    is_paired_atom = (scheduler.get_last_advance() == 2);
                 }
             }
             last_q_atom_idx = q_atom_idx;
