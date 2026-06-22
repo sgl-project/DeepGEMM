@@ -100,6 +100,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         l1_weights = _cast_weights_to_fp4(l1_weights)
         l2_weights = _cast_weights_to_fp4(l2_weights)
+
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
     # Run fused mega MoE
