@@ -52,6 +52,7 @@ struct SM90ArchSpec {
             end = 192;
         if (desc.kernel_type == KernelType::Kernel1D1D)
             end = 160;
+        end = std::min(end, desc.max_block_n);
         // Enumerate
         for (int i = start; i <= end; i += step)
             block_n_candidates.push_back(i);

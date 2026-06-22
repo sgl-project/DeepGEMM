@@ -22,6 +22,10 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // SBO (Single Batch Overlap), SM90 masked GEMM only
+    int max_block_n = 256;
+    bool enable_overlap = false;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -60,6 +64,8 @@ struct GemmDesc {
            << ", num_sms=" << desc.num_sms
            << ", tc_util=" << desc.tc_util
            << ", compiled_dims=" << desc.compiled_dims
+           << ", max_block_n=" << desc.max_block_n
+           << ", enable_overlap=" << static_cast<int>(desc.enable_overlap)
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k

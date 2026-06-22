@@ -336,7 +336,7 @@ void dg_m_grouped_fp8_fp4_gemm_nn_contiguous(TensorView a, TensorView a_sf,
     );
 }
 
-void dg_m_grouped_fp8_fp4_gemm_nt_masked(TensorView a, TensorView a_sf,
+Tuple<Optional<int64_t>, Optional<int64_t>> dg_m_grouped_fp8_fp4_gemm_nt_masked(TensorView a, TensorView a_sf,
                                  TensorView b, TensorView b_sf,
                                  TensorView d,
                                  TensorView masked_m,
@@ -345,17 +345,24 @@ void dg_m_grouped_fp8_fp4_gemm_nt_masked(TensorView a, TensorView a_sf,
                                  Optional<Tuple<int64_t, int64_t>> recipe_a,
                                  Optional<Tuple<int64_t, int64_t>> recipe_b,
                                  std::string compiled_dims,
-                                 bool disable_ue8m0_cast) {
+                                 bool disable_ue8m0_cast,
+                                 int64_t max_block_n,
+                                 bool enable_overlap,
+                                 Optional<TensorView> signal) {
     auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
     auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
     auto recipe_b_opt = recipe_b.has_value() ? std::make_optional(std::make_tuple((int)recipe_b.value().get<0>(), (int)recipe_b.value().get<1>())) : std::nullopt;
-    gemm::m_grouped_fp8_fp4_gemm_nt_masked(
+    auto signal_opt = signal.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(signal.value())) : std::nullopt;
+    auto result = gemm::m_grouped_fp8_fp4_gemm_nt_masked(
         std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
         std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
         convert_to_torch_tensor(d), convert_to_torch_tensor(masked_m),
         (int) expected_m, recipe_opt, recipe_a_opt, recipe_b_opt,
-        compiled_dims, disable_ue8m0_cast
+        compiled_dims, disable_ue8m0_cast, (int) max_block_n, enable_overlap, signal_opt
     );
+    if (result.has_value())
+        return Tuple<Optional<int64_t>, Optional<int64_t>>(Optional<int64_t>(result->first), Optional<int64_t>(result->second));
+    return Tuple<Optional<int64_t>, Optional<int64_t>>(Optional<int64_t>(), Optional<int64_t>());
 }
 
 
