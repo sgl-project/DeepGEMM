@@ -6,12 +6,12 @@ import torch
 import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
-    calc_diff, count_bytes,
+    calc_diff, count_bytes, check_signal,
     ignore_env, get_arch_major
 )
 
 from generators import (
-    KernelType, get_ue8m0_usage, layout_masked_to_psum, align,
+    KernelType, QuantConfig, get_ue8m0_usage, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
     get_mk_alignment_for_contiguous_layout
@@ -174,6 +174,42 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
+def test_m_grouped_gemm_masked_overlap() -> None:
+    if get_arch_major() != 9:
+        print('Skipping m-grouped masked GEMM SBO overlap test (SM90 only)\n')
+        return
+
+    print('Testing m-grouped masked GEMM with SBO overlap:')
+    ceil_div = lambda a, b: (a + b - 1) // b
+
+    max_m = 4096
+    quant_config = QuantConfig()
+    use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D2D)
+    disable_ue8m0_cast = not use_ue8m0
+    recipe, recipe_a, recipe_b = quant_config.get_recipes()
+
+    for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256), (16, 64), (16, 32)):
+        for n, k in ((4096, 7168), (7168, 2048)):
+            for i in range(10):
+                a, b, masked_m, _, d, ref_d = generate_m_grouped_masked(
+                    num_groups, max_m, expected_m_per_group, n, k,
+                    use_ue8m0=use_ue8m0, quant_config=quant_config)
+
+                signal = torch.zeros(num_groups * ceil_div(max_m, 64), dtype=torch.int32, device='cuda')
+                block_m, threshold = deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(
+                    a, b, d, masked_m, int(expected_m_per_group * 1.2),
+                    disable_ue8m0_cast=disable_ue8m0_cast,
+                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+                    enable_overlap=True, signal=signal)
+
+                check_signal(num_groups, max_m, block_m, threshold, signal, masked_m)
+                for j in range(num_groups):
+                    diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
+                    assert diff < quant_config.max_diff(), f'{n=}, {k=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+        print(f' > Passed (num_groups={num_groups:2}, expected_m_per_group={expected_m_per_group:4})')
+    print()
+
+
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
@@ -220,4 +256,5 @@ if __name__ == '__main__':
     # test_gemm()
     test_m_grouped_gemm_contiguous()
     # test_m_grouped_gemm_masked()
+    test_m_grouped_gemm_masked_overlap()
     # test_k_grouped_gemm_contiguous()
