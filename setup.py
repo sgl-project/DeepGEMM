@@ -14,7 +14,7 @@ from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
-from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME as TORCH_CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from scripts.generate_pyi import generate_pyi_file
 
@@ -23,6 +23,34 @@ DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
+
+
+def _find_cuda_home():
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH') or TORCH_CUDA_HOME
+    if cuda_home is None:
+        nvcc_path = shutil.which('nvcc')
+        if nvcc_path is not None:
+            cuda_home = str(Path(nvcc_path).parent.parent)
+        else:
+            cuda_home = '/usr/local/cuda'
+            if not Path(cuda_home).exists():
+                cuda_home = None
+    assert cuda_home is not None, 'Cannot find CUDA_HOME'
+    return cuda_home
+
+
+def _get_cuda_arch():
+    try:
+        status = subprocess.run(
+            args=['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            capture_output=True, check=True,
+        )
+        return status.stdout.decode('utf-8').strip().split('\n')[0]
+    except Exception:
+        return '9.0'
+
+
+CUDA_HOME = _find_cuda_home()
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
