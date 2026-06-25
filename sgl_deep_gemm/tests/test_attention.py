@@ -193,6 +193,110 @@ def test_mqa_logits():
     print()
 
 
+def _expect_paged_mqa_logits_metadata_out_failure(*args, **kwargs):
+    try:
+        deep_gemm.get_paged_mqa_logits_metadata_out(*args, **kwargs)
+    except Exception:
+        return
+    raise AssertionError("Expected get_paged_mqa_logits_metadata_out to fail")
+
+
+def test_paged_mqa_logits_metadata_out():
+    if get_arch_major() not in (9, 10):
+        return
+
+    context_lens = torch.tensor(
+        [[128, 130, 132], [65, 67, 69], [200, 202, 204]],
+        device='cuda',
+        dtype=torch.int,
+    )
+    num_sms = deep_gemm.get_num_sms()
+
+    for block_kv in ((64, 32) if get_arch_major() == 10 else (64, )):
+        expected = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, block_kv, num_sms
+        )
+        actual = torch.full_like(expected, -1)
+        actual_ptr = actual.data_ptr()
+        ret = deep_gemm.get_paged_mqa_logits_metadata_out(
+            context_lens, actual, block_kv, num_sms
+        )
+        torch.cuda.synchronize()
+
+        assert ret is None
+        assert actual.data_ptr() == actual_ptr
+        assert torch.equal(actual, expected)
+
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens,
+        torch.empty((num_sms, 2), device='cuda', dtype=torch.int),
+        64,
+        num_sms,
+    )
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens,
+        torch.empty((num_sms + 1, 2), device='cuda', dtype=torch.int64),
+        64,
+        num_sms,
+    )
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens, torch.empty((1, 2), device='cuda', dtype=torch.int), 64, 0
+    )
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens, torch.empty((1, 2), device='cuda', dtype=torch.int), 64, -1
+    )
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens,
+        torch.empty((num_sms + 1, 2), device='cuda', dtype=torch.int),
+        2**40 + 64,
+        num_sms,
+    )
+    _expect_paged_mqa_logits_metadata_out_failure(
+        context_lens,
+        torch.empty((num_sms + 1, 2), dtype=torch.int),
+        64,
+        num_sms,
+    )
+    alias_context_lens = torch.empty((3, 2), device='cuda', dtype=torch.int)
+    _expect_paged_mqa_logits_metadata_out_failure(
+        alias_context_lens, alias_context_lens, 64, 2
+    )
+    partial_overlap = torch.empty(7, device='cuda', dtype=torch.int)
+    _expect_paged_mqa_logits_metadata_out_failure(
+        partial_overlap[:6].view(3, 2), partial_overlap[1:].view(3, 2), 64, 2
+    )
+
+    if get_arch_major() == 10:
+        indices = torch.tensor([2, 0, 1], device='cuda', dtype=torch.int)
+        context_lens = context_lens[:, :1].contiguous()
+        expected = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, 64, num_sms, indices=indices
+        )
+        actual = torch.full_like(expected, -1)
+        actual_ptr = actual.data_ptr()
+        ret = deep_gemm.get_paged_mqa_logits_metadata_out(
+            context_lens, actual, 64, num_sms, indices=indices
+        )
+        torch.cuda.synchronize()
+
+        assert ret is None
+        assert actual.data_ptr() == actual_ptr
+        assert torch.equal(actual, expected)
+        indices_overlap = torch.empty(5, device='cuda', dtype=torch.int)
+        _expect_paged_mqa_logits_metadata_out_failure(
+            context_lens,
+            indices_overlap[1:].view(2, 2),
+            64,
+            1,
+            indices=indices_overlap[:3],
+        )
+        if torch.cuda.device_count() > 1:
+            wrong_device_indices = indices.to('cuda:1')
+            _expect_paged_mqa_logits_metadata_out_failure(
+                context_lens, actual, 64, num_sms, indices=wrong_device_indices
+            )
+
+
 def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                          weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
                          max_model_len: int, use_2d_context_lens: bool):

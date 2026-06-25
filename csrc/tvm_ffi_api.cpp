@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/container/array.h>
@@ -517,6 +518,8 @@ Tensor dg_fp8_mqa_logits(TensorView q, TensorView kv_data, TensorView kv_sf,
 
 Tensor dg_get_paged_mqa_logits_metadata(TensorView context_lens, int64_t block_kv,
                                        int64_t num_sms, Optional<TensorView> indices) {
+    DG_HOST_ASSERT(num_sms > 0 and num_sms <= std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(block_kv == 64 or block_kv == 32);
     auto indices_val = indices.has_value()?
         std::optional<torch::Tensor>(convert_to_torch_tensor(indices.value()))
         : std::nullopt;
@@ -524,6 +527,20 @@ Tensor dg_get_paged_mqa_logits_metadata(TensorView context_lens, int64_t block_k
         convert_to_torch_tensor(context_lens), static_cast<int>(block_kv),
         static_cast<int>(num_sms), indices_val);
     return Tensor::FromDLPack(at::toDLPack(result));
+}
+
+void dg_get_paged_mqa_logits_metadata_out(TensorView context_lens, TensorView schedule_metadata,
+                                          int64_t block_kv, int64_t num_sms,
+                                          Optional<TensorView> indices) {
+    DG_HOST_ASSERT(num_sms > 0 and num_sms <= std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(block_kv == 64 or block_kv == 32);
+    auto indices_val = indices.has_value() ?
+        std::optional<torch::Tensor>(convert_to_torch_tensor(indices.value()))
+        : std::nullopt;
+    attention::get_paged_mqa_logits_metadata_out(
+        convert_to_torch_tensor(context_lens),
+        convert_to_torch_tensor(schedule_metadata), static_cast<int>(block_kv),
+        static_cast<int>(num_sms), indices_val);
 }
 
 Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
@@ -574,6 +591,7 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm_nt_skip_head_mid, dg_fp8_gemm_nt_skip_head_mid);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mqa_logits, dg_fp8_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata, dg_get_paged_mqa_logits_metadata);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata_out, dg_get_paged_mqa_logits_metadata_out);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_logits, dg_fp8_paged_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mqa_logits, dg_fp8_fp4_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_paged_mqa_logits, dg_fp8_fp4_paged_mqa_logits);
