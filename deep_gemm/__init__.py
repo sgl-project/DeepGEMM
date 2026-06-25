@@ -62,6 +62,7 @@ try:
         # Attention kernels
         fp8_fp4_mqa_logits,
         get_paged_mqa_logits_metadata,
+        get_paged_mqa_logits_metadata_out,
         fp8_fp4_paged_mqa_logits,
         # Attention kernels (legacy)
         fp8_mqa_logits,

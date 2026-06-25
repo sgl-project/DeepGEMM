@@ -223,6 +223,13 @@ try:
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
         return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
 
+    def get_paged_mqa_logits_metadata_out(
+        context_lens, schedule_metadata, block_kv, num_sms, indices=None
+    ):
+        _C.get_paged_mqa_logits_metadata_out(
+            context_lens, schedule_metadata, block_kv, num_sms, indices
+        )
+
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
