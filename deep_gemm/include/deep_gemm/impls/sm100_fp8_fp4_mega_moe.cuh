@@ -169,6 +169,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kUseFp8Combine
     );
     const auto workspace = buffer.workspace;
+    constexpr uint32_t kNumMaxPoolTokens = layout::get_num_max_pool_tokens<uint32_t>(
+        kNumRanks, kNumMaxTokensPerRank, kNumTopk, kNumExpertsPerRank);
+    constexpr bool kRingCoversFullPool = kNumRingTokens >= kNumMaxPoolTokens;
+    constexpr bool kUseFullPoolFP8FP4Path =
+        not kHasShared and kRingCoversFullPool and BLOCK_K == BLOCK_N and
+        (L2_SHAPE_K / BLOCK_K) <= 32;
+    const auto get_ring_block_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kRingCoversFullPool)
+            return pool_block_idx;
+        else
+            return pool_block_idx % kNumRingBlocks;
+    };
+    const auto get_ring_token_idx = [](const uint32_t& pool_token_idx) {
+        if constexpr (kRingCoversFullPool)
+            return pool_token_idx;
+        else
+            return pool_token_idx % kNumRingTokens;
+    };
+    const auto get_ring_wave_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kRingCoversFullPool)
+            return 0u;
+        else
+            return pool_block_idx / kNumRingBlocks;
+    };
 
     // SF and its buffer configs
     constexpr uint32_t kGranK = 32;
@@ -637,24 +661,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
-            // Hidden bytes are divided into chunks. Under `kUseFp4Acts`, the
-            // source slot is packed E2M1 (kHidden/2 bytes), so the chunk loop
-            // covers the smaller packed footprint.
+            // Hidden bytes are divided into chunks on the reusable-ring path.
+            // The full-pool path keeps the tuned one-shot pull/store sequence.
             DG_STATIC_ASSERT(kNumTokenPullChunks >= 1, "Invalid token pull chunk count");
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-            const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
-            if (l1_empty_count_target > 0) {
-                const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+            if constexpr (not kRingCoversFullPool) {
+                const auto l1_empty_count_target = get_ring_wave_idx(pool_block_idx) * kNumL1BlockNs;
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(get_ring_block_idx(pool_block_idx));
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
             }
 
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -664,16 +689,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
             };
-            if (cute::elect_one_sync()) {
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumTokenPullChunks; ++ i) {
+            if constexpr (kUseFullPoolFP8FP4Path) {
+                if (cute::elect_one_sync()) {
                     ptx::tma_load_1d(
-                        pull_buffer.get_base_ptr(),
-                        math::advance_ptr(src_base_ptr, i * kNumBytesPerPullForActs),
-                        pull_mbarrier, kNumBytesPerPullForActs
-                    );
-                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPullForActs);
-                    i != (kNumTokenPullChunks - 1) ? issue_and_wait_pull_store(i) : void();
+                        pull_buffer.get_base_ptr(), src_base_ptr, pull_mbarrier, kInputTokenBytes);
+                }
+            } else {
+                if (cute::elect_one_sync()) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumTokenPullChunks; ++ i) {
+                        ptx::tma_load_1d(
+                            pull_buffer.get_base_ptr(),
+                            math::advance_ptr(src_base_ptr, i * kNumBytesPerPullForActs),
+                            pull_mbarrier, kNumBytesPerPullForActs
+                        );
+                        ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPullForActs);
+                        i != (kNumTokenPullChunks - 1) ? issue_and_wait_pull_store(i) : void();
+                    }
                 }
             }
             __syncwarp();
@@ -685,7 +717,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
                 current_rank_in_expert_idx);
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
@@ -703,19 +735,39 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto weight = *sym_buffer.map(
                     buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
-                *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                *buffer.l1_topk_weights_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = weight;
 
-                // Write source metadata for combine write-back (logical pool token)
-                *workspace.get_token_src_metadata_ptr(pool_token_idx) =
-                    {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                if constexpr (kUseFullPoolFP8FP4Path) {
+                    // Wait for TMA token load to complete
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kInputTokenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
-                // Complete last chunk's store
-                issue_and_wait_pull_store(kNumTokenPullChunks - 1);
-                const bool is_last_token = (token_idx == expert_end_idx - 1);
-                ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
-                    is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
-                );
+                    // Store token to local L1 buffer via TMA
+                    ptx::tma_store_1d(
+                        dst_base_ptr, pull_buffer.get_base_ptr(), kInputTokenBytes);
+
+                    // Write source metadata for combine write-back
+                    *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                        {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+
+                    // Wait for token TMA store to complete
+                    cute::tma_store_arrive();
+                    ptx::tma_store_wait<0>();
+                    ptx::red_add_rel(
+                        workspace.get_l1_arrival_count_ptr(pool_block_idx), 1u);
+                } else {
+                    // Write source metadata for combine write-back (logical pool token)
+                    *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                        {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+
+                    // Complete last chunk's store
+                    issue_and_wait_pull_store(kNumTokenPullChunks - 1);
+                    const bool is_last_token = (token_idx == expert_end_idx - 1);
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(ring_block_idx),
+                        is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+                    );
+                }
             }
             __syncwarp();
         }
@@ -769,12 +821,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     *workspace.get_expert_recv_count_ptr(j, i) = 0;
                 __syncwarp();
 
-                // Clean L1 and L2 full stuffs and ring buffer counts
+                // Clean L1 and L2 arrivals / ring-buffer counters
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    *workspace.get_l1_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    const auto pool_block_idx = expert_pool_block_offset + j;
+                    if constexpr (kUseFullPoolFP8FP4Path) {
+                        *workspace.get_l1_arrival_count_ptr(pool_block_idx) = 0;
+                        *workspace.get_l2_arrival_mask_ptr(pool_block_idx) = 0;
+                    } else {
+                        const auto ring_block_idx = get_ring_block_idx(pool_block_idx);
+                        *workspace.get_l1_full_count_ptr(ring_block_idx) = 0;
+                        *workspace.get_l1_empty_count_ptr(ring_block_idx) = 0;
+                        *workspace.get_l2_full_count_ptr(ring_block_idx) = 0;
+                        *workspace.get_l2_empty_count_ptr(ring_block_idx) = 0;
+                    }
                 }
                 __syncwarp();
             }
@@ -807,18 +866,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the entire token arrival
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
-                const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
-                while (ptx::ld_acq(ptr) != num_expected_tokens);
+                if constexpr (kUseFullPoolFP8FP4Path) {
+                    const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
+                    while (ptx::ld_acq(ptr) != task_info.valid_m);
+                } else {
+                    const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
+                    const auto num_expected_tokens = BLOCK_M * (get_ring_wave_idx(pool_block_idx) + 1);
+                    while (ptx::ld_acq(ptr) != num_expected_tokens);
+                }
             } else if (task_info.block_phase == sched::BlockPhase::Linear2) {
-                const auto ptr = workspace.get_l2_full_count_ptr(block_idx);
-                const auto num_expected_blocks = (L2_SHAPE_K / BLOCK_N) * 2 * (pool_block_idx / kNumRingBlocks + 1);
-                while (ptx::ld_acq(ptr) != num_expected_blocks);
+                if constexpr (kUseFullPoolFP8FP4Path) {
+                    DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
+                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                    const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
+                    while (ptx::ld_acq_gpu(ptr) != expected);
+                } else {
+                    const auto ptr = workspace.get_l2_full_count_ptr(block_idx);
+                    const auto num_expected_blocks = (L2_SHAPE_K / BLOCK_N) * 2 * (get_ring_wave_idx(pool_block_idx) + 1);
+                    while (ptx::ld_acq(ptr) != num_expected_blocks);
+                }
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
@@ -1235,7 +1306,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
             const uint32_t valid_m = ptx::exchange(task_info.valid_m, 0);
             const uint32_t pool_block_idx = task_info.pool_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t m_idx = block_idx * BLOCK_M;
@@ -1246,9 +1317,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
                 if (not task_info.is_shared()) {
                     // Wait L2 block empty
-                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                    if constexpr (not kRingCoversFullPool) {
+                        const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                        const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * get_ring_wave_idx(pool_block_idx);
+                        while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                    }
                 }
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
@@ -1529,24 +1602,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         ptx::red_add_rel(
                             workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
                     } else {
-                        ptx::red_add_rel(
-                            workspace.get_l2_full_count_ptr(ring_block_idx), 1u);
-
-                        // Increment L1 empty count for this physical slot (one per N block)
-                        ptx::red_add(
-                            workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                        if constexpr (kUseFullPoolFP8FP4Path) {
+                            DG_STATIC_ASSERT(L2_SHAPE_K <= 64 * L1_OUT_BLOCK_N, "L2 shape K is too large");
+                            ptx::red_or_rel_gpu(
+                                workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                                1ull << n_block_idx);
+                        } else {
+                            ptx::red_add_rel(
+                                workspace.get_l2_full_count_ptr(ring_block_idx), 1u);
+                        }
+                        if constexpr (not kRingCoversFullPool) {
+                            // Increment L1 empty count for this physical slot (one per N block)
+                            ptx::red_add(
+                                workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                        }
                     }
                 }
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if (not task_info.is_shared()) {
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        ptx::red_add(
-                            workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
+                if constexpr (not kRingCoversFullPool) {
+                    if (not task_info.is_shared()) {
+                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            ptx::red_add(
+                                workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
+                        }
                     }
-                    __syncwarp();
                 }
+                __syncwarp();
 
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;

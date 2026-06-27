@@ -66,6 +66,13 @@ get_symm_buffer_size_for_mega_moe(
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    if (num_max_tokens_per_rank >= 6144) {
+        // Preserve the tuned non-wrapping prefill path from dev. The dynamic
+        // scheduler still uses a smaller live-ring bound for decode-sized
+        // buffers, while large prefill allocations cover the full token pool.
+        num_ring_tokens = layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    }
 
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);

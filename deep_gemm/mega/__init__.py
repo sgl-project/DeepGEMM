@@ -1,3 +1,4 @@
+import os
 import torch
 import types
 import warnings
@@ -13,7 +14,6 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
-
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
@@ -50,14 +50,36 @@ class SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # Create input buffer views (as torch tensors, not tvm-ffi tensors).
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.shared_l1_acts, self.shared_l1_acts_sf,
-         self.shared_l2_acts, self.shared_l2_acts_sf,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = map(
-            torch.from_dlpack, slice_input_buffers(self.buffer))
+        # Create input buffer views. TVM-FFI transports float8 storage as
+        # int8, so restore the logical dtype without changing the bytes.
+        raw_buffers = slice_input_buffers(self.buffer)
+        use_fp4_acts = (mma_type != 'bf16xbf16' and num_shared_experts == 0 and
+                        int(os.environ.get('DG_USE_FP4_ACTS', '0')) != 0)
+        acts_dtype = (torch.bfloat16 if mma_type == 'bf16xbf16' else
+                      (torch.int8 if use_fp4_acts else torch.float8_e4m3fn))
+        l2_dtype = torch.bfloat16 if mma_type == 'bf16xbf16' else torch.float8_e4m3fn
+
+        def as_torch(tensor, dtype=None):
+            if tensor is None:
+                return None
+            tensor = torch.from_dlpack(tensor)
+            return tensor.view(dtype) if dtype is not None and tensor.dtype != dtype else tensor
+
+        (x, x_sf, topk_idx, topk_weights,
+         shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = raw_buffers
+        self.x = as_torch(x, acts_dtype)
+        self.x_sf = as_torch(x_sf)
+        self.topk_idx = as_torch(topk_idx)
+        self.topk_weights = as_torch(topk_weights)
+        self.shared_l1_acts = as_torch(shared_l1_acts, acts_dtype)
+        self.shared_l1_acts_sf = as_torch(shared_l1_acts_sf)
+        self.shared_l2_acts = as_torch(shared_l2_acts, l2_dtype)
+        self.shared_l2_acts_sf = as_torch(shared_l2_acts_sf)
+        self.l1_acts = as_torch(l1_acts, acts_dtype)
+        self.l1_acts_sf = as_torch(l1_acts_sf)
+        self.l2_acts = as_torch(l2_acts, l2_dtype)
+        self.l2_acts_sf = as_torch(l2_acts_sf)
 
     def destroy(self):
         self.handle = None
