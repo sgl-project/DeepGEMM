@@ -32,6 +32,9 @@ def apply_skip_head_mid(d: torch.Tensor, head_splits: Tuple[int, int, int]):
 
 
 def test_gemm_skip_head_mid() -> None:
+    if get_arch_major() == 12:
+        print('Skipping GEMM skip-head-mid on SM120 (not part of this port).')
+        return
     print('Testing GEMM skip head mid:')
     head_splits = (128, 64, 128)
 
@@ -114,6 +117,9 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
 
 
 def test_mqa_logits():
+    if get_arch_major() == 12:
+        print('Skipping dense MQA logits on SM120 (not part of this port).')
+        return
 
     # Helper functions
     def generate_ks_ke_tests(seq_len: int, seq_len_kv: int, disable_cp: bool):
@@ -320,21 +326,21 @@ def test_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_varlen_tokens = 16 * 1024
         for is_varlen in ((False, True) if arch_major == 10 else (False, )):
-            for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
-                for logits_dtype in (torch.bfloat16, torch.float):
+            for is_fp4 in ((True, False) if arch_major == 10 else ((True, ) if arch_major == 12 else (False, ))):
+                for logits_dtype in ((torch.float, ) if arch_major == 12 else (torch.bfloat16, torch.float)):
                     for weights_dtype in ((torch.float, torch.bfloat16) if arch_major == 10 else (torch.float, )):
                         if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:
                             continue
                         for block_kv in ((32, 64) if arch_major == 10 else (64, )):
                             for use_2d_context_lens, clean_logits in [(True, False)]:
-                                for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                for batch_size in ((16, ) if arch_major == 12 else (256, 4096)):
+                                    for next_n in ((1, ) if (is_varlen or arch_major == 12) else ((1, 6) if arch_major == 10 else (1, 2))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
-                                            heads = (8, 16, 32, 64) if arch_major == 10 else (32, 64)
+                                            heads = (8, 16, 32, 64) if arch_major == 10 else ((64, ) if arch_major == 12 else (32, 64))
                                             head_dims = (64, 128) if (is_fp4 and arch_major == 10) else ((32, 64, 128) if arch_major == 10 else (128, ))
                                             for num_heads in heads:
                                                 for head_dim in head_dims:
-                                                    for avg_kv in (8192, 65536):
+                                                    for avg_kv in ((4096, ) if arch_major == 12 else (8192, 65536)):
                                                         if batch_size * avg_kv > max_kv_pool_tokens:
                                                             continue
                                                         if is_varlen and batch_size * max_tokens_per_batch > max_varlen_tokens:
