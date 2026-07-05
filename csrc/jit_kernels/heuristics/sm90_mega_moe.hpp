@@ -47,7 +47,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_topk, const int& num_tokens) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
+    const bool auto_split_mn = expected_tokens_per_expert > 64.0f;
     if (auto_split_mn)
         return {128, 512};
 
@@ -160,7 +160,8 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
-    return decode_split_n_path and num_tokens <= 128 and expected_tokens_per_expert > 0.0f;
+    return decode_split_n_path and expected_tokens_per_expert < 30.0f
+           and expected_tokens_per_expert > 0.0f;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
@@ -450,7 +451,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
     const bool decode_use_block_n_256 =
-        decode_split_n_path and intermediate_hidden >= 3072 and
+        decode_split_n_path and intermediate_hidden >= 2048 and
         expected_tokens_per_expert >= 0.25f and
         (2 * intermediate_hidden) % 256 == 0 and hidden % 256 == 0;
     const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
