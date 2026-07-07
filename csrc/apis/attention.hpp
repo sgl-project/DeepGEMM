@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
+#include "../jit_kernels/impls/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
 #endif
@@ -91,9 +92,10 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
         // Check FP4 Q
         std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
         head_dim *= 2;
-        DG_HOST_ASSERT(arch_major == 10);
+        DG_HOST_ASSERT(arch_major == 10 or arch_major == 12);
         DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
+        DG_HOST_ASSERT(arch_major != 12 or head_dim == 128);  // SM120 FP4 MQA logits: head_dim=128 only
         DG_HOST_ASSERT(q_fp.is_contiguous());
         DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
 
@@ -120,6 +122,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
         // Check FP8 Q
         std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
         DG_HOST_ASSERT((arch_major == 10 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
+                       (arch_major == 12 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
                        (arch_major == 9 and (num_heads == 32 or num_heads == 64)));
         DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
         DG_HOST_ASSERT(q_fp.is_contiguous());
@@ -158,7 +161,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Allocate output
     constexpr int block_qh = 128;
-    constexpr int block_kv = 256;
+    const int block_kv = (arch_major == 12) ? 128 : 256;  // SM120 dense MQA uses block_kv=128
     const int block_q = block_qh / num_heads;
     DG_HOST_ASSERT(block_qh % num_heads == 0);
 
@@ -180,6 +183,9 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     // Dispatch implementation
     if (arch_major == 10) {
         sm100_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+    } else if (arch_major == 12) {
+        sm120_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else if (arch_major == 9 and not is_fp4) {
         DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
