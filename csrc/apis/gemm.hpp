@@ -498,13 +498,13 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                                 a.first.options().dtype(torch::kByte));
 
     // Dispatch implementation
+    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks_cpu.value(), grouped_layout, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else if (arch_major == 12) {
-        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, tensor_map_buffer,
-                                           gran_k, gran_k,
-                                           cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+        // TODO(sm120-port, stage 2): k-grouped FP8 GEMM needs adaptation to dev's psum SF-layout API
+        DG_HOST_UNREACHABLE("SM120 k-grouped FP8 GEMM not yet ported");
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
