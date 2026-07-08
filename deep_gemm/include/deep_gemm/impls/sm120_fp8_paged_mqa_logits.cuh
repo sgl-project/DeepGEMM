@@ -18,7 +18,7 @@
 #include <deep_gemm/mma/sm120.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/paged_mqa_logits.cuh>
+#include <deep_gemm/scheduler/sm120_paged_mqa_logits.cuh>
 
 namespace deep_gemm {
 
@@ -150,7 +150,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     // Scheduler
     static constexpr bool kPadOddN = (not kIsVarlen) and (kNextN % 2 == 1) and (kNextN >= 3);
     static constexpr uint32_t kNumNextNAtoms = math::constexpr_ceil_div(kNextN, kNextNAtom);
-    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumGroups, kNumNextNAtoms>(
+    auto scheduler = sched::SM120PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumGroups, kNumNextNAtoms>(
         blockIdx.x, batch_size, context_lens, schedule_meta, indices);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
