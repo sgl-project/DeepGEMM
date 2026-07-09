@@ -352,4 +352,40 @@ static void sm120_fp4_paged_mqa_logits(const torch::Tensor& q,
     SM120FP4PagedMQALogitsRuntime::launch(runtime, args);
 }
 
+// ---- Unified entry (mirrors dev's sm100_paged_mqa_logits(is_fp4, ...) exactly) ----
+// SM120's atom scheduler does not use num_q_tokens_total / splits_per_chunk.
+static void sm120_paged_mqa_logits(const bool& is_fp4,
+                                   const torch::Tensor& q,
+                                   const std::optional<torch::Tensor>& sf_q,
+                                   const torch::Tensor& kv_cache,
+                                   const torch::Tensor& kv_cache_sf,
+                                   const torch::Tensor& weights,
+                                   const torch::Tensor& context_lens,
+                                   const torch::Tensor& logits,
+                                   const torch::Tensor& block_table,
+                                   const torch::Tensor& indices,
+                                   const torch::Tensor& schedule_meta,
+                                   const at::ScalarType& logits_dtype,
+                                   const int& num_requests, const int& num_q_tokens_total,
+                                   const int& tokens_per_request,
+                                   const int& num_heads, const int& head_dim,
+                                   const int& num_kv_blocks, const int& page_kv,
+                                   const bool& is_context_lens_2d,
+                                   const bool& is_varlen,
+                                   const int& logits_stride,
+                                   const int& block_table_stride,
+                                   const int& num_sms,
+                                   const int& split_kv,
+                                   const int& splits_per_chunk) {
+    if (is_fp4) {
+        sm120_fp4_paged_mqa_logits(q, sf_q.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices, schedule_meta,
+                                   logits_dtype, num_requests, tokens_per_request, num_heads, head_dim, num_kv_blocks, page_kv, is_context_lens_2d,
+                                   is_varlen, logits_stride, block_table_stride, num_sms, split_kv);
+    } else {
+        sm120_fp8_paged_mqa_logits(q, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices, schedule_meta,
+                                   logits_dtype, num_requests, tokens_per_request, num_heads, head_dim, num_kv_blocks, page_kv, is_context_lens_2d,
+                                   is_varlen, logits_stride, block_table_stride, num_sms, split_kv);
+    }
+}
+
 } // namespace deep_gemm

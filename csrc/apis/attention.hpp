@@ -401,15 +401,10 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk);
     } else if (arch_major == 12) {
-        if (is_fp4) {
-            sm120_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
-                                       logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                                       is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
-        } else {
-            sm120_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
-                                       logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                                       is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
-        }
+        constexpr int splits_per_chunk = 16;  // unused by SM120 atom scheduler
+        sm120_paged_mqa_logits(is_fp4, q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
+                               logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
+                               is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk);
     } else if (arch_major == 9 and not is_fp4) {
         DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
         sm90_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
