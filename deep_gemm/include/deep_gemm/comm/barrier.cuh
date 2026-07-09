@@ -8,8 +8,8 @@
 
 namespace deep_gemm::comm {
 
-// 60s timeout, at 2 GHz
-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
+// 300s timeout, at 2 GHz
+constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
 
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
