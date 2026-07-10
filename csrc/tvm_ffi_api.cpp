@@ -18,6 +18,7 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
+#include "apis/runtime.hpp"
 #include "apis/sm90_mega.hpp"
 #include "utils/torch_compat.hpp"
 
@@ -64,6 +65,20 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_tc_util, dg_get_tc_util);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_tc_util, dg_set_tc_util);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_pdl, dg_get_pdl);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_pdl, dg_set_pdl);
+
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+// Return a hashable Array identifying the best JIT GEMM config.
+tvm::ffi::Array<int64_t> dg_get_best_gemm_config_key(
+        std::string gemm_type, std::string mma,
+        int64_t m, int64_t n, int64_t k, int64_t num_groups) {
+    auto key = deep_gemm::runtime::get_best_gemm_config_key_vec(
+        gemm_type, mma,
+        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+        static_cast<int>(num_groups));
+    return tvm::ffi::Array<int64_t>(key);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_best_gemm_config_key, dg_get_best_gemm_config_key);
+#endif
 
 // ---------------------------------------------------------------------------
 // Layout utilities

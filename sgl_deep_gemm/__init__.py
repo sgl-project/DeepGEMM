@@ -119,6 +119,17 @@ get_tc_util = _C.get_tc_util
 set_pdl = _C.set_pdl
 get_pdl = _C.get_pdl
 
+# Optional: present when built with FP8 + tensormap support (CUDA >= 12.1).
+# Wrap as tuple: tvm_ffi.Array hashes by identity, so dict/set dedup would fail.
+try:
+    _get_best_gemm_config_key = _C.get_best_gemm_config_key
+
+    def get_best_gemm_config_key(*args, **kwargs):
+        return tuple(_get_best_gemm_config_key(*args, **kwargs))
+except AttributeError as e:
+    print(f"Could not import get_best_gemm_config_key. Error: {e}")
+    pass
+
 # cuBLASLt Kernels
 def cublaslt_gemm_nt(a, b, d, c=None):
     _C.cublaslt_gemm_nt(a, b, d, c)
