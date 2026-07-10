@@ -6,6 +6,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_paged_mqa_logits.hpp"
@@ -69,6 +70,9 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         // NOTES: Only granularity 128 and FP8 are exposed in the API
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
+                                128, 128, major_a, major_b, compiled_dims, epilogue_type);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
                                 128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
