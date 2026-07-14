@@ -33,6 +33,12 @@ from typing import Any, Dict, List, Tuple
 
 GENERIC_FALLBACK = "generic"
 
+# Decode -> prefill boundary (expected tokens per expert). Mirrors the C++
+# default of DG_SM90_FP4_PREFILL_E (the CPU mirror assumes the env is unset).
+# 80 = measured: BLOCK_M=64 decode wins for e in [64, 80) (full first m-block),
+# BLOCK_M=128 prefill wins from e=80 up (decode's second m-block mostly empty).
+PREFILL_E = 80.0
+
 
 def table_wave(
     num_experts_per_rank: int,
@@ -65,11 +71,11 @@ def legacy_threads(
     small_block_n = block_m == 64 and block_n == 128
     e = expected_tokens_per_expert
     decode_heavy_small_batch = small_block_n and 0.0 < e <= 24.0
-    pro_large_decode_assist_batch = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0
-    pro_split_n_decode_threads = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 64.0
-    flash_split_n_decode_threads = small_block_n and intermediate_hidden <= 2048 and 0.0 < e < 64.0
+    pro_large_decode_assist_batch = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < PREFILL_E
+    pro_split_n_decode_threads = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < PREFILL_E
+    flash_split_n_decode_threads = small_block_n and intermediate_hidden <= 2048 and 0.0 < e < PREFILL_E
     two_wg_decode_offload = (
-        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= 64.0
+        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= PREFILL_E
     )
     dispatch = (
         64
@@ -101,9 +107,9 @@ def legacy_epilogue_threads(
     e = expected_tokens_per_expert
     epilogue_warpgroups = num_epilogue_threads // 128
     split_n_eligible = block_m == 64 and block_n % 128 == 0
-    split_n_band = 32.0 <= e < 64.0
-    pro_split_n_band = intermediate_hidden >= 3072 and 0.0 < e < 64.0
-    flash_split_n_band = intermediate_hidden <= 2048 and 0.0 < e < 64.0
+    split_n_band = 32.0 <= e < PREFILL_E
+    pro_split_n_band = intermediate_hidden >= 3072 and 0.0 < e < PREFILL_E
+    flash_split_n_band = intermediate_hidden <= 2048 and 0.0 < e < PREFILL_E
     small_split_n_band = flash_split_n_band or pro_split_n_band
     default_split_n = (
         split_n_eligible
@@ -126,7 +132,7 @@ def table_epilogue_threads(
     epilogue_warpgroups = num_epilogue_threads // 128
     split_n_eligible = block_m == 64 and block_n % 128 == 0
     split_n_shape_band = (
-        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < 64.0
+        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < PREFILL_E
     )
     if split_n_eligible and split_n_shape_band:
         epilogue_warpgroups = 2
@@ -143,11 +149,11 @@ def table_threads(
     small_block_n_kernel = block_m == 64 and block_n == 128
     e = expected_tokens_per_expert
     split_n_shape_band = (
-        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < 64.0
+        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < PREFILL_E
     )
     split_n_decode_thread_kernel_band = small_block_n_kernel and split_n_shape_band
     two_wg_decode_offload_kernel_band = (
-        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= 64.0
+        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= PREFILL_E
     )
     decode_assist_thread_kernel_band = two_wg_decode_offload_kernel_band or (
         small_block_n_kernel and 0.0 < e <= 24.0
@@ -246,8 +252,8 @@ def table_api_features(
     threshold, shape-agnostic (no per-(shape x e-band) table)."""
     del num_experts_per_rank, intermediate_hidden
     e = expected_tokens_per_expert
-    prefill = e >= 64.0
-    decode = 0.0 < e < 64.0
+    prefill = e >= PREFILL_E
+    decode = 0.0 < e < PREFILL_E
     return {
         "math_wg_participates": False,
         "first_decode_assist_warp": 2,
