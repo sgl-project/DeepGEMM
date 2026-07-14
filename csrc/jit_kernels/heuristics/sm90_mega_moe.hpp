@@ -205,6 +205,17 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     return {num_stages, smem_size};
 }
 
+// Decode -> prefill boundary for the FP4 MegaMoE path, in expected tokens per
+// expert. At the boundary the kernel flips from the decode config (BLOCK_M=64,
+// split-N epilogue) to the prefill config (BLOCK_M=128, 2-WG decode offload).
+// 80 = measured on H20: decode wins for e in [64, 80) (its first m-block is
+// exactly full while prefill's 128-row block runs half empty); prefill wins
+// from e=80 up (decode's second m-block is mostly empty). Overridable via
+// DG_SM90_FP4_PREFILL_E for boundary A/B tuning.
+static float get_fp4_sm90_prefill_threshold() {
+    return static_cast<float>(get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
+}
+
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -213,7 +224,8 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
 
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
+    const bool auto_split_mn =
+        expected_tokens_per_expert >= get_fp4_sm90_prefill_threshold();
     const bool ultra_small_split_n =
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f;
     int block_m = auto_split_mn ? 128 : 64;
@@ -343,7 +355,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         block_m == 64 and block_n % 128 == 0;
     const bool fp4_split_n_shape_band =
         fp4_flash_or_pro_shape and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
+        expected_tokens_per_expert > 0.0f and
+        expected_tokens_per_expert < get_fp4_sm90_prefill_threshold();
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
@@ -371,7 +384,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_small_block_n_kernel and fp4_split_n_shape_band;
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
-        fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+        fp4_num_epilogue_threads == 256 and
+        expected_tokens_per_expert >= get_fp4_sm90_prefill_threshold();
     const bool fp4_decode_assist_thread_kernel_band =
         fp4_2wg_decode_offload_kernel_band or
         (fp4_small_block_n_kernel and
