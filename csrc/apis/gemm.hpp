@@ -241,6 +241,51 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                          d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, std::nullopt);
 }
 
+static void m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma_g128(
+    const std::pair<torch::Tensor, torch::Tensor>& a,
+    const std::pair<torch::Tensor, torch::Tensor>& b,
+    const torch::Tensor& d,
+    const torch::Tensor& masked_m,
+    const int& expected_m,
+    const std::string& compiled_dims) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 9);
+
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(a.second.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+
+    const auto [num_groups, m, k] = get_shape<3>(a.first);
+    const auto [num_groups_b, n, half_k] = get_shape<3>(b.first);
+    const auto [num_groups_d, m_d, n_d] = get_shape<3>(d);
+    DG_HOST_ASSERT(num_groups == num_groups_b && num_groups == num_groups_d);
+    DG_HOST_ASSERT(m == m_d && n == n_d);
+    DG_HOST_ASSERT(half_k * 2 == k);
+    DG_HOST_ASSERT(static_cast<int>(masked_m.numel()) == num_groups);
+    DG_HOST_ASSERT(expected_m > 0);
+
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    std::optional<std::tuple<int, int>> recipe_a = std::make_tuple(1, 128);
+    std::optional<std::tuple<int, int>> recipe_b = std::make_tuple(1, 128);
+
+    const auto [sfa, sfb, gran_k_a, gran_k_b] =
+        layout::transform_sf_pair_into_required_layout(
+            a.second, b.second, m, n, k,
+            recipe, recipe_a, recipe_b,
+            num_groups, num_groups, false);
+
+    DG_HOST_ASSERT(gran_k_a == 128 && gran_k_b == 128);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(sfb.scalar_type() == torch::kFloat);
+
+    sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_g128(
+        {a.first, sfa}, {b.first, sfb}, d, masked_m, expected_m, compiled_dims);
+}
+
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
@@ -675,6 +720,14 @@ static void register_apis(pybind11::module_& m) {
           py::arg("b_is_int4_sym") = false,
           py::arg("masked_m_max_hint") = std::nullopt,
           py::arg("active_groups_hint") = std::nullopt);
+    m.def("m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma_g128",
+      &m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma_g128,
+      py::arg("a"),
+      py::arg("b"),
+      py::arg("d"),
+      py::arg("masked_m"),
+      py::arg("expected_m"),
+      py::arg("compiled_dims") = "nk");
     m.attr("m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma") =
         m.attr("m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma");
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,

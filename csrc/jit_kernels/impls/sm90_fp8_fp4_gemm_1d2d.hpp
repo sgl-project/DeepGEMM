@@ -226,6 +226,147 @@ static void sm90_fp8_fp4_gemm_1d1d_fused(const std::pair<torch::Tensor, torch::T
     SM90FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
+static void sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_g128(
+        const std::pair<torch::Tensor, torch::Tensor>& a,
+        const std::pair<torch::Tensor, torch::Tensor>& b,
+        const torch::Tensor& d,
+        const torch::Tensor& masked_m,
+        const int& expected_m,
+        const std::string& compiled_dims) {
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(a.second.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+
+    DG_HOST_ASSERT(a.first.is_contiguous());
+    DG_HOST_ASSERT(b.first.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+
+    const auto [num_groups, m, k] = get_shape<3>(a.first);
+    const auto [num_groups_b, n, half_k] = get_shape<3>(b.first);
+    const auto [num_groups_d, m_d, n_d] = get_shape<3>(d);
+    const auto num_groups_mask = static_cast<int>(masked_m.numel());
+
+    DG_HOST_ASSERT(num_groups == num_groups_b and num_groups == num_groups_d and num_groups == num_groups_mask);
+    DG_HOST_ASSERT(m == m_d and n == n_d);
+    DG_HOST_ASSERT(k % 2 == 0 and half_k * 2 == k);
+    DG_HOST_ASSERT(expected_m > 0);
+
+    DG_HOST_ASSERT(a.second.size(0) == num_groups);
+    DG_HOST_ASSERT(a.second.size(1) == m);
+    DG_HOST_ASSERT(a.second.size(2) == ceil_div(k, 128));
+
+    DG_HOST_ASSERT(b.second.size(0) == num_groups);
+    DG_HOST_ASSERT(b.second.size(1) == n);
+    DG_HOST_ASSERT(b.second.size(2) == ceil_div(k, 128));
+
+    check_major_type_cd(d);
+
+    if (m == 0 or n == 0) {
+        return;
+    }
+
+    auto desc = GemmDesc {
+        .gemm_type = GemmType::MGroupedMasked,
+        .kernel_type = KernelType::Kernel1D2D,
+        .m = m,
+        .n = n,
+        .k = k,
+        .num_groups = num_groups,
+        .a_dtype = a.first.scalar_type(),
+        .b_dtype = torch::kFloat8_e4m3fn,
+        .cd_dtype = d.scalar_type(),
+        .major_a = cute::UMMA::Major::K,
+        .major_b = cute::UMMA::Major::K,
+        .with_accumulation = false,
+        .num_sms = device_runtime->get_num_sms(),
+        .tc_util = device_runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
+        .expected_m = expected_m,
+        .expected_n = n,
+        .expected_k = k,
+        .expected_num_groups = num_groups
+    };
+
+    auto config = get_best_config<SM90ArchSpec>(desc);
+
+    // Packed FP4 B has half the K bytes of FP8 B. Match the W4 path:
+    config.storage_config.swizzle_b_mode = config.layout.block_k / 2;
+    DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k / 2);
+
+    const auto tensor_map_a = make_tma_a_desc(
+        cute::UMMA::Major::K,
+        a.first,
+        m,
+        k,
+        config.storage_config.load_block_m,
+        config.layout.block_k,
+        k,
+        num_groups,
+        config.storage_config.swizzle_a_mode);
+
+    const auto b_bytes = b.first.view(torch::kFloat8_e4m3fn);
+    const auto tensor_map_b = make_tma_b_desc(
+        cute::UMMA::Major::K,
+        b_bytes,
+        n,
+        half_k,
+        config.layout.block_n,
+        config.layout.block_k / 2,
+        half_k,
+        num_groups,
+        config.storage_config.swizzle_b_mode);
+
+    const auto tensor_map_sfa = make_tma_sf_desc(
+        cute::UMMA::Major::MN,
+        a.second,
+        m,
+        k,
+        config.layout.block_m,
+        config.layout.block_k,
+        num_groups,
+        0);
+
+    const auto tensor_map_d = make_tma_cd_desc(
+        d,
+        m,
+        n,
+        config.storage_config.store_block_m,
+        config.storage_config.store_block_n,
+        static_cast<int>(d.stride(-2)),
+        num_groups,
+        config.storage_config.swizzle_cd_mode);
+
+    const SM90FP8FP4Gemm1D2DRSG128Runtime::Args& rs_args = {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(
+            config.launch_config.num_sms,
+            config.launch_config.num_threads,
+            config.pipeline_config.smem_size,
+            config.layout.get_cluster_size()),
+        .major_sfb = get_major_type_ab(b.second),
+        .gmem_b_ptr = b.first.data_ptr(),
+        .gmem_d_ptr = d.data_ptr(),
+        .sfb = b.second.data_ptr(),
+        .grouped_layout = masked_m.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_d = tensor_map_d,
+        .tensor_map_sfa = tensor_map_sfa,
+    };
+
+    const auto code = SM90FP8FP4Gemm1D2DRSG128Runtime::generate(rs_args);
+    const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_g128", code);
+    SM90FP8FP4Gemm1D2DRSG128Runtime::launch(runtime, rs_args);
+}
+
 static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         const std::pair<torch::Tensor, torch::Tensor>& a,
         const std::pair<torch::Tensor, torch::Tensor>& b,
