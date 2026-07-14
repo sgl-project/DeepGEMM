@@ -58,7 +58,8 @@ def test_gemm() -> None:
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
             scores.append((cublas_t + split_k_t) / t)
-    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    if scores:
+        print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -171,6 +172,10 @@ def test_m_grouped_gemm_masked() -> None:
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
+    if get_arch_major() == 12:
+        print(' > skip: k-grouped BF16 GEMM not yet ported to SM120')
+        return
+
     for num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu, _, _, alignment, use_psum_layout in enumerate_k_grouped_contiguous(torch.bfloat16):
         include_k_tail = get_arch_major() == 10 and alignment == 32
         for test_real_ks_cpu, test_aligned_ks_cpu, _, test_k_tail in enumerate_k_grouped_contiguous_test_variants(real_ks_cpu, alignment, use_psum_layout, include_k_tail):
@@ -219,6 +224,9 @@ def test_k_grouped_gemm_contiguous() -> None:
 
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
+    if get_arch_major() == 12:
+        print(' > skip: cuBLASLt baseline benchmark not supported on SM120')
+        return
     for kernel_type, _, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(dtype=torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'

@@ -58,14 +58,15 @@ def test_gemm() -> None:
         t = bench_kineto(lambda: deep_gemm.fp8_fp4_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
                          'gemm_', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
-                              if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
+                              if not quant_config.is_fp4_a and not quant_config.is_fp4_b and get_arch_major() != 12 else (0, 0)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
             scores.append((cublas_t + split_k_t) / t)
-    print(f"Average FP8xFP8 GEMM speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    if scores:
+        print(f"Average FP8xFP8 GEMM speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -192,6 +193,10 @@ def test_m_grouped_gemm_masked() -> None:
 
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
+
+    if get_arch_major() == 12:
+        print(' > skip: k-grouped GEMM not yet ported to SM120')
+        return
 
     k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() == 9 \
                                     else deep_gemm.k_grouped_fp8_gemm_tn_contiguous

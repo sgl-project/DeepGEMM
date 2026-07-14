@@ -134,7 +134,7 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
+        for is_fp4 in ((True, False) if get_arch_major() in (10, 12) else (False, )):
             for logits_dtype in (torch.bfloat16, torch.float):
                 for weights_dtype in ((torch.float, torch.bfloat16) if get_arch_major() == 10 else (torch.float, )):
                     if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:
@@ -142,7 +142,7 @@ def test_mqa_logits():
                     for compressed_logits, clean_logits in [(False, True), (True, False)]:
                         for seq_len in (2048, 8192):
                             for seq_len_kv in (8192, 65536):
-                                head_dims = (64, 128) if (is_fp4 and get_arch_major() == 10) else (32, 64, 128)
+                                head_dims = (64, 128) if (is_fp4 and get_arch_major() == 10) else ((128, ) if is_fp4 else (32, 64, 128))
                                 heads = (8, 16, 32, 64) if get_arch_major() == 10 else (32, 64)
                                 for num_heads in heads:
                                     for head_dim in head_dims:
@@ -320,7 +320,7 @@ def test_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_varlen_tokens = 16 * 1024
         for is_varlen in ((False, True) if arch_major == 10 else (False, )):
-            for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
+            for is_fp4 in ((True, False) if arch_major in (10, 12) else (False, )):
                 for logits_dtype in (torch.bfloat16, torch.float):
                     for weights_dtype in ((torch.float, torch.bfloat16) if arch_major == 10 else (torch.float, )):
                         if weights_dtype == torch.bfloat16 and logits_dtype == torch.float:

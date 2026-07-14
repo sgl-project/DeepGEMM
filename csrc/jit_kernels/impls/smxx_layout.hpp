@@ -200,7 +200,9 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         if ((mn * sf_k) % 4 != 0 and num_sf_batches > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
 
-        constexpr int block_mn = 48;
+        const int max_smem = static_cast<int>(device_runtime->get_prop()->sharedMemPerBlockOptin);
+        const int block_mn = std::min(48, (max_smem / (sf_k * 4) / 4) * 4);
+        DG_HOST_ASSERT(block_mn >= 4);
         constexpr int num_threads = 512;
         const auto psum_smem_elems = use_psum_layout ? align(num_psum_groups * 2, 4) : 0;
         const auto smem_size = block_mn * sf_k * 4 + psum_smem_elems * 4;
