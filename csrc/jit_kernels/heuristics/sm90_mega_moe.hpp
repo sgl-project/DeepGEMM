@@ -230,169 +230,14 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-struct FP4SM90WaveRule {
-    float min_tokens_per_expert;
-    float max_tokens_per_expert;
-    bool include_min;
-    int required_expert_divisor;
-    int num_experts_per_wave;
-};
-
-enum class FP4SM90StageShape {
-    Any,
-    Flash,
-    Pro,
-    NotPro,
-};
-
-struct FP4SM90StageCapRule {
-    float min_tokens_per_expert;
-    float max_tokens_per_expert;
-    bool include_min;
-    bool include_max;
-    FP4SM90StageShape shape;
-    int num_stages_cap;
-};
-
-static bool try_get_num_experts_per_wave_for_sm90_fp4(
-    const FP4SM90WaveRule* rules, const int& num_rules,
-    const float& expected_tokens_per_expert, const int& num_experts_per_rank,
-    int& num_experts_per_wave) {
-    for (int i = 0; i < num_rules; ++ i) {
-        const auto& rule = rules[i];
-        const bool in_lower_bound = rule.include_min
-            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
-            : expected_tokens_per_expert > rule.min_tokens_per_expert;
-        if (!in_lower_bound or expected_tokens_per_expert >= rule.max_tokens_per_expert)
-            continue;
-
-        if (rule.num_experts_per_wave == 0) {
-            if (num_experts_per_rank <= 0)
-                continue;
-            num_experts_per_wave = num_experts_per_rank;
-            return true;
-        }
-        DG_HOST_ASSERT(rule.required_expert_divisor > 0);
-        if (num_experts_per_rank % rule.required_expert_divisor == 0) {
-            num_experts_per_wave = rule.num_experts_per_wave;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool fp4_sm90_stage_shape_matches(
-    const FP4SM90StageShape& shape, const bool& fp4_flash_shape, const bool& fp4_pro_shape) {
-    switch (shape) {
-        case FP4SM90StageShape::Any:
-            return true;
-        case FP4SM90StageShape::Flash:
-            return fp4_flash_shape;
-        case FP4SM90StageShape::Pro:
-            return fp4_pro_shape;
-        case FP4SM90StageShape::NotPro:
-            return !fp4_pro_shape;
-    }
-    DG_HOST_ASSERT(false);
-    return false;
-}
-
-static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
-    const int& intermediate_hidden, const int& block_m, const int& block_n,
-    const float& expected_tokens_per_expert) {
-    if (!(block_m == 64 and block_n == 128)) {
-        return 0;
-    }
-
-    const bool fp4_flash_shape = intermediate_hidden <= 2048;
-    const bool fp4_pro_shape = intermediate_hidden >= 3072;
-    // Ordered first-match rules preserve the historical stage-cap priority.
-    static constexpr FP4SM90StageCapRule stage_cap_rules[] = {
-        {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 4},
-        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 4},
-        {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 5},
-        {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 5},
-        {1.5f, 3.0f, true, false, FP4SM90StageShape::Pro, 5},
-        {1.0f, 1.5f, true, false, FP4SM90StageShape::Pro, 5},
-        {24.0f, 64.0f, true, false, FP4SM90StageShape::Pro, 5},
-        {0.375f, 0.75f, true, false, FP4SM90StageShape::Any, 6},
-        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 6},
-        {1.5f, 3.0f, true, false, FP4SM90StageShape::NotPro, 6},
-        {1.5f, 24.0f, true, true, FP4SM90StageShape::Any, 5},
-    };
-    for (const auto& rule: stage_cap_rules) {
-        const bool in_lower_bound = rule.include_min
-            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
-            : expected_tokens_per_expert > rule.min_tokens_per_expert;
-        const bool in_upper_bound = rule.include_max
-            ? expected_tokens_per_expert <= rule.max_tokens_per_expert
-            : expected_tokens_per_expert < rule.max_tokens_per_expert;
-        if (in_lower_bound and in_upper_bound and
-            fp4_sm90_stage_shape_matches(rule.shape, fp4_flash_shape, fp4_pro_shape)) {
-            return rule.num_stages_cap;
-        }
-    }
-    return 0;
-}
-
 static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
     const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    const float expected_tokens_per_expert =
-        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const bool fp4_small_block_n_kernel =
-        block_m == 64 and block_n == 128;
-    const bool fp4_flash_shape = intermediate_hidden <= 2048;
-    const bool fp4_pro_shape = intermediate_hidden >= 3072;
-    int fp4_num_experts_per_wave = 0;
-    if (fp4_small_block_n_kernel and fp4_flash_shape) {
-        static constexpr FP4SM90WaveRule flash_wave_rules[] = {
-            {0.75f, 1.0f, true, 16, 16},
-            {1.5f, 2.0f, true, 16, 16},
-            {3.0f, 6.0f, true, 16, 16},
-            {6.0f, 12.0f, true, 32, 32},
-            {6.0f, 12.0f, true, 8, 8},
-            {24.0f, 32.0f, true, 16, 16},
-            {12.0f, 24.0f, true, 32, 32},
-            {12.0f, 24.0f, true, 8, 8},
-            {32.0f, 64.0f, true, 16, 16},
-        };
-        if (try_get_num_experts_per_wave_for_sm90_fp4(
-                flash_wave_rules,
-                static_cast<int>(sizeof(flash_wave_rules) / sizeof(flash_wave_rules[0])),
-                expected_tokens_per_expert, num_experts_per_rank,
-                fp4_num_experts_per_wave)) {
-            return fp4_num_experts_per_wave;
-        }
-    }
-    if (fp4_small_block_n_kernel and fp4_pro_shape) {
-        static constexpr FP4SM90WaveRule pro_wave_rules[] = {
-            {0.0f, 0.25f, false, 16, 16},
-            {0.25f, 0.375f, true, 16, 16},
-            {0.375f, 0.75f, true, 16, 16},
-            {0.25f, 1.0f, true, 24, 24},
-            {1.0f, 1.5f, true, 1, 0},
-            {1.5f, 3.0f, true, 16, 16},
-            {3.0f, 6.0f, true, 8, 8},
-            {6.0f, 12.0f, true, 16, 16},
-            {6.0f, 12.0f, true, 8, 8},
-            {12.0f, 24.0f, true, 24, 24},
-            {12.0f, 24.0f, true, 8, 8},
-            {24.0f, 64.0f, true, 8, 8},
-        };
-        if (try_get_num_experts_per_wave_for_sm90_fp4(
-                pro_wave_rules,
-                static_cast<int>(sizeof(pro_wave_rules) / sizeof(pro_wave_rules[0])),
-                expected_tokens_per_expert, num_experts_per_rank,
-                fp4_num_experts_per_wave)) {
-            return fp4_num_experts_per_wave;
-        }
-    }
-    if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
-        return num_experts_per_rank;
-    }
-    return get_num_experts_per_wave_for_mega_moe(
+    // Simplified: schedule FP4 expert waves exactly like the FP8 path. The
+    // historical flash/pro wave tables (9 + 12 first-match rules) were tuned
+    // point-by-point on benchmark batches and are retired.
+    return get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);
@@ -405,7 +250,6 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const int& default_num_stages_cap = 0,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false) {
     constexpr int kSmemAlignment = 1024;
@@ -466,12 +310,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_fixed =
         smem_dispatch_size + smem_cd + smem_amax_scratch + smem_barriers_fixed;
 
-    const int max_num_stages = (smem_capacity - smem_fixed) /
-                               (smem_per_stage + smem_barriers_per_stage);
-    int num_stages = max_num_stages;
-    if (default_num_stages_cap > 0) {
-        num_stages = std::min(num_stages, default_num_stages_cap);
-    }
+    // No FP4 stage cap (FP8 parity): always use as many pipeline stages as
+    // SMEM allows. The historical 11-rule cap table is retired.
+    const int num_stages = (smem_capacity - smem_fixed) /
+                           (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(num_stages >= 2);
     return {num_stages,
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
@@ -547,15 +389,12 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
-    const int default_num_stages_cap = get_default_num_stages_cap_for_mega_moe_sm90_fp4(
-        intermediate_hidden, block_m, block_n, expected_tokens_per_expert);
-
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
-        use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap,
+        use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax);
 
     const auto config = MegaMoESM90Config {

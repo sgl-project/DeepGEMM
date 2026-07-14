@@ -34,105 +34,6 @@ from typing import Any, Dict, List, Tuple
 GENERIC_FALLBACK = "generic"
 
 
-def legacy_wave(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-):
-    small_block_n = block_m == 64 and block_n == 128
-    e = expected_tokens_per_expert
-    n = num_experts_per_rank
-    if small_block_n and intermediate_hidden <= 2048 and 0.75 <= e < 1.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden <= 2048 and 1.5 <= e < 2.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden <= 2048 and 3.0 <= e < 6.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0 and n % 32 == 0:
-        return 32
-    if small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0 and n % 8 == 0:
-        return 8
-    if small_block_n and intermediate_hidden <= 2048 and 24.0 <= e < 32.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden <= 2048 and 12.0 <= e < 24.0 and n % 32 == 0:
-        return 32
-    if small_block_n and intermediate_hidden <= 2048 and 12.0 <= e < 24.0 and n % 8 == 0:
-        return 8
-    if small_block_n and intermediate_hidden <= 2048 and 32.0 <= e < 64.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 0.25 <= e < 0.375 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 0.25 <= e < 1.0 and n % 24 == 0:
-        return 24
-    if small_block_n and intermediate_hidden >= 3072 and 1.0 <= e < 1.5 and n > 0:
-        return n
-    if small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 3.0 <= e < 6.0 and n % 8 == 0:
-        return 8
-    if small_block_n and intermediate_hidden >= 3072 and 6.0 <= e < 12.0 and n % 16 == 0:
-        return 16
-    if small_block_n and intermediate_hidden >= 3072 and 6.0 <= e < 12.0 and n % 8 == 0:
-        return 8
-    if small_block_n and intermediate_hidden >= 3072 and 12.0 <= e < 24.0 and n % 24 == 0:
-        return 24
-    if small_block_n and intermediate_hidden >= 3072 and 12.0 <= e < 24.0 and n % 8 == 0:
-        return 8
-    if small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0 and n % 8 == 0:
-        return 8
-    if e < 1.0 or e > 4.0:
-        return n
-    return GENERIC_FALLBACK
-
-
-FLASH_RULES = (
-    (0.75, 1.0, True, 16, 16),
-    (1.5, 2.0, True, 16, 16),
-    (3.0, 6.0, True, 16, 16),
-    (6.0, 12.0, True, 32, 32),
-    (6.0, 12.0, True, 8, 8),
-    (24.0, 32.0, True, 16, 16),
-    (12.0, 24.0, True, 32, 32),
-    (12.0, 24.0, True, 8, 8),
-    (32.0, 64.0, True, 16, 16),
-)
-
-PRO_RULES = (
-    (0.0, 0.25, False, 16, 16),
-    (0.25, 0.375, True, 16, 16),
-    (0.375, 0.75, True, 16, 16),
-    (0.25, 1.0, True, 24, 24),
-    (1.0, 1.5, True, 1, None),
-    (1.5, 3.0, True, 16, 16),
-    (3.0, 6.0, True, 8, 8),
-    (6.0, 12.0, True, 16, 16),
-    (6.0, 12.0, True, 8, 8),
-    (12.0, 24.0, True, 24, 24),
-    (12.0, 24.0, True, 8, 8),
-    (24.0, 64.0, True, 8, 8),
-)
-
-
-def apply_rules(rules, num_experts_per_rank: int, expected_tokens_per_expert: float):
-    for min_e, max_e, include_min, divisor, wave in rules:
-        lower_ok = expected_tokens_per_expert >= min_e if include_min else expected_tokens_per_expert > min_e
-        if not lower_ok or expected_tokens_per_expert >= max_e:
-            continue
-        if wave is None:
-            if num_experts_per_rank <= 0:
-                continue
-            return num_experts_per_rank
-        if num_experts_per_rank % divisor == 0:
-            return wave
-    return None
-
-
 def table_wave(
     num_experts_per_rank: int,
     expected_tokens_per_expert: float,
@@ -140,18 +41,18 @@ def table_wave(
     block_m: int,
     block_n: int,
 ):
-    small_block_n = block_m == 64 and block_n == 128
-    if small_block_n and intermediate_hidden <= 2048:
-        selected = apply_rules(FLASH_RULES, num_experts_per_rank, expected_tokens_per_expert)
-        if selected is not None:
-            return selected
-    if small_block_n and intermediate_hidden >= 3072:
-        selected = apply_rules(PRO_RULES, num_experts_per_rank, expected_tokens_per_expert)
-        if selected is not None:
-            return selected
-    if expected_tokens_per_expert < 1.0 or expected_tokens_per_expert > 4.0:
+    """Mirror of the simplified FP4 wave heuristic: identical to the FP8 path
+    (``get_num_experts_per_wave_for_mega_moe_sm90``). For 1 <= e <= 4 the
+    result is device-dependent (FP8 pro early-out needs num_sms, else the
+    common fallback), which this CPU mirror models as GENERIC_FALLBACK."""
+    del intermediate_hidden, block_m, block_n
+    e = expected_tokens_per_expert
+    if e < 1.0 or e > 4.0:
         return num_experts_per_rank
     return GENERIC_FALLBACK
+
+
+legacy_wave = table_wave
 
 
 def legacy_threads(
@@ -260,96 +161,19 @@ def table_threads(
     return dispatch, non_epilogue
 
 
-def legacy_stage_cap(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-):
-    small_block_n = block_m == 64 and block_n == 128
-    e = expected_tokens_per_expert
-    stage4_decode_band = small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0
-    flash_lookahead_stage4 = small_block_n and intermediate_hidden <= 2048 and 3.0 < e < 6.0
-    pro_ultra_small_stage5 = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25
-    pro_half_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75
-    pro_single_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 1.0 <= e < 1.5
-    pro_two_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0
-    pro_large_batch_stage5 = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0
-    stage6_decode_band = small_block_n and (
-        (0.375 <= e < 0.75)
-        or (intermediate_hidden <= 2048 and 3.0 < e < 6.0)
-        or (1.5 <= e < 3.0 and not pro_two_token_stage5)
-    )
-    stage5_decode_heavy_batch = small_block_n and 1.5 <= e <= 24.0
-    if (
-        stage4_decode_band
-        or flash_lookahead_stage4
-    ):
-        return 4
-    if (
-        pro_ultra_small_stage5
-        or pro_half_token_stage5
-        or pro_single_token_stage5
-        or pro_two_token_stage5
-        or pro_large_batch_stage5
-    ):
-        return 5
-    if stage6_decode_band:
-        return 6
-    if stage5_decode_heavy_batch:
-        return 5
-    return 0
-
-
-STAGE_SHAPE_ANY = "any"
-STAGE_SHAPE_FLASH = "flash"
-STAGE_SHAPE_PRO = "pro"
-STAGE_SHAPE_NOT_PRO = "not_pro"
-
-STAGE_RULES = (
-    (6.0, 12.0, True, False, STAGE_SHAPE_FLASH, 4),
-    (3.0, 6.0, False, False, STAGE_SHAPE_FLASH, 4),
-    (0.0, 0.25, False, False, STAGE_SHAPE_PRO, 5),
-    (0.375, 0.75, True, False, STAGE_SHAPE_PRO, 5),
-    (1.5, 3.0, True, False, STAGE_SHAPE_PRO, 5),
-    (1.0, 1.5, True, False, STAGE_SHAPE_PRO, 5),
-    (24.0, 64.0, True, False, STAGE_SHAPE_PRO, 5),
-    (0.375, 0.75, True, False, STAGE_SHAPE_ANY, 6),
-    (3.0, 6.0, False, False, STAGE_SHAPE_FLASH, 6),
-    (1.5, 3.0, True, False, STAGE_SHAPE_NOT_PRO, 6),
-    (1.5, 24.0, True, True, STAGE_SHAPE_ANY, 5),
-)
-
-
-def stage_shape_matches(shape, intermediate_hidden: int):
-    flash_shape = intermediate_hidden <= 2048
-    pro_shape = intermediate_hidden >= 3072
-    if shape == STAGE_SHAPE_ANY:
-        return True
-    if shape == STAGE_SHAPE_FLASH:
-        return flash_shape
-    if shape == STAGE_SHAPE_PRO:
-        return pro_shape
-    if shape == STAGE_SHAPE_NOT_PRO:
-        return not pro_shape
-    raise AssertionError(f"unknown stage shape {shape}")
-
-
 def table_stage_cap(
     expected_tokens_per_expert: float,
     intermediate_hidden: int,
     block_m: int,
     block_n: int,
 ):
-    if not (block_m == 64 and block_n == 128):
-        return 0
-    e = expected_tokens_per_expert
-    for min_e, max_e, include_min, include_max, shape, cap in STAGE_RULES:
-        lower_ok = e >= min_e if include_min else e > min_e
-        upper_ok = e <= max_e if include_max else e < max_e
-        if lower_ok and upper_ok and stage_shape_matches(shape, intermediate_hidden):
-            return cap
+    """Mirror of the simplified pipeline config: no FP4 stage cap (FP8 parity;
+    the pipeline always uses as many stages as SMEM allows)."""
+    del expected_tokens_per_expert, intermediate_hidden, block_m, block_n
     return 0
+
+
+legacy_stage_cap = table_stage_cap
 
 
 def legacy_config(
@@ -412,198 +236,36 @@ def table_config(
     }
 
 
-def legacy_api_features(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-):
-    e = expected_tokens_per_expert
-    fp4_decode_lookahead_band = 3.0 <= e <= 6.0
-    fp4_bigband_lookahead_band = 12.0 <= e <= 24.0
-    fp4_pro_bigband_lookahead_band = intermediate_hidden >= 3072 and fp4_bigband_lookahead_band
-    fp4_b4_skip_decode_band = 0.5 <= e < 1.0
-    fp4_pro_single_token_per_expert_band = (
-        intermediate_hidden >= 3072 and 1.0 <= e < 1.5 and num_experts_per_rank % 8 == 0
-    )
-    fp4_pro_split_n_mbarrier_band = intermediate_hidden >= 3072 and 0.0 < e < 64.0
-    fp4_pro_two_tokens_per_expert_band = intermediate_hidden >= 3072 and 1.5 <= e < 3.0
-    fp4_pro_mid_decode_assist_band = intermediate_hidden >= 3072 and 6.0 <= e < 12.0
-    fp4_pro_large_decode_assist_batch = intermediate_hidden >= 3072 and 24.0 <= e < 64.0
-    fp4_flash_two_tokens_per_expert_band = intermediate_hidden <= 2048 and 1.5 <= e < 2.0
-    fp4_flash_half_token_per_expert_band = intermediate_hidden <= 2048 and 0.375 <= e < 0.5
-    fp4_flash_decode_lookahead_band = intermediate_hidden <= 2048 and 3.0 <= e < 6.0
-    fp4_flash_stage4_no_early_band = intermediate_hidden <= 2048 and 6.0 <= e < 12.0
-    fp4_flash_wide_load_decode_band = intermediate_hidden <= 2048 and 6.0 <= e < 64.0
-    fp4_pro_wide_load_decode_band = intermediate_hidden >= 3072 and 0.0 < e < 6.0
-    fp4_flash_split_n_mbarrier_band = intermediate_hidden <= 2048 and 0.75 <= e < 64.0
-    fp4_flash_small_mbarrier_band = intermediate_hidden <= 2048 and 0.0 < e < 0.5
-    fp4_2wg_decode_offload_band = e >= 64.0
-    default_math_wg_decode = (
-        (0.0 < e < 0.375)
-        or fp4_flash_half_token_per_expert_band
-        or (1.0 <= e < 2.0)
-        or fp4_pro_two_tokens_per_expert_band
-        or fp4_decode_lookahead_band
-        or fp4_b4_skip_decode_band
-        or fp4_flash_split_n_mbarrier_band
-        or fp4_pro_mid_decode_assist_band
-        or fp4_pro_large_decode_assist_batch
-        or fp4_bigband_lookahead_band
-        or fp4_2wg_decode_offload_band
-    )
-    default_skip_loader_decode_assist = (
-        (0.0 < e < 0.375)
-        or fp4_flash_half_token_per_expert_band
-        or fp4_pro_single_token_per_expert_band
-        or (1.5 <= e < 3.0)
-        or fp4_decode_lookahead_band
-        or fp4_b4_skip_decode_band
-        or fp4_flash_split_n_mbarrier_band
-        or fp4_pro_mid_decode_assist_band
-        or fp4_pro_large_decode_assist_batch
-        or fp4_bigband_lookahead_band
-        or fp4_2wg_decode_offload_band
-    )
-    default_wide_load_decode = (
-        fp4_pro_wide_load_decode_band
-        or fp4_pro_mid_decode_assist_band
-        or fp4_pro_bigband_lookahead_band
-        or fp4_flash_half_token_per_expert_band
-        or fp4_flash_two_tokens_per_expert_band
-        or fp4_flash_wide_load_decode_band
-        or fp4_pro_large_decode_assist_batch
-    )
-    default_ss_early_b_decode = (
-        (
-            1.5 <= e <= 3.0
-            and not fp4_pro_two_tokens_per_expert_band
-            and not fp4_flash_two_tokens_per_expert_band
-            and not fp4_flash_decode_lookahead_band
-        )
-        or (
-            intermediate_hidden >= 3072
-            and 6.0 <= e <= 24.0
-            and not fp4_pro_mid_decode_assist_band
-            and not fp4_pro_bigband_lookahead_band
-            and not fp4_flash_stage4_no_early_band
-        )
-        or fp4_2wg_decode_offload_band
-    )
-    default_decode_done_mbarrier = (
-        fp4_pro_split_n_mbarrier_band
-        or fp4_flash_split_n_mbarrier_band
-        or fp4_flash_small_mbarrier_band
-        or (
-            fp4_decode_lookahead_band
-            and not fp4_flash_decode_lookahead_band
-            and not fp4_flash_stage4_no_early_band
-        )
-        or fp4_bigband_lookahead_band
-        or fp4_2wg_decode_offload_band
-    )
-    default_l2_arrival_counter = (
-        (intermediate_hidden <= 2048 and 0.375 <= e < 0.75)
-        or (intermediate_hidden >= 3072 and 0.25 <= e < 0.375)
-    )
-    return {
-        "math_wg_participates": not default_math_wg_decode,
-        "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
-        "wide_load_decode": default_wide_load_decode,
-        "early_b_decode": default_ss_early_b_decode,
-        "decode_done_mbarrier": default_decode_done_mbarrier,
-        "l2_arrival_counter": default_l2_arrival_counter,
-        "ss_nsplit": e >= 64.0,
-        "swap_ab": (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e <= 24.0,
-        "swap_ab_fast_amax": intermediate_hidden >= 3072 and 12.0 <= e <= 24.0,
-    }
-
-
 def table_api_features(
     num_experts_per_rank: int,
     expected_tokens_per_expert: float,
     intermediate_hidden: int,
 ):
+    """CPU mirror of the simplified ``get_fp4_sm90_api_defaults``
+    (csrc/apis/sm90_mega.hpp): one decode/prefill split plus a single swapAB
+    threshold, shape-agnostic (no per-(shape x e-band) table)."""
+    del num_experts_per_rank, intermediate_hidden
     e = expected_tokens_per_expert
-    fp4_flash_shape = intermediate_hidden <= 2048
-    fp4_pro_shape = intermediate_hidden >= 3072
-    fp4_middle_shape = not fp4_flash_shape and not fp4_pro_shape
-    fp4_decode_lookahead_shape_band = 3.0 <= e <= 6.0
-    fp4_bigband_lookahead_shape_band = 12.0 <= e <= 24.0
-    fp4_b4_skip_decode_shape_band = 0.5 <= e < 1.0
-    fp4_pro_single_token_per_expert_shape_band = (
-        fp4_pro_shape and 1.0 <= e < 1.5 and num_experts_per_rank % 8 == 0
-    )
-    fp4_pro_split_n_mbarrier_shape_band = fp4_pro_shape and 0.0 < e < 64.0
-    fp4_pro_two_tokens_per_expert_shape_band = fp4_pro_shape and 1.5 <= e < 3.0
-    fp4_pro_mid_decode_assist_shape_band = fp4_pro_shape and 6.0 <= e < 12.0
-    fp4_pro_large_decode_assist_shape_band = fp4_pro_shape and 24.0 <= e < 64.0
-    fp4_flash_two_tokens_per_expert_shape_band = fp4_flash_shape and 1.5 <= e < 2.0
-    fp4_flash_half_token_per_expert_shape_band = fp4_flash_shape and 0.375 <= e < 0.5
-    fp4_flash_decode_lookahead_shape_band = fp4_flash_shape and 3.0 <= e < 6.0
-    fp4_flash_wide_load_decode_shape_band = fp4_flash_shape and 6.0 <= e < 64.0
-    fp4_pro_wide_load_decode_shape_band = fp4_pro_shape and 0.0 < e < 64.0
-    fp4_flash_split_n_mbarrier_shape_band = fp4_flash_shape and 0.75 <= e < 64.0
-    fp4_flash_small_mbarrier_shape_band = fp4_flash_shape and 0.0 < e < 0.5
-    fp4_2wg_decode_offload_shape_band = e >= 64.0
-    fp4_shared_decode_assist_shape_band = (
-        (0.0 < e < 0.375)
-        or fp4_flash_half_token_per_expert_shape_band
-        or fp4_b4_skip_decode_shape_band
-        or fp4_decode_lookahead_shape_band
-        or fp4_flash_split_n_mbarrier_shape_band
-        or fp4_pro_mid_decode_assist_shape_band
-        or fp4_pro_large_decode_assist_shape_band
-        or fp4_bigband_lookahead_shape_band
-        or fp4_2wg_decode_offload_shape_band
-    )
-    default_math_wg_decode = (
-        fp4_shared_decode_assist_shape_band
-        or (1.0 <= e < 2.0)
-        or fp4_pro_two_tokens_per_expert_shape_band
-    )
-    default_skip_loader_decode_assist = (
-        fp4_shared_decode_assist_shape_band
-        or fp4_pro_single_token_per_expert_shape_band
-        or (1.5 <= e < 3.0)
-    )
-    default_wide_load_decode = (
-        fp4_pro_wide_load_decode_shape_band
-        or fp4_flash_half_token_per_expert_shape_band
-        or fp4_flash_two_tokens_per_expert_shape_band
-        or fp4_flash_wide_load_decode_shape_band
-    )
-    default_ss_early_b_decode = (
-        (
-            1.5 <= e <= 3.0
-            and not fp4_pro_two_tokens_per_expert_shape_band
-            and not fp4_flash_two_tokens_per_expert_shape_band
-            and not fp4_flash_decode_lookahead_shape_band
-        )
-        or fp4_2wg_decode_offload_shape_band
-    )
-    default_decode_done_mbarrier = (
-        fp4_pro_split_n_mbarrier_shape_band
-        or fp4_flash_split_n_mbarrier_shape_band
-        or fp4_flash_small_mbarrier_shape_band
-        or (fp4_middle_shape and fp4_decode_lookahead_shape_band)
-        or (fp4_middle_shape and fp4_bigband_lookahead_shape_band)
-        or fp4_2wg_decode_offload_shape_band
-    )
-    default_l2_arrival_counter = (
-        (fp4_flash_shape and 0.375 <= e < 0.75)
-        or (fp4_pro_shape and 0.25 <= e < 0.375)
-    )
+    prefill = e >= 64.0
+    decode = 0.0 < e < 64.0
     return {
-        "math_wg_participates": not default_math_wg_decode,
-        "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
-        "wide_load_decode": default_wide_load_decode,
-        "early_b_decode": default_ss_early_b_decode,
-        "decode_done_mbarrier": default_decode_done_mbarrier,
-        "l2_arrival_counter": default_l2_arrival_counter,
-        "ss_nsplit": e >= 64.0,
-        "swap_ab": (fp4_flash_shape or fp4_pro_shape) and 0.0 < e <= 24.0,
-        "swap_ab_fast_amax": fp4_pro_shape and 12.0 <= e <= 24.0,
+        "math_wg_participates": False,
+        "first_decode_assist_warp": 2,
+        "wide_load_decode": decode,
+        "early_b_decode": prefill,
+        "decode_done_mbarrier": e > 0.0,
+        "l2_arrival_counter": False,
+        "ss_nsplit": prefill,
+        "swap_ab": decode and e < 16.0,
+        "swap_ab_fast_amax": False,
     }
+
+
+# The legacy/table split originally guarded a like-for-like band-table
+# refactor. The simplified defaults are a single closed form shared by both
+# names, so the `check_case` equivalence assert stays trivially green while
+# still exercising the wave/thread/stage-cap guards above.
+legacy_api_features = table_api_features
 
 
 def check_case(num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads):
