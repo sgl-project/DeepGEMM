@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdlib>
-
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <torch/python.h>
 
@@ -92,19 +90,15 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
 
     // Always do shape checks
     const auto sf_dtype = sf.scalar_type();
-    // BF16 / E8M0 (UInt8) SFB fast path 也允许；其它情况维持 fp32/int 限制。
+    // Supported SF storage formats. INT is fixed to 4-way packed UE8M0.
     DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt or
                    sf_dtype == torch::kBFloat16 or sf_dtype == torch::kUInt8);
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())
         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
     DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    const char* scale_b_lut_env = std::getenv("DG_W4_SCALE_B_LUT");
-    const bool scale_b_lut = sf_dtype == torch::kInt and
-        scale_b_lut_env != nullptr and scale_b_lut_env[0] != '\0' and scale_b_lut_env[0] != '0';
-    const int expected_sf_k = scale_b_lut ?
-        ceil_div(k, gran_k) * 2 :
-        ceil_div(k, gran_k * (sf_dtype == torch::kInt ? 4 : 1));
+    const int sf_pack_factor = sf_dtype == torch::kInt ? 4 : 1;
+    const int expected_sf_k = ceil_div(k, gran_k * sf_pack_factor);
     DG_HOST_ASSERT(sf.size(-1) == expected_sf_k);
 
     // TMA stride checks: TMA aligned and MN-major
