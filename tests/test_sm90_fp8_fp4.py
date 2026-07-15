@@ -1,6 +1,6 @@
+import argparse
 import sys
 import time
-import os
 from pathlib import Path
 
 import torch
@@ -215,22 +215,21 @@ def _masked_benchmark_case(
     a_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
     a_sf = torch.empty((groups, max_m, k // a_gran_k), device="cuda", dtype=torch.float)
     b_fp4 = torch.empty((groups, n, k // 2), device="cuda", dtype=torch.int8)
-    use_packed_b_sf = bool(int(os.getenv("DG_W4_FUSE_SCALE_B_DECODE", "0")))
-    b_sf_k = k // (b_gran_k * (4 if use_packed_b_sf else 1))
-    b_sf = torch.empty((groups, n, b_sf_k), device="cuda", dtype=torch.int if use_packed_b_sf else torch.float)
+    b_sf_k = k // b_gran_k
+    b_sf = torch.empty((groups, n, b_sf_k), device="cuda", dtype=torch.float)
     for group_id in range(groups):
         a_data[group_id], a_sf[group_id] = per_token_cast_to_fp8(
             a_ref_src[group_id], use_ue8m0=False, gran_k=a_gran_k
         )
         b_fp4[group_id], b_sf[group_id] = per_token_cast_to_fp4(
-            b_ref_src[group_id], use_ue8m0=True, gran_k=b_gran_k, use_packed_ue8m0=use_packed_b_sf
+            b_ref_src[group_id], use_ue8m0=True, gran_k=b_gran_k
         )
     a = (a_data, a_sf)
     b_w4 = (b_fp4, b_sf)
 
     assert a[1].shape == (groups, max_m, k // a_gran_k)
     assert b_w4[1].shape == (groups, n, b_sf_k)
-    if b_gran_k == 128 and not use_packed_b_sf:
+    if b_gran_k == 128:
         assert b_w4[1].dtype == torch.float
         assert b_w4[1].shape == (groups, n, k // 128)
 
@@ -242,7 +241,7 @@ def _masked_benchmark_case(
     for group_id in range(groups):
         valid_m = int(masked_m[group_id].item())
         b_dequant = cast_back_from_fp4(
-            b_w4[0][group_id], b_w4[1][group_id], gran_k=b_gran_k, use_packed_ue8m0=use_packed_b_sf
+            b_w4[0][group_id], b_w4[1][group_id], gran_k=b_gran_k
         )
         b_fp8_data[group_id], b_fp8_sf[group_id] = per_token_cast_to_fp8(
             b_dequant, use_ue8m0=False, gran_k=a_gran_k
@@ -342,51 +341,21 @@ def _masked_skew_benchmark_case(
     a_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
     a_sf = torch.empty((groups, max_m, k // a_gran_k), device="cuda", dtype=torch.float)
     b_fp4 = torch.empty((groups, n, k // 2), device="cuda", dtype=torch.int8)
-    use_packed_b_sf = bool(int(os.getenv("DG_W4_FUSE_SCALE_B_DECODE", "0")))
-    b_sf_k = k // (b_gran_k * (4 if use_packed_b_sf else 1))
-    block_m_override = int(os.getenv("DG_W4_BLOCK_M_OVERRIDE", "0")) or None
-    block_n_override = int(os.getenv("DG_W4_BLOCK_N_OVERRIDE", "0")) or None
+    b_sf_k = k // b_gran_k
     bm32_skew_fast_path = (
         b_gran_k == 32
         and masked_m_max_hint is not None
         and masked_m_max_hint > 16
-        and os.getenv("DG_W4_PATHB_FUSE_DECODE", "0") == "0"
-        and os.getenv("DG_W4_PATHB_FAST_PATH", "1") != "0"
-        and os.getenv("DG_W4_PATHB_BM64", "0") == "0"
-        and (block_m_override is None or block_m_override == 32)
-        and (block_n_override is None or block_n_override in (128, 256))
         and max_m >= 1024
-        and groups == 32
-        and n in (4096, 7168)
+        and 8 <= groups <= 36
+        and n in (4096, 6144, 7168)
         and k in (2048, 3072, 4096, 7168)
     )
     scale_b_direct_load = b_gran_k == 32 and (
         expected_m <= 16 or bm32_skew_fast_path
     )
-    scale_b_dtype_fast_path = (
-        scale_b_direct_load
-        and os.getenv("DG_W4_K32_QUAD_SCALE_B_PREFETCH", "0") == "0"
-        and os.getenv("DG_W4_SCALE_B_POW2_PROMOTE", "0") == "0"
-    )
-    # bf16 sfb：path-A (gran_k_b=128) 与 path-B fast-path (gran_k_b=32) 都支持，
-    # 体积砍半。按 MN-major + tma_aligned_mn=align(N, 8) 直接构造，避开 host 端
-    # fp32-only 的 transpose 路径。**默认开启**，DG_W4_SCALE_B_BF16=0 时回退 fp32。
-    use_bf16_b_sf = (
-        ((b_gran_k == 32 and scale_b_dtype_fast_path) or b_gran_k == 128)
-        and not use_packed_b_sf
-        and bool(int(os.getenv("DG_W4_SCALE_B_BF16", "1")))
-    )
-    # E8M0 sfb（uint8）：仅 path-B (gran_k_b=32)。每元素 = fp32 pow2 scale 的指数位。
-    # per_token_cast_to_fp4(..., use_ue8m0=True) 已保证 sf 是严格 pow2，因此抽指数无损。
-    # **默认开启**，DG_W4_SCALE_B_E8M0=0 时回退。优先级高于 bf16（互斥）。
-    use_e8m0_b_sf = (
-        b_gran_k == 32
-        and scale_b_dtype_fast_path
-        and not use_packed_b_sf
-        and bool(int(os.getenv("DG_W4_SCALE_B_E8M0", "1")))
-    )
-    if use_e8m0_b_sf:
-        use_bf16_b_sf = False  # e8m0 优先
+    use_e8m0_b_sf = b_gran_k == 32 and scale_b_direct_load
+    use_bf16_b_sf = b_gran_k == 128
     if use_e8m0_b_sf:
         # uint8: tma_aligned_mn = ceil(N, 16)，要求 N % 16 == 0。
         assert n % 16 == 0
@@ -410,14 +379,14 @@ def _masked_skew_benchmark_case(
         )
         b_sf_fp32 = torch.empty((groups, n, b_sf_k), device="cuda", dtype=torch.float)
     else:
-        b_sf = torch.empty((groups, n, b_sf_k), device="cuda", dtype=torch.int if use_packed_b_sf else torch.float)
+        b_sf = torch.empty((groups, n, b_sf_k), device="cuda", dtype=torch.float)
         b_sf_fp32 = b_sf
     for group_id in range(groups):
         a_data[group_id], a_sf[group_id] = per_token_cast_to_fp8(
             a_ref_src[group_id], use_ue8m0=False, gran_k=a_gran_k
         )
         b_fp4[group_id], b_sf_fp32[group_id] = per_token_cast_to_fp4(
-            b_ref_src[group_id], use_ue8m0=True, gran_k=b_gran_k, use_packed_ue8m0=use_packed_b_sf
+            b_ref_src[group_id], use_ue8m0=True, gran_k=b_gran_k
         )
     if use_e8m0_b_sf:
         # b_sf_fp32 已是严格 pow2（per_token_cast_to_fp4 use_ue8m0=True）。
@@ -453,7 +422,7 @@ def _masked_skew_benchmark_case(
     b_sf_for_ref = b_sf_fp32 if (use_e8m0_b_sf or use_bf16_b_sf) else b_w4[1]
     for group_id, valid_m in enumerate(masked_m_values):
         b_dequant = cast_back_from_fp4(
-            b_w4[0][group_id], b_sf_for_ref[group_id], gran_k=b_gran_k, use_packed_ue8m0=use_packed_b_sf
+            b_w4[0][group_id], b_sf_for_ref[group_id], gran_k=b_gran_k
         )
         b_fp8_data[group_id], b_fp8_sf[group_id] = per_token_cast_to_fp8(
             b_dequant, use_ue8m0=False, gran_k=a_gran_k
@@ -908,13 +877,25 @@ def test_sm90_fp8_fp4_masked_skew_cases() -> None:
     # _print_skew_table(sorted(rows, key=lambda row: float(row["speedup"]))[:12])
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SM90 FP8xFP4 accuracy and benchmark cases")
+    parser.add_argument(
+        "--case",
+        choices=("masked", "masked-skew", "masked-direct-fp32-scale", "contiguous"),
+        default="masked",
+        help="Benchmark case to run",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
     start_time = time.time()
-    # if os.getenv("DG_W4_CONTIGUOUS_DIRECT_FP32_SCALE", "0") not in ("", "0"):
-    #     test_sm90_fp8_fp4_contiguous()
-    if os.getenv("DG_W4_MASKED_SKEW_CASES", "0") not in ("", "0"):
+    if args.case == "contiguous":
+        test_sm90_fp8_fp4_contiguous()
+    elif args.case == "masked-skew":
         test_sm90_fp8_fp4_masked_skew_cases()
-    elif os.getenv("DG_W4_MASKED_DIRECT_FP32_SCALE", "0") not in ("", "0"):
+    elif args.case == "masked-direct-fp32-scale":
         test_sm90_fp8_fp4_masked_direct_fp32_scale()
     else:
         test_sm90_fp8_fp4_masked()

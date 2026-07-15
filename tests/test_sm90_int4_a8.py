@@ -31,7 +31,7 @@ pass/fail 判定。
 
 from __future__ import annotations
 
-import os
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -303,26 +303,18 @@ def _build_int4_a8_skew_inputs(masked_m_values, max_m, n, k, *, gran_k=128):
 
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
     b_int4 = torch.empty((groups, n, k // 2), device="cuda", dtype=torch.int8)
-    # path-A bf16 sfb：与 fp8_fp4 测试同款，按 MN-major + tma_aligned_mn=align(N,8) 直构造。
-    # **默认开启**，DG_W4_SCALE_B_BF16=0 时回退 fp32。
-    use_bf16_b_sf = bool(int(os.getenv("DG_W4_SCALE_B_BF16", "1")))
-    if use_bf16_b_sf:
-        assert n % 8 == 0
-        tma_aligned_n = (n + 7) // 8 * 8
-        b_int4_sf = torch.empty_strided(
-            (groups, n, k // gran_k),
-            (tma_aligned_n * (k // gran_k), 1, tma_aligned_n),
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-        b_int4_sf_fp32 = torch.empty((groups, n, k // gran_k), device="cuda", dtype=torch.float)
-    else:
-        b_int4_sf = torch.empty((groups, n, k // gran_k), device="cuda", dtype=torch.float)
-        b_int4_sf_fp32 = b_int4_sf
+    assert n % 8 == 0
+    tma_aligned_n = (n + 7) // 8 * 8
+    b_int4_sf = torch.empty_strided(
+        (groups, n, k // gran_k),
+        (tma_aligned_n * (k // gran_k), 1, tma_aligned_n),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    b_int4_sf_fp32 = torch.empty((groups, n, k // gran_k), device="cuda", dtype=torch.float)
     for g in range(groups):
         b_int4[g], b_int4_sf_fp32[g] = per_token_cast_to_int4_sym(b_ref[g], gran_k=gran_k)
-    if use_bf16_b_sf:
-        b_int4_sf.copy_(b_int4_sf_fp32.to(torch.bfloat16))
+    b_int4_sf.copy_(b_int4_sf_fp32.to(torch.bfloat16))
 
     group_idx_a = torch.arange(k, device="cuda") // gran_k
     a_dequant = a_fp8.float() * a_sf[..., group_idx_a]
@@ -514,10 +506,22 @@ def test_int4_a8_masked_skew_cases() -> None:
         raise AssertionError(f"{fail_count} skew cases failed cos_abs > {COS_ABS_THRESHOLD}")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SM90 INT4-A8 masked accuracy and benchmark cases")
+    parser.add_argument(
+        "--case",
+        choices=("accuracy", "skew"),
+        default="accuracy",
+        help="Benchmark case to run",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
     start_time = time.time()
     _require_sm90()
-    if os.getenv("DG_W4_MASKED_SKEW_CASES", "0") not in ("", "0"):
+    if args.case == "skew":
         test_int4_a8_masked_skew_cases()
     else:
         test_int4_a8_masked_accuracy()
