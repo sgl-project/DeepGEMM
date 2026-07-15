@@ -13,7 +13,7 @@
 - 同时覆盖 contiguous / masked 两条常用调用路径
 
 用法：
-python /sgl-workspace/sglang/test_sm90_fp8_fp4_g128.py --repo-root /root/work/DeepGEMM
+python /sgl-workspace/DeepGEMM/tests/test_sm90_fp8_fp4_g128.py --repo-root /sgl-workspace/DeepGEMM
 
 """
 from __future__ import annotations
