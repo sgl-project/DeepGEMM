@@ -107,7 +107,7 @@ static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const to
     if (require_float) {
         DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat);
     } else {
-        // 放过 bf16 / E8M0 (UInt8) sfb（path-B fast-path，体积砍半 / 砍 4 倍）。
+        // Allow BF16/UInt8 E8M0 SFB for compressed scale paths.
         DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat or
                        sf.scalar_type() == torch::kInt or
                        sf.scalar_type() == torch::kBFloat16 or
@@ -130,8 +130,8 @@ static torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& sf) {
     if ((batched_sf.stride(0) == tma_aligned_mn * sf_k or dim == 2) and batched_sf.stride(1) == 1 and batched_sf.stride(2) == tma_aligned_mn)
         return (dim == 2) ? batched_sf.squeeze(0) : batched_sf;
 
-    // bf16 / E8M0 (UInt8) sfb 必须由调用方按 MN-major + tma_aligned_mn 直接构造，
-    // 不能落入下面的 fp32-only TransposeFP32Runtime。
+    // BF16/UInt8 E8M0 SFB must be pre-constructed with MN-major + TMA-aligned strides.
+    // They bypass the fp32-only transpose path above.
     DG_HOST_ASSERT(sf.scalar_type() != torch::kBFloat16 and sf.scalar_type() != torch::kUInt8);
 
     const auto out = torch::empty_strided({num_groups, mn, sf_k},
