@@ -541,10 +541,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const std::optional<int>& masked_m_max_hint = std::nullopt,
         // active_groups_hint: caller passes count of groups with masked_m > 0
         // (i.e. (masked_m != 0).sum()). Combined with masked_m_max_hint this
-        // is enough to estimate "工作量分布" and decide fast-path 是否合适：
-        //   * 单热点 / 极少活跃 group → fast-path (BM=32 BN=128) 大胜
-        //   * 大量活跃 group + 高 max_m → fan-out (BM 阶梯, BN=256) 取胜
-        // 不传时退化为旧行为（仅看 max_hint）。
+        // is enough to estimate workload distribution and decide fast-path suitability:
+        //   * Single-hot / few active groups → fast-path (BM=32 BN=128) dominates
+        //   * Many active groups + high max_m → fan-out (BM ladder, BN=256) wins
+        // Falls back to old behavior (max_hint only) when not provided.
         const std::optional<int>& active_groups_hint = std::nullopt) {
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     const int gran_k_a_requested = gran_k_a_override.value_or(gran_k);
@@ -633,24 +633,24 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         }
     }
     DG_HOST_ASSERT(found_layout);
-    // W4 masked 启发式：以 weight HBM 带宽为主要瓶颈，需要足够的 pipeline stages
-    // 来隐藏 TMA B 的延迟。在 expected_m 较小时（典型 MoE 场景），优先选择能让
-    // stages 数最深的 (BM, BN) 组合，并兼顾 wave 利用率。
+    // W4 masked heuristic: weight HBM bandwidth is the main bottleneck; sufficient pipeline
+    // stages are needed to hide TMA B latency. For small expected_m (typical MoE), prioritize
+    // (BM, BN) combinations that maximize stages, while also considering wave utilization.
     //
-    // 参数空间：BM ∈ {8, 16, 32, 64, 128}（BM<64 用于 masked small-M），
-    //          BN ∈ {64, 128, 256}。
+    // Parameter space: BM ∈ {8, 16, 32, 64, 128} (BM<64 for masked small-M),
+    //                  BN ∈ {64, 128, 256}.
     //
-    // 选择目标：在 (waves <= ceil_div(total_tiles, num_sms)) 的前提下最大化 stages，
-    //         其次最大化 last_wave 利用率，最后倾向更小的 per-stage（即更小 BN）。
+    // Selection criteria: maximize stages under (waves <= ceil_div(total_tiles, num_sms)),
+    //                    then maximize last_wave utilization, then prefer smaller per-stage (smaller BN).
     if (not block_m_override and not block_n_override) {
         const int num_sms = desc.num_sms;
         const int block_k = layout.block_k;
         const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
 
         auto eval_layout = [&](int bm, int bn) -> std::tuple<int, int, int, int> {
-            // 返回 (sat_stages, -waves, last_wave_util, -per_stage)，越大越好。
-            // stages 在 ~6 之上对 TMA 隐藏几乎饱和，因此用饱和 stage 数比较，避免
-            // 小 BN 因 stages=8 击败 wave 利用率更高的候选。
+            // Returns (sat_stages, -waves, last_wave_util, -per_stage); higher is better.
+            // Stages saturate TMA hiding around ~6, so use saturated stage count to avoid
+            // small BN with stages=8 defeating candidates with better wave utilization.
             const int tiles = ceil_div(expected_m, bm) * ceil_div(static_cast<int>(n), bn) * num_groups;
             const int waves = ceil_div(tiles, num_sms);
             const int last = tiles - (waves - 1) * num_sms;
@@ -692,10 +692,10 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         for (const auto& cand : w4_candidates) {
             const int bm = cand.first;
             const int bn = cand.second;
-            // 1D2D 内核 unroll 要求
+            // 1D2D kernel unroll requirements
             if (bn > block_k and (bn % (bn - block_k) != 0 and block_k % (bn - block_k) != 0))
                 continue;
-            // masked 路径 multicast 合法性：当前固定 cluster_m=1, cluster_n=1，恒满足
+            // Masked multicast validity: currently fixed cluster_m=1, cluster_n=1, always satisfied
             const auto score = eval_layout(bm, bn);
             if (std::get<0>(score) < 3)
                 continue;
@@ -754,7 +754,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                     layout.block_n = 256;
                 }
             } else {
-                // path-A：cooperative prefetch + sfb→smem，BM 阶梯有效。
+                // Path-A: cooperative prefetch + sfb→smem, BM ladder effective.
                 if (bm_select_m <= 8) layout.block_m = 8;
                 else if (bm_select_m <= 16) layout.block_m = 16;
                 else if (bm_select_m <= 32) layout.block_m = 32;
@@ -910,12 +910,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path);
     const bool k32_quad_split_promote = k32_quad_reduce;
-    // small_m_simple_sched：device 端 kUseSmallMSimpleSched 仅编译期检查
-    //   BLOCK_M<=16 + GroupedMasked + multicast=1，与 N/K 数值无关。
-    // 默认守护 (k>=4096 + n<=4096) 来自历史 g32 + n=4096 dsv4 形状的保守覆盖。
-    // 放开到 RELAX 形状集 (g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168})
-    // 让 DSV4 EP 业务真实 shape (g24 + n∈{6144,7168} + k∈{3072,7168} + expected_m=1/2/3)
-    // 也能命中 simple_sched，避开通用 masked scheduler 的额外开销。
+    // small_m_simple_sched: device-side kUseSmallMSimpleSched is compile-time only.
+    //   BLOCK_M<=16 + GroupedMasked + multicast=1, independent of N/K values.
+    // Default guard (k>=4096 + n<=4096) from historical g32 + n=4096 DSV4 shapes.
+    // Extended to RELAX shape set (g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168})
+    // to allow DSV4 EP real shapes (g24 + n∈{6144,7168} + k∈{3072,7168} + expected_m=1/2/3)
+    // to hit simple_sched and avoid generic masked scheduler overhead.
     const bool small_m_simple_sched =
         gran_k_b == 32 and expected_m <= 16 and
         ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
