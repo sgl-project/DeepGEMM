@@ -37,10 +37,9 @@ public:
         // INT4-sym (signed [-8, 7] packed two nibbles/byte) variant for B.
         // Path-A: per-128 fp32 SFB, no fused-decode. See kernel header.
         bool b_is_int4_sym;
-        // bf16 SFB（path-A k128 / path-B fast-path）：体积砍半，scale 用 __nv_bfloat16。
         bool scale_b_bf16;
-        // E8M0 SFB（path-B fast-path 专用）：每元素 1B = fp32 的 8 位指数。
-        // 解码 `__uint_as_float(uint32(e) << 23)` 零误差。仅 pow2 scale 适用。
+        // E8M0 SFB: 1B per element = fp32 exponent bits.
+        // Decoded via `__uint_as_float(uint32(e) << 23)`, zero-error for pow2 scales.
         bool scale_b_e8m0;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
