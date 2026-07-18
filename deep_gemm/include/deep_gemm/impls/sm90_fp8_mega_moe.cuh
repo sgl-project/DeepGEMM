@@ -55,14 +55,17 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_swiglu(float g, float u) {
     return sm90_fp8_mega_moe_silu<kFastMath>(g) * u;
 }
 
+// Continuous FP32 activation scale. SM90 WGMMA has no hardware block-scale operand (the SF
+// is a plain FFMA in the epilogue), so the previous UE8M0 (power-of-two) scale bought nothing
+// on SM90 and only cost precision; the SF pool is already fp32, so this is byte/layout neutral.
+// clamp amax before the reciprocal: padded rows have amax==0, and 448/0=inf -> 0*inf=NaN.
 __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     const float2& amax, float2& sf, float2& sf_inv) {
     constexpr float kScale = 1.0f / 448.0f;
-    const auto scaled = make_float2(__fmul_rn(amax.x, kScale), __fmul_rn(amax.y, kScale));
-    const auto exp_x = math::fast_log2_ceil(scaled.x);
-    const auto exp_y = math::fast_log2_ceil(scaled.y);
-    sf.x = math::fast_pow2(exp_x), sf_inv.x = math::fast_pow2(-exp_x);
-    sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
+    const auto ax = fmaxf(amax.x, 1e-10f);
+    const auto ay = fmaxf(amax.y, 1e-10f);
+    sf.x = __fmul_rn(ax, kScale), sf_inv.x = 1.0f / sf.x;
+    sf.y = __fmul_rn(ay, kScale), sf_inv.y = 1.0f / sf.y;
 }
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
