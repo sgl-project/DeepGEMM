@@ -37,7 +37,8 @@ if [ "${NUM_GPUS}" -eq 0 ]; then
   echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
   exit 1
 fi
-# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100/SM103).
+# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100/SM103),
+# 12 == Blackwell (SM120, e.g. RTX 5090).
 COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
 ARCH_MAJOR=${COMPUTE_CAP%%.*}
 
@@ -100,7 +101,7 @@ skip_test() {
 
 # test_legacy.py is intentionally excluded: the deep_gemm.legacy kernels are
 # deprecated and not exposed by the wheel.
-SINGLE_GPU_TESTS=(
+DEFAULT_SINGLE_GPU_TESTS=(
   test_bf16.py
   test_einsum.py
   test_fp8_fp4.py
@@ -108,6 +109,23 @@ SINGLE_GPU_TESTS=(
   test_layout.py
   test_attention.py
 )
+SM120_SINGLE_GPU_TESTS=(
+  test_bf16.py
+  test_einsum.py
+  test_fp8_fp4.py
+  test_attention.py
+)
+SM120_UNSUPPORTED_SINGLE_GPU_TESTS=(
+  test_hyperconnection.py
+  test_layout.py
+)
+
+if [ "${ARCH_MAJOR}" -eq 12 ]; then
+  SINGLE_GPU_TESTS=("${SM120_SINGLE_GPU_TESTS[@]}")
+else
+  SINGLE_GPU_TESTS=("${DEFAULT_SINGLE_GPU_TESTS[@]}")
+fi
+
 for t in "${SINGLE_GPU_TESTS[@]}"; do
   if [ -f "${TESTS_DIR}/${t}" ]; then
     run_test "${t}"
@@ -115,6 +133,12 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
     skip_test "${t}" "not present in this branch"
   fi
 done
+
+if [ "${ARCH_MAJOR}" -eq 12 ]; then
+  for t in "${SM120_UNSUPPORTED_SINGLE_GPU_TESTS[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
+  done
+fi
 
 # test_lazy_init.py is intentionally excluded: `import tvm_ffi` eagerly creates a
 # CUDA context, so `import deep_gemm` trips torch's bad-fork guard. Tracked
@@ -144,6 +168,10 @@ MEGA_MOE_ALL=(
 if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
   for t in "${MEGA_MOE_ALL[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
+  done
+elif [ "${ARCH_MAJOR}" -eq 12 ]; then
+  for t in "${MEGA_MOE_ALL[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
   done
 elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
