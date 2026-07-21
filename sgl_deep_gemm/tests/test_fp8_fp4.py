@@ -80,8 +80,8 @@ def test_m_grouped_gemm_contiguous() -> None:
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes()
 
-        # Select best alignment
-        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+        # Select best alignment for the per-group expected m (decode cases -> minimum alignment)
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(int(expected_m_per_group * 1.2))
         deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
 
         for test_alias in (False, True):
