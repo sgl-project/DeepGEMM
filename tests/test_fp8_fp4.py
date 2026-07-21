@@ -105,9 +105,7 @@ def test_m_grouped_gemm_contiguous() -> None:
                 if ensure_zero_padding:
                     check_fp8_fp4_psum_zero_padding(a, d, grouped_layout)
             else:
-                # M-padding rows of `d` are unspecified; compare valid rows only
-                valid = grouped_layout >= 0
-                diff = calc_diff(d[valid], ref_d[valid])
+                diff = calc_diff(d, ref_d)
                 assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'
         m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
                                                                           use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
