@@ -156,7 +156,8 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     quant_config_list = QuantConfig.get_list_from_dtype(dtype)
-    m_group_list = [(4, 8192), (8, 4096)]
+    # (128, 2): MoE decode regime — tiny per-expert m exercises the minimum alignment
+    m_group_list = [(4, 8192), (8, 4096), (128, 2)]
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
