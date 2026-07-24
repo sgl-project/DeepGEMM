@@ -51,7 +51,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {},
-        {}, {},
+        {}, {}, {},
         {}, {},
         {},
         {},
@@ -74,7 +74,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_non_epilogue_threads, args.gemm_config.launch_config.num_epilogue_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
-        args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
+        args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding, args.gemm_desc.batch_invariant,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.a_dtype), to_string(args.gemm_desc.b_dtype), to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type));
@@ -109,7 +109,8 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -192,7 +193,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .ensure_zero_padding = ensure_zero_padding,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
-        .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
+        .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -261,7 +263,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
+        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -342,7 +345,8 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         // NOTES: expected_k is not used in SM100 get_best_config yet.
-        .expected_m = m, .expected_n = n, .expected_k = expected_k, .expected_num_groups = num_groups
+        .expected_m = m, .expected_n = n, .expected_k = expected_k, .expected_num_groups = num_groups,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -408,7 +412,8 @@ static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 

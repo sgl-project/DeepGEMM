@@ -102,6 +102,7 @@ skip_test() {
 # test_legacy.py is intentionally excluded: the deep_gemm.legacy kernels are
 # deprecated and not exposed by the wheel.
 DEFAULT_SINGLE_GPU_TESTS=(
+  test_batch_invariant.py
   test_bf16.py
   test_einsum.py
   test_fp8_fp4.py

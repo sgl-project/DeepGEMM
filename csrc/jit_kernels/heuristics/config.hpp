@@ -34,6 +34,9 @@ struct GemmDesc {
 
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
+    // Keep the tensor-core reduction shape independent of batch dimensions.
+    // Currently enabled only for FP8 x FP8 GEMMs by their API entrypoints.
+    bool batch_invariant = false;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
     int get_expected_n() const { return expected_n > 0 ? expected_n : n; }
     int get_expected_k() const { return expected_k > 0 ? expected_k : k; }
@@ -74,7 +77,8 @@ struct GemmDesc {
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k
-           << ", expected_num_groups=" << desc.expected_num_groups << ")";
+           << ", expected_num_groups=" << desc.expected_num_groups
+           << ", batch_invariant=" << static_cast<int>(desc.batch_invariant) << ")";
         return os;
     }
 };

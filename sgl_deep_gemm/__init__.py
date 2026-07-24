@@ -118,6 +118,8 @@ set_tc_util = _C.set_tc_util
 get_tc_util = _C.get_tc_util
 set_pdl = _C.set_pdl
 get_pdl = _C.get_pdl
+set_batch_invariant = _C.set_batch_invariant
+get_batch_invariant = _C.get_batch_invariant
 
 # cuBLASLt Kernels
 def cublaslt_gemm_nt(a, b, d, c=None):
