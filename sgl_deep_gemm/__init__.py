@@ -414,6 +414,7 @@ class SM90SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.activation = activation
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
             group.size(), num_experts,
@@ -553,6 +554,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
+                     activation_alpha: Optional[float] = None,
+                     activation_linear_beta: Optional[float] = None,
                      fast_math: bool = True):
     if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
         return mega.fp8_fp4_mega_moe(
@@ -567,6 +570,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             fast_math,
         )
 
+    assert activation in ('swiglu', 'situ')
+    assert getattr(sym_buffer, 'activation', activation) == activation, (
+        f'symmetric buffer activation={getattr(sym_buffer, "activation", None)!r} '
+        f'does not match kernel activation={activation!r}'
+    )
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_fp4_mega_moe_sm90(
@@ -580,6 +588,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
+        activation_alpha, activation_linear_beta,
         fast_math
     )
 
