@@ -256,7 +256,8 @@ static void sm90_fp8_fp4_mega_moe(
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.block_m, l1_act_sf_gran_k,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        config.block_k / l1_act_sf_gran_k);
 
     // Packed FP4 weight tile: each byte = 2 nibbles. SM90 loads these as raw
     // bytes and software-decodes them before WGMMA, so the TensorMap must be a
@@ -313,7 +314,8 @@ static void sm90_fp8_fp4_mega_moe(
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.block_m, l2_act_sf_gran_k,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        config.block_k / l2_act_sf_gran_k);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
                                                         intermediate_hidden / 2, num_experts_per_rank * hidden,
                                                         config.block_k / 2, config.block_n,
