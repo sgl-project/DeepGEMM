@@ -236,6 +236,15 @@ static void sm90_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
     DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
 
+    // swapAB's data layout only covers the 128/64 activation-scale recipe, so
+    // gate on the granularity (SiTU qualifies since its 128/64 default) rather
+    // than on the activation type.
+    const bool swap_ab_eligible = l1_act_sf_gran_k == 128 and
+                                  l2_act_sf_gran_k == 64;
+    const bool effective_swap_ab = use_swap_ab and swap_ab_eligible;
+    const bool effective_swap_ab_fast_amax =
+        use_swap_ab_fast_amax and swap_ab_eligible;
+
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
         num_ranks, num_experts, num_experts_per_rank,
@@ -243,8 +252,7 @@ static void sm90_fp8_fp4_mega_moe(
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
         l1_act_sf_gran_k, l2_act_sf_gran_k, use_situ,
         use_early_b_decode, use_decode_done_mbarrier,
-        use_swap_ab and not use_situ,
-        use_swap_ab_fast_amax and not use_situ);
+        effective_swap_ab, effective_swap_ab_fast_amax);
 
     // Tensormap construction
     // Acts: FP8 e4m3, identical to FP8 path
@@ -349,8 +357,8 @@ static void sm90_fp8_fp4_mega_moe(
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_l2_arrival_counter = use_l2_arrival_counter,
         .use_ss_nsplit = use_ss_nsplit,
-        .use_swap_ab = use_swap_ab,
-        .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
+        .use_swap_ab = effective_swap_ab,
+        .use_swap_ab_fast_amax = effective_swap_ab_fast_amax,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

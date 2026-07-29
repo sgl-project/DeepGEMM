@@ -96,6 +96,13 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
     // the non-swap path for A/B accuracy comparison.
     const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
+    // Measured crossover on H20 for swiglu shapes: swapAB wins clearly at
+    // e<=12, ties at e~16 and loses beyond, so the default bound is 16 (FP8
+    // uses 30; the FP4 kernel pays extra decode work on the swapped path).
+    // DG_SM90_FP4_SWAP_AB_MAX_E overrides the bound for per-shape tuning
+    // (e.g. Kimi's tile-quantization tail band around e~73, doc 15.13).
+    const float swap_ab_max_e = static_cast<float>(
+        get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 16));
     return {
         /*math_wg_participates_in_decode=*/ false,
         /*num_math_wg_decode_warps=*/ 0,
@@ -105,11 +112,8 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
         /*l2_arrival_counter=*/ false,
         /*ss_nsplit=*/ prefill_band,
-        // Measured crossover on H20: swapAB wins clearly at e<=12, ties at
-        // e~16 and loses beyond, so the bound is 16 (FP8 uses 30; the FP4
-        // kernel pays extra decode work on the swapped path).
         /*swap_ab=*/ swap_ab_env_enabled and decode_band and
-                     expected_tokens_per_expert < 16.0f,
+                     expected_tokens_per_expert < swap_ab_max_e,
         /*swap_ab_fast_amax=*/ false
     };
 }
@@ -416,8 +420,8 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.decode_done_mbarrier,
                           fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
-                          fp4_defaults.swap_ab and not use_situ,
-                          fp4_defaults.swap_ab_fast_amax and not use_situ);
+                          fp4_defaults.swap_ab,
+                          fp4_defaults.swap_ab_fast_amax);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

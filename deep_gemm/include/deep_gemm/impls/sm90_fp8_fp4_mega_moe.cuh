@@ -1977,6 +1977,37 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
 
+            // Shared by the swapAB and regular L1 epilogues so both support
+            // SwiGLU (clamp + silu * up) and SiTU.
+            auto gated_activation = [](float gate, float up) -> float {
+                if constexpr (kUseSiTU) {
+                    const float sigmoid = kFastMath
+                        ? 0.5f * (1.0f + __tanhf(0.5f * gate))
+                        : 1.0f / (1.0f + expf(-gate));
+                    const float gate_tanh = kFastMath
+                        ? __tanhf(gate / kSiTUBeta)
+                        : tanhf(gate / kSiTUBeta);
+                    const float up_tanh = kFastMath
+                        ? __tanhf(up / kSiTULinearBeta)
+                        : tanhf(up / kSiTULinearBeta);
+                    const float capped_gate = kSiTUBeta * gate_tanh;
+                    const float capped_up = kSiTULinearBeta * up_tanh;
+                    return capped_gate * sigmoid * capped_up;
+                } else {
+                    if constexpr (kActivationClamp !=
+                                  cute::numeric_limits<float>::infinity()) {
+                        gate = cute::min(gate, kActivationClamp);
+                        up = cute::min(cute::max(up, -kActivationClamp),
+                                       kActivationClamp);
+                    }
+                    const float e = kFastMath ? __expf(-gate) : expf(-gate);
+                    const float sigmoid = kFastMath
+                        ? math::fast_rcp(1.0f + e)
+                        : 1.0f / (1.0f + e);
+                    return gate * sigmoid * up;
+                }
+            };
+
             if (block_phase == sched::BlockPhase::Linear1) {
                 if constexpr (kSwapABL1Active) {
                     // Each split-N WG writes its disjoint 32-column range into
@@ -1985,20 +2016,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // The fast-amax path keeps each thread's small token slice in
                     // registers, publishes per-token partial amax, and writes FP8
                     // directly after the cross-warp reduction.
-                    auto silu = [](float x) -> float {
-                        const float e = kFastMath ? __expf(-x) : expf(-x);
-                        const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
-                        return x * sig;
-                    };
-                    auto clamp_gate = [](float& x) {
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-                            x = cute::min(x, kActivationClamp);
-                    };
-                    auto clamp_up = [](float& x) {
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-                            x = cute::min(cute::max(x, -kActivationClamp), kActivationClamp);
-                    };
-
                     const uint32_t out_col_base =
                         wg_l1_out_n_offset + warp_idx_in_wg * 8 + row_idx;
                     float swap_v0[kSwapABTokenChunks] = {};
@@ -2011,36 +2028,32 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                         float v0 = 0.0f;
                         if (valid_token_0) {
-                            float g0 = final_accum[i * 4 + 0];
-                            float u0 = final_accum[i * 4 + 2];
-                            clamp_gate(g0);
-                            clamp_up(u0);
+                            const float act0 = gated_activation(
+                                final_accum[i * 4 + 0], final_accum[i * 4 + 2]);
                             const float weight_0 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_0)
                                 .get_base_ptr<float>();
                             if constexpr (kSwapABFastAmaxActive) {
-                                v0 = silu(g0) * u0 * weight_0;
+                                v0 = act0 * weight_0;
                                 swap_v0[i] = v0;
                             } else {
-                                v0 = silu(g0) * u0;
+                                v0 = act0;
                                 smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] = v0;
                             }
                         }
 
                         float v1 = 0.0f;
                         if (valid_token_1) {
-                            float g1 = final_accum[i * 4 + 1];
-                            float u1 = final_accum[i * 4 + 3];
-                            clamp_gate(g1);
-                            clamp_up(u1);
+                            const float act1 = gated_activation(
+                                final_accum[i * 4 + 1], final_accum[i * 4 + 3]);
                             const float weight_1 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_1)
                                 .get_base_ptr<float>();
                             if constexpr (kSwapABFastAmaxActive) {
-                                v1 = silu(g1) * u1 * weight_1;
+                                v1 = act1 * weight_1;
                                 swap_v1[i] = v1;
                             } else {
-                                v1 = silu(g1) * u1;
+                                v1 = act1;
                                 smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] = v1;
                             }
                         }
@@ -2199,35 +2212,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 float activated_r1[kNumPairs][2];
                 float amax_r0[kNumOutputSFPerWG] = {};
                 float amax_r1[kNumOutputSFPerWG] = {};
-
-                auto gated_activation = [](float gate, float up) -> float {
-                    if constexpr (kUseSiTU) {
-                        const float sigmoid = kFastMath
-                            ? 0.5f * (1.0f + __tanhf(0.5f * gate))
-                            : 1.0f / (1.0f + expf(-gate));
-                        const float gate_tanh = kFastMath
-                            ? __tanhf(gate / kSiTUBeta)
-                            : tanhf(gate / kSiTUBeta);
-                        const float up_tanh = kFastMath
-                            ? __tanhf(up / kSiTULinearBeta)
-                            : tanhf(up / kSiTULinearBeta);
-                        const float capped_gate = kSiTUBeta * gate_tanh;
-                        const float capped_up = kSiTULinearBeta * up_tanh;
-                        return capped_gate * sigmoid * capped_up;
-                    } else {
-                        if constexpr (kActivationClamp !=
-                                      cute::numeric_limits<float>::infinity()) {
-                            gate = cute::min(gate, kActivationClamp);
-                            up = cute::min(cute::max(up, -kActivationClamp),
-                                           kActivationClamp);
-                        }
-                        const float e = kFastMath ? __expf(-gate) : expf(-gate);
-                        const float sigmoid = kFastMath
-                            ? math::fast_rcp(1.0f + e)
-                            : 1.0f / (1.0f + e);
-                        return gate * sigmoid * up;
-                    }
-                };
 
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
