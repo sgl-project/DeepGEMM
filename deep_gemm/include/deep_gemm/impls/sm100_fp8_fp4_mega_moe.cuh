@@ -1328,33 +1328,52 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply activation: SwiGLU, or Kimi-K3 SiTU via sentinel
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
+                        // K3-SITU-PATCH: kActivationClamp == 0.03125f (2^-5 magic;
+                        // host asserts clamp >= 0 so negatives can't sentinel) selects SiTU:
+                        //   act = kSituBeta * tanh(gate/kSituBeta) * sigmoid(gate)
+                        //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
+                        // K3 config constants baked in (activation_situ_{beta,linear_beta}).
+                        constexpr bool kUseSitu = (kActivationClamp == 0.03125f);
+                        constexpr float kSituBeta = 4.0f;
+                        constexpr float kSituLinearBeta = 25.0f;
                         auto fp32_values = reinterpret_cast<float*>(values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
 
-                            // Clamp
-                            if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                            // Clamp (SwiGLU-with-limit only; SiTU soft-clips below)
+                            if constexpr (!kUseSitu && kActivationClamp != cute::numeric_limits<float>::infinity()) {
                                 bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                                 bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
+                            // sigmoid(gate)
                             auto gate = __bfloat1622float2(bf16_gate);
                             auto neg_gate_exp = make_float2(
                                 kFastMath ? __expf(-gate.x) : expf(-gate.x),
                                 kFastMath ? __expf(-gate.y) : expf(-gate.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                            float2 sig;
                             if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                sig = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
                             } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
+                                sig = {1.0f / denom.x, 1.0f / denom.y};
                             }
-                            const auto up = __bfloat1622float2(bf16_up);
+                            auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kUseSitu) {
+                                // K3-SITU-PATCH: tanh-bounded gate, soft-clipped up
+                                gate = {kSituBeta * tanhf(gate.x / kSituBeta) * sig.x,
+                                        kSituBeta * tanhf(gate.y / kSituBeta) * sig.y};
+                                up = {kSituLinearBeta * tanhf(up.x / kSituLinearBeta),
+                                      kSituLinearBeta * tanhf(up.y / kSituLinearBeta)};
+                            } else {
+                                // SwiGLU: silu(gate) * up
+                                gate = __fmul2_rn(gate, sig);
+                            }
                             activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
                         }
 
