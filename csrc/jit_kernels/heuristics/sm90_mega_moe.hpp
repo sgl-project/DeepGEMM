@@ -215,10 +215,34 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
 // materially better with the deeper BLOCK_M=64 decode pipeline throughout the
 // measured batch/rank range 1..8192 (e<=1171 for Kimi's 896 experts/top-k 16).
 // Keep its boundary independent so changing Kimi does not regress DSV4.
+// Activation-scale granularities (L1 input, L2 intermediate). SiTU defaults to
+// the legacy 128/64 recipe (decided 2026-07-29: the per-32 promotion loop costs
+// ~15% at large batch and cannot be pipelined on SM90, see doc sections
+// 15.7-15.11). DG_SM90_FP4_SITU_ACT_GRAN_128_64=0 switches back to the
+// official Kimi-K3 per-32 recipe for accuracy comparison.
+static std::pair<int, int> get_act_sf_grans_for_mega_moe_sm90_fp4(
+    const bool& use_situ) {
+    if (use_situ and get_env<int>("DG_SM90_FP4_SITU_ACT_GRAN_128_64", 1) == 0)
+        return {32, 32};
+    return {128, 64};
+}
+
 static float get_fp4_sm90_prefill_threshold(const bool& use_situ) {
+    // The high SiTU decode threshold only applies to the per-32 recipe, whose
+    // promotion drain gets amplified by the BLOCK_M=128 prefill bundle (docs
+    // 13/15.7). With the default 128/64 recipe the prefill bundle itself is
+    // healthy again, but Kimi's routing density (e = batch/7 for 896 experts,
+    // top-k 16) lands e=146/293 at batch 1024/2048 where a BLOCK_M=128 tile
+    // wastes 43%/24% of its rows; measured decode-config wins there are
+    // 20%/10%, while e=585 (batch 4096) already favors prefill. Hence the
+    // e=512 boundary, distinct from swiglu's e=80 (doc 15.12).
+    const bool situ_per32 = use_situ and
+        get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 32;
+    if (situ_per32)
+        return static_cast<float>(get_env<int>("DG_SM90_FP4_SITU_PREFILL_E", 2048));
     return static_cast<float>(
         use_situ
-            ? get_env<int>("DG_SM90_FP4_SITU_PREFILL_E", 2048)
+            ? get_env<int>("DG_SM90_FP4_SITU_PREFILL_E", 512)
             : get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
 }
 
@@ -358,7 +382,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     DG_HOST_ASSERT(128 % l1_act_sf_gran_k == 0);
     DG_HOST_ASSERT(128 % l2_act_sf_gran_k == 0);
     DG_HOST_ASSERT(not use_situ or
-                   (l1_act_sf_gran_k == 32 and l2_act_sf_gran_k == 32));
+                   (l1_act_sf_gran_k == 32 and l2_act_sf_gran_k == 32) or
+                   (l1_act_sf_gran_k == 128 and l2_act_sf_gran_k == 64));
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
         use_situ);

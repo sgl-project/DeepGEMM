@@ -40,6 +40,19 @@ GENERIC_FALLBACK = "generic"
 PREFILL_E = 80.0
 
 
+def act_sf_groups(activation: str) -> Tuple[int, int]:
+    """(input, intermediate) activation-scale group sizes.
+
+    Mirror of C++ ``get_act_sf_grans_for_mega_moe_sm90_fp4``: SiTU defaults
+    to the legacy 128/64 recipe; DG_SM90_FP4_SITU_ACT_GRAN_128_64=0 switches
+    back to the official Kimi-K3 per-32 recipe for accuracy comparison.
+    """
+    if activation == 'situ' and os.environ.get(
+            'DG_SM90_FP4_SITU_ACT_GRAN_128_64', '1') == '0':
+        return 32, 32
+    return 128, 64
+
+
 def table_wave(
     num_experts_per_rank: int,
     expected_tokens_per_expert: float,
@@ -689,8 +702,7 @@ def _reference_fused(
     combine_buf = torch.zeros(
         mg, num_topk, hidden, dtype=torch.float32, device='cuda')
 
-    input_sf_group = 32 if activation == 'situ' else 128
-    intermediate_sf_group = 32 if activation == 'situ' else 64
+    input_sf_group, intermediate_sf_group = act_sf_groups(activation)
     x_fp32 = _dequant_per_token_grouped(
         x_fp8_g, x_sf_g, input_sf_group)  # (Mg, H)
 
@@ -771,7 +783,7 @@ def _run_scenario(
     activation_alpha = float(cfg.get('activation_alpha', 4.0))
     activation_linear_beta = float(
         cfg.get('activation_linear_beta', 25.0))
-    input_sf_group = 32 if activation == 'situ' else 128
+    input_sf_group = act_sf_groups(activation)[0]
     fast_math = cfg.get('fast_math', True)
     input_pattern = cfg.get('input_pattern', 'random')
     routing_pattern = cfg.get('routing_pattern', 'random')
@@ -1144,7 +1156,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     activation = args.activation
     activation_alpha = args.activation_alpha
     activation_linear_beta = args.activation_linear_beta
-    fused_input_sf_group = 32 if activation == "situ" else 128
+    fused_input_sf_group = act_sf_groups(activation)[0]
     num_experts_per_rank = num_experts // num_ranks
     run_fp4_runtime_enabled = args.fp4_mode == "runtime"
     run_fp4_predecode_enabled = args.fp4_mode == "predecode"

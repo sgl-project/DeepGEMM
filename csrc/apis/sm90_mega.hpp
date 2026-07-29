@@ -124,8 +124,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     const bool use_situ = activation == "situ";
-    const int sm90_l1_act_sf_gran_k = use_situ ? 32 : 128;
-    const int sm90_l2_act_sf_gran_k = use_situ ? 32 : 64;
+    const auto [sm90_l1_act_sf_gran_k, sm90_l2_act_sf_gran_k] =
+        get_act_sf_grans_for_mega_moe_sm90_fp4(use_situ);
 
     const auto workspace = layout::SM90Workspace(
         nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
