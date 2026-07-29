@@ -2209,14 +2209,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 auto gated_activation = [](float gate, float up) -> float {
                     if constexpr (kUseSiTU) {
-                        const float e = kFastMath ? __expf(-gate) : expf(-gate);
                         const float sigmoid = kFastMath
-                            ? math::fast_rcp(1.0f + e)
-                            : 1.0f / (1.0f + e);
-                        const float capped_gate =
-                            kSiTUBeta * tanhf(gate / kSiTUBeta);
-                        const float capped_up =
-                            kSiTULinearBeta * tanhf(up / kSiTULinearBeta);
+                            ? 0.5f * (1.0f + __tanhf(0.5f * gate))
+                            : 1.0f / (1.0f + expf(-gate));
+                        const float gate_tanh = kFastMath
+                            ? __tanhf(gate / kSiTUBeta)
+                            : tanhf(gate / kSiTUBeta);
+                        const float up_tanh = kFastMath
+                            ? __tanhf(up / kSiTULinearBeta)
+                            : tanhf(up / kSiTULinearBeta);
+                        const float capped_gate = kSiTUBeta * gate_tanh;
+                        const float capped_up = kSiTULinearBeta * up_tanh;
                         return capped_gate * sigmoid * capped_up;
                     } else {
                         if constexpr (kActivationClamp !=
