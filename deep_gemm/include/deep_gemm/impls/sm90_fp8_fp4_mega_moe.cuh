@@ -418,8 +418,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      BLOCK_K % kL2ActsSFGranK == 0,
                      "Activation SF granularities must divide BLOCK_K");
     DG_STATIC_ASSERT(not kUseSiTU or
-                     (kL1ActsSFGranK == 32 and kL2ActsSFGranK == 32),
-                     "SiTU currently requires MXFP8 per-32 activation scales");
+                     (kL1ActsSFGranK == 32 and kL2ActsSFGranK == 32) or
+                     (kL1ActsSFGranK == 128 and kL2ActsSFGranK == 64),
+                     "SiTU requires the official per-32 activation scales or "
+                     "the experimental legacy 128/64 recipe");
     DG_STATIC_ASSERT(not kFP4SwapAB or
                      (kL1ActsSFGranK == 128 and kL2ActsSFGranK == 64),
                      "swapAB currently requires the legacy 128/64 activation scales");

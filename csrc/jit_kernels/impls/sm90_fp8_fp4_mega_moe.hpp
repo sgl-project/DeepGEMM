@@ -223,8 +223,8 @@ static void sm90_fp8_fp4_mega_moe(
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     const bool use_situ = activation == "situ";
-    const int l1_act_sf_gran_k = use_situ ? 32 : 128;
-    const int l2_act_sf_gran_k = use_situ ? 32 : 64;
+    const auto [l1_act_sf_gran_k, l2_act_sf_gran_k] =
+        get_act_sf_grans_for_mega_moe_sm90_fp4(use_situ);
     DG_HOST_ASSERT(not use_situ or
                    (activation_alpha > 0.0f and activation_linear_beta > 0.0f));
 
