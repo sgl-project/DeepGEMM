@@ -115,8 +115,11 @@ def _swiglu_apply_weight_to_fp8_kernel(
     stride_sfm,
     stride_sfk,  # y_sf: (M, H / BLOCK_K) stride
     clamp_value,  # Ignored when HAS_CLAMP=False
+    situ_beta,
+    situ_linear_beta,
     HAS_TOPK: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
+    USE_SITU: tl.constexpr,
     USE_UE8M0_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,  # = num_per_channels
@@ -138,13 +141,19 @@ def _swiglu_apply_weight_to_fp8_kernel(
     gate = tl.load(gate_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
     up = tl.load(up_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
 
-    # 2) Optional clamp: one-sided for gate, two-sided for up.
-    if HAS_CLAMP:
+    if USE_SITU:
+        gate_t = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+        up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+        y = (
+            situ_beta * gate_t * tl.sigmoid(gate)
+            * situ_linear_beta * up_t
+        )
+    elif HAS_CLAMP:
         gate = tl.minimum(gate, clamp_value)
         up = tl.minimum(tl.maximum(up, -clamp_value), clamp_value)
-
-    # 3) SwiGLU: silu(gate) * up = gate * sigmoid(gate) * up, accumulated in FP32.
-    y = gate * tl.sigmoid(gate) * up
+        y = gate * tl.sigmoid(gate) * up
+    else:
+        y = gate * tl.sigmoid(gate) * up
 
     # 4) Optional MoE weight scaling with a per-token scalar.
     if HAS_TOPK:
@@ -176,6 +185,9 @@ def swiglu_apply_weight_to_fp8_triton(
     clamp_value: float | None = None,
     num_per_channels: int = BASELINE_L2_ACT_SF_GRAN,
     use_ue8m0_scale: bool = True,
+    activation: str = "swiglu",
+    activation_alpha: float = 4.0,
+    activation_linear_beta: float = 25.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU + FP8 quantization. Semantically equivalent to:
     gate, up = x[:, :H], x[:, H:]
@@ -185,6 +197,7 @@ def swiglu_apply_weight_to_fp8_triton(
     y_fp8 = (y / y_sf.unsqueeze(-1)).to(fp8)
     """
     assert x.is_cuda and x.dtype == torch.bfloat16
+    assert activation in ("swiglu", "situ")
     assert x.is_contiguous(), "This implementation expects contiguous x"
     M, two_H = x.shape
     H = two_H // 2
@@ -214,8 +227,11 @@ def swiglu_apply_weight_to_fp8_triton(
         y_sf.stride(0),
         y_sf.stride(1),
         float(clamp_value) if clamp_value is not None else 0.0,
+        float(activation_alpha),
+        float(activation_linear_beta),
         HAS_TOPK=topk_weights is not None,
         HAS_CLAMP=clamp_value is not None,
+        USE_SITU=activation == "situ",
         USE_UE8M0_SCALE=use_ue8m0_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_K=num_per_channels,
@@ -812,7 +828,10 @@ def _swiglu_masked_post_quant_kernel(
     masked_m_ptr,
     H,
     clamp_value,
+    situ_beta,
+    situ_linear_beta,
     HAS_CLAMP: tl.constexpr,
+    USE_SITU: tl.constexpr,
     USE_UE8M0_SCALE: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_STAGES: tl.constexpr,
@@ -835,11 +854,19 @@ def _swiglu_masked_post_quant_kernel(
         gate = tl.load(x_base + token * stride_x_m).to(tl.float32)
         up = tl.load(x_base + token * stride_x_m + H * stride_x_n).to(tl.float32)
 
-        if HAS_CLAMP:
+        if USE_SITU:
+            gate_t = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+            up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+            y = (
+                situ_beta * gate_t * tl.sigmoid(gate)
+                * situ_linear_beta * up_t
+            )
+        elif HAS_CLAMP:
             gate = tl.minimum(gate, clamp_value)
             up = tl.minimum(tl.maximum(up, -clamp_value), clamp_value)
-
-        y = gate * tl.sigmoid(gate) * up
+            y = gate * tl.sigmoid(gate) * up
+        else:
+            y = gate * tl.sigmoid(gate) * up
 
         amax = tl.max(tl.abs(y))
         sf = tl.maximum(amax / _FP8_E4M3_MAX_TL, 1.0e-30)
@@ -858,6 +885,9 @@ def swiglu_masked_post_quant_to_fp8(
     quant_group_size: int = BASELINE_L2_ACT_SF_GRAN,
     clamp_value: float | None = None,
     use_ue8m0_scale: bool = False,
+    activation: str = "swiglu",
+    activation_alpha: float = 4.0,
+    activation_linear_beta: float = 25.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU + per-(token, BLOCK_K) FP8 quant on masked-layout input.
 
@@ -872,6 +902,7 @@ def swiglu_masked_post_quant_to_fp8(
     ``low_latency_combine``, so this kernel does NOT multiply by topk weights.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16
+    assert activation in ("swiglu", "situ")
     assert x.is_contiguous(), "Expects contiguous masked-layout input"
     assert x.dim() == 3 and x.shape[-1] % 2 == 0
     E, M, two_H = x.shape
@@ -906,7 +937,10 @@ def swiglu_masked_post_quant_to_fp8(
         masked_m,
         H,
         float(clamp_value) if clamp_value is not None else 0.0,
+        float(activation_alpha),
+        float(activation_linear_beta),
         HAS_CLAMP=clamp_value is not None,
+        USE_SITU=activation == "situ",
         USE_UE8M0_SCALE=use_ue8m0_scale,
         BLOCK_K=BLOCK_K,
         NUM_STAGES=4,

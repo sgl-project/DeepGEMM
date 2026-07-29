@@ -350,6 +350,11 @@ template <
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
+    uint32_t kL1ActsSFGranK,
+    uint32_t kL2ActsSFGranK,
+    bool kUseSiTU,
+    float kSiTUBeta,
+    float kSiTULinearBeta,
     float kActivationClamp,
     bool kFastMath,
     bool kUseWideLoadDecode        = false,  // Read one K-group's packed FP4 words as uint4
@@ -405,6 +410,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
     DG_STATIC_ASSERT(BLOCK_N % 8 == 0, "BLOCK_N must be compatible with SM90 FP8 WGMMA shapes");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
+    DG_STATIC_ASSERT(kL1ActsSFGranK == 32 or kL1ActsSFGranK == 128,
+                     "L1 activation SF must be per-32 or per-128");
+    DG_STATIC_ASSERT(kL2ActsSFGranK == 32 or kL2ActsSFGranK == 64,
+                     "L2 activation SF must be per-32 or per-64");
+    DG_STATIC_ASSERT(BLOCK_K % kL1ActsSFGranK == 0 and
+                     BLOCK_K % kL2ActsSFGranK == 0,
+                     "Activation SF granularities must divide BLOCK_K");
+    DG_STATIC_ASSERT(not kUseSiTU or
+                     (kL1ActsSFGranK == 32 and kL2ActsSFGranK == 32),
+                     "SiTU currently requires MXFP8 per-32 activation scales");
+    DG_STATIC_ASSERT(not kFP4SwapAB or
+                     (kL1ActsSFGranK == 128 and kL2ActsSFGranK == 64),
+                     "swapAB currently requires the legacy 128/64 activation scales");
     DG_STATIC_ASSERT(kNumMathWGDecodeWarps <= kNumEpilogueWarps,
                      "Math decode warps cannot exceed epilogue warps");
     DG_STATIC_ASSERT(kMathWGParticipatesInFP4Decode or kNumMathWGDecodeWarps == 0,
@@ -440,10 +458,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr auto fp8_token_layout              = SM90FP8FP4MegaMoEData(kHidden);
     constexpr auto bf16_token_layout             = SM90FP8FP4MegaMoEData(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = SM90FP8FP4MegaMoEData(kIntermediateHidden);
-    // Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100 packing)
-    constexpr auto fp8_sf_layout                 = SM90FP8FP4MegaMoEData(kHidden / 32);
-    // L2 activation SF is per-64 for BLOCK_N=128 and per-32 for BLOCK_N=64.
-    constexpr uint32_t kL2ActsSFGranK = BLOCK_N == 64 ? 32 : 64;
+    constexpr auto fp8_sf_layout =
+        SM90FP8FP4MegaMoEData(kHidden * sizeof(float) / kL1ActsSFGranK);
     constexpr auto fp8_intermediate_sf_layout =
         SM90FP8FP4MegaMoEData(kIntermediateHidden * sizeof(float) / kL2ActsSFGranK);
     constexpr auto input_topk_idx_layout         = SM90FP8FP4MegaMoEData(kNumTopk * sizeof(int64_t), false);
@@ -531,8 +547,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // In the split-N=2, BLOCK_N=128 path each WG produces only
     // WG_L1_OUT_BLOCK_N post-SwiGLU columns. WG0 issues one combined 64-column
     // TMA store after both WGs reduce amax, matching the 64-column SF block.
-    constexpr bool kSplitNCombinesL1Store = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
     constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
+    constexpr bool kSplitNCombinesL1Store = kSplitNSharesSF;
     DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
                      "share-SF only meaningful under split-N");
     DG_STATIC_ASSERT(not kSplitNSharesSF or (kWarpgroupSplitN == 2),
@@ -546,7 +562,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwizzleBMode        = BLOCK_K * sizeof(b_dtype_t);  // 128
     constexpr uint32_t kSwizzleBPackedMode  = 0;
     constexpr uint32_t kSwizzleCDMode  = 128;
-    constexpr uint32_t kGranK          = 128;          // L1 acts SF base granularity
+    constexpr uint32_t kNumL1SFAPerBlockK = BLOCK_K / kL1ActsSFGranK;
     constexpr uint32_t kNumL2SFAPerBlockK = BLOCK_K / kL2ActsSFGranK;
     // SFB granularity for FP4 weights: per-32 K (DSV4 standard, UE8M0).
     // BLOCK_K=128 has 4 SFB groups along K, exactly one per WGMMA::K tile.
@@ -571,10 +587,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // Packed FP4 source tile (TMA-loaded raw nibbles)
     constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
-    // SFA per-stage must be sized for the larger of L1 (BLOCK_M floats) and
-    // L2 (2*BLOCK_M floats per-64, or 4*BLOCK_M floats per-32 with BLOCK_N=64).
+    // SFA per-stage must be sized for the larger of L1 and L2.
+    constexpr uint32_t kNumSFAPerBlockK =
+        kNumL1SFAPerBlockK > kNumL2SFAPerBlockK
+            ? kNumL1SFAPerBlockK
+            : kNumL2SFAPerBlockK;
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
-        math::constexpr_align<uint32_t>(kNumL2SFAPerBlockK * BLOCK_M * sizeof(float), 128u);
+        math::constexpr_align<uint32_t>(
+            kNumSFAPerBlockK * BLOCK_M * sizeof(float), 128u);
     // SFB UE8M0 per-32: the decode-to-SMEM path stages one packed uint32 per
     // N row per BLOCK_K in SMEM. Each word contains the 4 K/32 scale bytes, so
     // dequant avoids reloading the same word once per K group.
@@ -1056,9 +1076,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
-            constexpr uint32_t kNumSFFloats = kHidden / 128;
-            DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
+            // Copy FP32 activation SF, written linearly (no UTCCP transpose).
+            constexpr uint32_t kNumSFFloats =
+                kHidden / kL1ActsSFGranK;
+            DG_STATIC_ASSERT(
+                kNumSFFloats > 0 and kHidden % kL1ActsSFGranK == 0,
+                "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
                 input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                 current_rank_in_expert_idx);
@@ -1198,12 +1221,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                     // TMA load SFA
                     if (block_phase == sched::BlockPhase::Linear1) {
-                        // L1 SFA per-128: load (BLOCK_M, 1) at K=k_block_idx
-                        tma::copy<BLOCK_M, 1, 0, float>(
-                            tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            m_idx, k_block_idx, 1);
+                        #pragma unroll
+                        for (uint32_t sf_group = 0;
+                             sf_group < kNumL1SFAPerBlockK; ++ sf_group) {
+                            tma::copy<BLOCK_M, 1, 0, float>(
+                                tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                smem_sfa[stage_idx] + sf_group * BLOCK_M,
+                                m_idx,
+                                k_block_idx * kNumL1SFAPerBlockK + sf_group,
+                                1);
+                        }
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
+                            SMEM_A_SIZE_PER_STAGE +
+                            kNumL1SFAPerBlockK * BLOCK_M * sizeof(float));
                     } else {
                         // L2 SFA descriptor box is (block_mn, 1).  Default
                         // BLOCK_N=128 loads two per-64 groups; BLOCK_N=64
@@ -1475,7 +1505,44 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
 
                 if (block_phase == sched::BlockPhase::Linear1) {
-                    if constexpr (kSwapABL1Active) {
+                    if constexpr (kL1ActsSFGranK == 32) {
+                        float accum[kAccumPerThread];
+                        #pragma unroll
+                        for (uint32_t sf_group = 0;
+                             sf_group < kNumL1SFAPerBlockK; ++ sf_group) {
+                            const float scale_a_0 = ptx::ld_shared(
+                                smem_sfa[stage_idx] +
+                                sf_group * BLOCK_M + wg_m_offset + r_0);
+                            const float scale_a_1 = ptx::ld_shared(
+                                smem_sfa[stage_idx] +
+                                sf_group * BLOCK_M + wg_m_offset + r_1);
+                            const uint32_t k_off = sf_group * WGMMA::K;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(accum[i]);
+                            ptx::warpgroup_arrive();
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset + k_off, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset + k_off, 1);
+                            WGMMA::wgmma(desc_a, desc_b, accum, false);
+                            ptx::warpgroup_commit_batch();
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(accum[i]);
+                            ptx::warpgroup_wait<0>();
+
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                                final_accum[i*4+0] += scale_a_0 * accum[i*4+0];
+                                final_accum[i*4+1] += scale_a_0 * accum[i*4+1];
+                                final_accum[i*4+2] += scale_a_1 * accum[i*4+2];
+                                final_accum[i*4+3] += scale_a_1 * accum[i*4+3];
+                            }
+                        }
+                        if (lane_idx == 0)
+                            empty_barriers[stage_idx]->arrive();
+                    } else if constexpr (kSwapABL1Active) {
                         // L1 swapAB: WGMMA-M is the 64-row weight slice owned by
                         // this split-N WG; WGMMA-N is the valid token count,
                         // bucketed to Hopper's 8-column granularity.
@@ -2127,82 +2194,95 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // For each pair we produce 4 post-SwiGLU floats per thread, mapped to
                 // output cols (p*8 + col_idx*2 + {0,1}) for both r0 and r1.
 
-                constexpr uint32_t kNumPairs = kAccumPerThread / 8;  // 8 for BLOCK_N=128
-                float swiglu_r0[kNumPairs][2];
-                float swiglu_r1[kNumPairs][2];
+                constexpr uint32_t kNumPairs = kAccumPerThread / 8;
+                constexpr uint32_t kNumOutputSFPerWG =
+                    kSplitNSharesSF ? 1 : WG_L1_OUT_BLOCK_N / kL2ActsSFGranK;
+                DG_STATIC_ASSERT(kSplitNSharesSF or
+                                 WG_L1_OUT_BLOCK_N % kL2ActsSFGranK == 0,
+                                 "Each WG output must contain whole SF groups");
+                DG_STATIC_ASSERT(kNumOutputSFPerWG >= 1,
+                                 "Each WG must produce at least one output SF");
+                float activated_r0[kNumPairs][2];
+                float activated_r1[kNumPairs][2];
+                float amax_r0[kNumOutputSFPerWG] = {};
+                float amax_r1[kNumOutputSFPerWG] = {};
 
-                // Per-row amax across all 8 pairs
-                float amax_r0 = 0.0f, amax_r1 = 0.0f;
+                auto gated_activation = [](float gate, float up) -> float {
+                    if constexpr (kUseSiTU) {
+                        const float e = kFastMath ? __expf(-gate) : expf(-gate);
+                        const float sigmoid = kFastMath
+                            ? math::fast_rcp(1.0f + e)
+                            : 1.0f / (1.0f + e);
+                        const float capped_gate =
+                            kSiTUBeta * tanhf(gate / kSiTUBeta);
+                        const float capped_up =
+                            kSiTULinearBeta * tanhf(up / kSiTULinearBeta);
+                        return capped_gate * sigmoid * capped_up;
+                    } else {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity()) {
+                            gate = cute::min(gate, kActivationClamp);
+                            up = cute::min(cute::max(up, -kActivationClamp),
+                                           kActivationClamp);
+                        }
+                        const float e = kFastMath ? __expf(-gate) : expf(-gate);
+                        const float sigmoid = kFastMath
+                            ? math::fast_rcp(1.0f + e)
+                            : 1.0f / (1.0f + e);
+                        return gate * sigmoid * up;
+                    }
+                };
 
-                // Compute SwiGLU + per-pair amax
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     const uint32_t gate = 2 * p, up = 2 * p + 1;
-
-                    // Apply optional clamp on gate / up before SwiGLU
-                    // Match SM100 reference: gate is clamped only on the upper
-                    // side (very-negative gate is fine because SiLU(-inf) -> 0),
-                    // while up is clamped both sides.
-                    auto clamp_gate = [](float& x) {
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-                            x = cute::min(x, kActivationClamp);
-                    };
-                    auto clamp_up = [](float& x) {
-                        if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-                            x = cute::min(cute::max(x, -kActivationClamp), kActivationClamp);
-                    };
-                    float g_r0_c0 = final_accum[gate*4 + 0]; clamp_gate(g_r0_c0);
-                    float g_r0_c1 = final_accum[gate*4 + 1]; clamp_gate(g_r0_c1);
-                    float g_r1_c0 = final_accum[gate*4 + 2]; clamp_gate(g_r1_c0);
-                    float g_r1_c1 = final_accum[gate*4 + 3]; clamp_gate(g_r1_c1);
-                    float u_r0_c0 = final_accum[up*4   + 0]; clamp_up(u_r0_c0);
-                    float u_r0_c1 = final_accum[up*4   + 1]; clamp_up(u_r0_c1);
-                    float u_r1_c0 = final_accum[up*4   + 2]; clamp_up(u_r1_c0);
-                    float u_r1_c1 = final_accum[up*4   + 3]; clamp_up(u_r1_c1);
-
-                    // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
-                    auto silu = [](float x) -> float {
-                        const float e = kFastMath ? __expf(-x) : expf(-x);
-                        const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
-                        return x * sig;
-                    };
+                    const uint32_t sf_group = kSplitNSharesSF
+                        ? 0 : (p * 8) / kL2ActsSFGranK;
 
                     if (valid_r0) {
-                        swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                        swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
-                        amax_r0 = cute::max(amax_r0, cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
+                        activated_r0[p][0] = gated_activation(
+                            final_accum[gate*4 + 0], final_accum[up*4 + 0]);
+                        activated_r0[p][1] = gated_activation(
+                            final_accum[gate*4 + 1], final_accum[up*4 + 1]);
+                        amax_r0[sf_group] = cute::max(
+                            amax_r0[sf_group],
+                            cute::max(cute::abs(activated_r0[p][0]),
+                                      cute::abs(activated_r0[p][1])));
                     } else {
-                        swiglu_r0[p][0] = 0.0f;
-                        swiglu_r0[p][1] = 0.0f;
+                        activated_r0[p][0] = 0.0f;
+                        activated_r0[p][1] = 0.0f;
                     }
                     if (valid_r1) {
-                        swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                        swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
-                        amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
+                        activated_r1[p][0] = gated_activation(
+                            final_accum[gate*4 + 2], final_accum[up*4 + 2]);
+                        activated_r1[p][1] = gated_activation(
+                            final_accum[gate*4 + 3], final_accum[up*4 + 3]);
+                        amax_r1[sf_group] = cute::max(
+                            amax_r1[sf_group],
+                            cute::max(cute::abs(activated_r1[p][0]),
+                                      cute::abs(activated_r1[p][1])));
                     } else {
-                        swiglu_r1[p][0] = 0.0f;
-                        swiglu_r1[p][1] = 0.0f;
+                        activated_r1[p][0] = 0.0f;
+                        activated_r1[p][1] = 0.0f;
                     }
                 }
 
-                // Fold topk weight into the row amax and final quantization scale.
                 float weight_r0 = valid_r0 ? *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r0)
                     .get_base_ptr<float>() : 0.0f;
                 float weight_r1 = valid_r1 ? *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r1)
                     .get_base_ptr<float>() : 0.0f;
-                amax_r0 *= cute::abs(weight_r0);
-                amax_r1 *= cute::abs(weight_r1);
-
-                // Reduce amax across the 4 col-lanes that share the same row.
-                // In WGMMA m64n128k32 output, the 4 lanes (`lane_idx & 3` differs,
-                // `lane_idx >> 2` same) hold all N positions for the same r_0/r_1,
-                // so we need an INTRA-group reduction (`xor 1, xor 2`), which is
-                // `warp_reduce<4, false>`. Using `<4, true>` would instead merge
-                // amax across 8 different rows -- giving wrong per-row SF.
-                amax_r0 = math::warp_reduce<4, false>(amax_r0, math::ReduceMax<float>());
-                amax_r1 = math::warp_reduce<4, false>(amax_r1, math::ReduceMax<float>());
+                #pragma unroll
+                for (uint32_t sf_group = 0;
+                     sf_group < kNumOutputSFPerWG; ++ sf_group) {
+                    amax_r0[sf_group] *= cute::abs(weight_r0);
+                    amax_r1[sf_group] *= cute::abs(weight_r1);
+                    amax_r0[sf_group] = math::warp_reduce<4, false>(
+                        amax_r0[sf_group], math::ReduceMax<float>());
+                    amax_r1[sf_group] = math::warp_reduce<4, false>(
+                        amax_r1[sf_group], math::ReduceMax<float>());
+                }
 
                 // Shared-SF split-N reduction: both N-half WGs publish their
                 // per-row amax, synchronize once, then read both values and
@@ -2212,9 +2292,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
                         const uint32_t slot = row_slot * 4 + epilogue_wg_n_idx * 2;
                         ptx::st_shared(smem_amax_scratch + slot + 0,
-                                       __float_as_uint(amax_r0));
+                                       __float_as_uint(amax_r0[0]));
                         ptx::st_shared(smem_amax_scratch + slot + 1,
-                                       __float_as_uint(amax_r1));
+                                       __float_as_uint(amax_r1[0]));
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     // Both WGs read the merged amax.
@@ -2229,29 +2309,36 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ptx::ld_shared(smem_amax_scratch + slot + 2));
                         const float wg1_r1 = __uint_as_float(
                             ptx::ld_shared(smem_amax_scratch + slot + 3));
-                        amax_r0 = cute::max(wg0_r0, wg1_r0);
-                        amax_r1 = cute::max(wg0_r1, wg1_r1);
+                        amax_r0[0] = cute::max(wg0_r0, wg1_r0);
+                        amax_r1[0] = cute::max(wg0_r1, wg1_r1);
                     }
                     // Broadcast the merged col_idx==0 amax across the row's
                     // four column lanes; this is no longer a reduction after
                     // both split-N WGs have published their row max.
                     const int row_group_leader = static_cast<int>(lane_idx - col_idx);
-                    amax_r0 = __shfl_sync(0xffffffff, amax_r0, row_group_leader);
-                    amax_r1 = __shfl_sync(0xffffffff, amax_r1, row_group_leader);
+                    amax_r0[0] = __shfl_sync(
+                        0xffffffff, amax_r0[0], row_group_leader);
+                    amax_r1[0] = __shfl_sync(
+                        0xffffffff, amax_r1[0], row_group_leader);
                 }
 
-                // Compute SF and inverse SF for each row
-                float sf_r0, sf_inv_r0;
-                float sf_r1, sf_inv_r1;
-                {
-                    float2 amax_pair = {amax_r0, amax_r1};
+                float sf_r0[kNumOutputSFPerWG];
+                float sf_inv_r0[kNumOutputSFPerWG];
+                float sf_r1[kNumOutputSFPerWG];
+                float sf_inv_r1[kNumOutputSFPerWG];
+                #pragma unroll
+                for (uint32_t sf_group = 0;
+                     sf_group < kNumOutputSFPerWG; ++ sf_group) {
+                    float2 amax_pair = {
+                        amax_r0[sf_group], amax_r1[sf_group]};
                     float2 sf_pair, sf_inv_pair;
-                    sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
-                    sf_r0 = sf_pair.x; sf_inv_r0 = sf_inv_pair.x;
-                    sf_r1 = sf_pair.y; sf_inv_r1 = sf_inv_pair.y;
+                    sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(
+                        amax_pair, sf_pair, sf_inv_pair);
+                    sf_r0[sf_group] = sf_pair.x;
+                    sf_inv_r0[sf_group] = sf_inv_pair.x;
+                    sf_r1[sf_group] = sf_pair.y;
+                    sf_inv_r1[sf_group] = sf_inv_pair.y;
                 }
-                const float weighted_sf_inv_r0 = weight_r0 * sf_inv_r0;
-                const float weighted_sf_inv_r1 = weight_r1 * sf_inv_r1;
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
                 // The L1-output TMA store descriptor is built with swizzle_mode = 0
@@ -2265,10 +2352,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 auto* smem_cd_l1_wg = smem_cd_l1 + smem_cd_l1_wg_offset;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
-                    const float v00 = swiglu_r0[p][0] * weighted_sf_inv_r0;
-                    const float v01 = swiglu_r0[p][1] * weighted_sf_inv_r0;
-                    const float v10 = swiglu_r1[p][0] * weighted_sf_inv_r1;
-                    const float v11 = swiglu_r1[p][1] * weighted_sf_inv_r1;
+                    const uint32_t sf_group = kSplitNSharesSF
+                        ? 0 : (p * 8) / kL2ActsSFGranK;
+                    const float weighted_sf_inv_r0 =
+                        weight_r0 * sf_inv_r0[sf_group];
+                    const float weighted_sf_inv_r1 =
+                        weight_r1 * sf_inv_r1[sf_group];
+                    const float v00 =
+                        activated_r0[p][0] * weighted_sf_inv_r0;
+                    const float v01 =
+                        activated_r0[p][1] * weighted_sf_inv_r0;
+                    const float v10 =
+                        activated_r1[p][0] * weighted_sf_inv_r1;
+                    const float v11 =
+                        activated_r1[p][1] * weighted_sf_inv_r1;
 
                     const __nv_fp8x2_e4m3 r0_pair(make_float2(v00, v01));
                     const __nv_fp8x2_e4m3 r1_pair(make_float2(v10, v11));
@@ -2291,18 +2388,26 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     (not kSplitNSharesSF or epilogue_wg_n_idx == 0);
                 if (sf_writer) {
                     auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                    // SF buffer is (kNumPaddedSFPoolTokens x kIntermediateHidden/64), MN-major:
-                    //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
                     const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
                     const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
-                    // Shared-SF spans both split-N WGs; otherwise each WG owns
-                    // a distinct local SF N block.
-                    const uint32_t sf_n_block_idx_local = n_block_idx * kWarpgroupSplitN + epilogue_wg_n_idx;
-                    const uint32_t k_sf_idx = kSplitNSharesSF ? n_block_idx : sf_n_block_idx_local;
-                    if (valid_r0)
-                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;
-                    if (valid_r1)
-                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
+                    const uint32_t output_n_start =
+                        n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_offset;
+                    const uint32_t first_k_sf_idx =
+                        output_n_start / kL2ActsSFGranK;
+                    #pragma unroll
+                    for (uint32_t sf_group = 0;
+                         sf_group < kNumOutputSFPerWG; ++ sf_group) {
+                        const uint32_t k_sf_idx =
+                            first_k_sf_idx + sf_group;
+                        if (valid_r0)
+                            sf_base_ptr[
+                                k_sf_idx * kNumPaddedSFPoolTokens + token_r0] =
+                                sf_r0[sf_group];
+                        if (valid_r1)
+                            sf_base_ptr[
+                                k_sf_idx * kNumPaddedSFPoolTokens + token_r1] =
+                                sf_r1[sf_group];
+                    }
                 }
 
                 // Combined split-N store needs an epilogue-wide sync so WG0 can

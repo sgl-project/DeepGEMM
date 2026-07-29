@@ -484,13 +484,13 @@ def _randn_quantize_grouped_fp8_block_128_128(
     return w_fp8, w_sf
 
 
-def _dequant_per_token_per_128_k(
-    x_fp8: torch.Tensor, sf: torch.Tensor
+def _dequant_per_token_grouped(
+    x_fp8: torch.Tensor, sf: torch.Tensor, group_size: int
 ) -> torch.Tensor:
-    """For (M, K) fp8 with (M, K // 128) float SF (per-token, K-major)."""
+    """Dequantize row-major FP8 with FP32 scales along K."""
     m, k = x_fp8.shape
-    assert k % 128 == 0
-    x_view = x_fp8.float().view(m, k // 128, 128)
+    assert k % group_size == 0
+    x_view = x_fp8.float().view(m, k // group_size, group_size)
     return (x_view * sf.unsqueeze(-1)).view(m, k)
 
 
@@ -630,6 +630,16 @@ def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
     return torch.nn.functional.silu(gate) * up
 
 
+def _situ_fp32(
+    gate_up: torch.Tensor, beta: float, linear_beta: float
+) -> torch.Tensor:
+    half = gate_up.size(-1) // 2
+    gate, up = gate_up[..., :half], gate_up[..., half:]
+    gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    up = linear_beta * torch.tanh(up / linear_beta)
+    return gate * up
+
+
 def _reference_fused(
     x_fp8_local: torch.Tensor, x_sf_local: torch.Tensor,
     topk_idx_local: torch.Tensor, topk_weights_local: torch.Tensor,
@@ -639,6 +649,9 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    activation: str = 'swiglu',
+    activation_alpha: float = 4.0,
+    activation_linear_beta: float = 25.0,
     reference_chunk: int = 0,
 ) -> torch.Tensor:
     """FP32 reference for the SM90 FP4 mega-MoE kernel.
@@ -676,7 +689,10 @@ def _reference_fused(
     combine_buf = torch.zeros(
         mg, num_topk, hidden, dtype=torch.float32, device='cuda')
 
-    x_fp32 = _dequant_per_token_per_128_k(x_fp8_g, x_sf_g)  # (Mg, H)
+    input_sf_group = 32 if activation == 'situ' else 128
+    intermediate_sf_group = 32 if activation == 'situ' else 64
+    x_fp32 = _dequant_per_token_grouped(
+        x_fp8_g, x_sf_g, input_sf_group)  # (Mg, H)
 
     # Token-chunked dequant to bound peak memory of the per-token gather.
     _CHUNK = int(reference_chunk) if reference_chunk else int(os.getenv('DSV4_FP4_REFERENCE_CHUNK', '64'))
@@ -702,11 +718,17 @@ def _reference_fused(
             l1_y = torch.einsum('sk,snk->sn', x_sel, l1_w_sel)
             del l1_w_sel
 
-            l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)
+            if activation == 'situ':
+                l1_y = _situ_fp32(
+                    l1_y, activation_alpha, activation_linear_beta)
+            else:
+                l1_y = _swiglu_fp32(l1_y, activation_clamp)
+            l1_y = l1_y * weights.unsqueeze(-1)
 
             s_, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s_, ih // 64, 64)
+            assert ih == intermediate_hidden and ih % intermediate_sf_group == 0
+            l1_view = l1_y.view(
+                s_, ih // intermediate_sf_group, intermediate_sf_group)
             amax = l1_view.abs().amax(dim=-1).clamp(1e-4)
             sf2 = amax / 448.0
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
@@ -745,6 +767,11 @@ def _run_scenario(
     num_topk = cfg['num_topk']
     masked_ratio = cfg.get('masked_ratio', 0.0)
     activation_clamp = cfg.get('activation_clamp', 10.0)
+    activation = cfg.get('activation', 'swiglu')
+    activation_alpha = float(cfg.get('activation_alpha', 4.0))
+    activation_linear_beta = float(
+        cfg.get('activation_linear_beta', 25.0))
+    input_sf_group = 32 if activation == 'situ' else 128
     fast_math = cfg.get('fast_math', True)
     input_pattern = cfg.get('input_pattern', 'random')
     routing_pattern = cfg.get('routing_pattern', 'random')
@@ -797,9 +824,10 @@ def _run_scenario(
         topk_idx.masked_fill_(rand_mask < masked_ratio, -1)
         topk_w.masked_fill_(topk_idx < 0, 0)
 
-    # FP8 activations with per-128 K float SF (SM90 format) — same as SM90 FP8 path.
+    assert activation in ('swiglu', 'situ')
     x_fp8, x_sf = per_token_cast_to_fp8(
-        x_bf, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+        x_bf, use_ue8m0=False, gran_k=input_sf_group,
+        use_packed_ue8m0=False)
 
     if cfg.get('checkpoint_model_path'):
         l1_w_fp4, l1_w_sf, l2_w_fp4, l2_w_sf = _load_dsv4_checkpoint_layer_weights(
@@ -833,6 +861,7 @@ def _run_scenario(
         group, num_experts,
         num_max, num_topk,
         hidden, intermediate_hidden,
+        activation=activation,
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
@@ -849,8 +878,10 @@ def _run_scenario(
             y_fused, transformed_l1, transformed_l2, buffer,
             cumulative_local_expert_recv_stats=cum_stats,
             recipe=(1, 1, 32),
-            activation='swiglu',
+            activation=activation,
             activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
             fast_math=fast_math,
         )
         torch.cuda.synchronize()
@@ -864,6 +895,9 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        activation=activation,
+        activation_alpha=activation_alpha,
+        activation_linear_beta=activation_linear_beta,
         reference_chunk=reference_chunk,
     )
 
@@ -1049,6 +1083,40 @@ def _layer9_swapab_small_batch(num_ranks: int) -> List[Tuple[str, Dict[str, Any]
     ]
 
 
+def _layer10_kimi_k3(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    common = dict(
+        activation='situ',
+        activation_alpha=4.0,
+        activation_linear_beta=25.0,
+        activation_clamp=math.inf,
+        hidden=3584,
+        intermediate_hidden=3072,
+        num_topk=16,
+        routing_pattern='round_robin',
+        reference_chunk=4,
+    )
+    return [
+        ('L10.kimi_k3_smoke', dict(
+            common,
+            num_max_tokens_per_rank=8,
+            num_tokens=8,
+            num_experts=8 * num_ranks,
+        )),
+        ('L10.kimi_k3_prefill_2wg', dict(
+            common,
+            num_max_tokens_per_rank=64,
+            num_tokens=40,
+            num_experts=8 * num_ranks,
+        )),
+        ('L10.kimi_k3_shape', dict(
+            common,
+            num_max_tokens_per_rank=8,
+            num_tokens=8,
+            num_experts=896,
+        )),
+    ]
+
+
 # ----------------------------------------------------------------------------
 # Benchmark mode
 # ----------------------------------------------------------------------------
@@ -1073,6 +1141,10 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     intermediate_hidden = args.intermediate_hidden
     num_experts = args.num_experts
     num_topk = args.num_topk
+    activation = args.activation
+    activation_alpha = args.activation_alpha
+    activation_linear_beta = args.activation_linear_beta
+    fused_input_sf_group = 32 if activation == "situ" else 128
     num_experts_per_rank = num_experts // num_ranks
     run_fp4_runtime_enabled = args.fp4_mode == "runtime"
     run_fp4_predecode_enabled = args.fp4_mode == "predecode"
@@ -1080,9 +1152,29 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     run_fp8_normal_baseline_enabled = (
         args.run_normal_baseline and not args.ncu_profile_only
     )
+    deep_ep_ll_topk_supported = num_topk <= args.deep_ep_ll_max_topk
     run_fp8_ll_baseline_enabled = (
-        not args.skip_fp8_ll_baseline and not args.ncu_profile_only
+        not args.skip_fp8_ll_baseline
+        and not args.ncu_profile_only
+        and deep_ep_ll_topk_supported
     )
+    if (
+        not args.skip_fp8_ll_baseline
+        and not args.ncu_profile_only
+        and not deep_ep_ll_topk_supported
+    ):
+        dist_print(
+            f"[SKIP] DeepEP low-latency baseline: num_topk={num_topk} exceeds "
+            f"this build's limit {args.deep_ep_ll_max_topk}; "
+            "DeepEP normal remains available.",
+            once_in_node=True,
+        )
+    if run_fp4_predecode_enabled and not deep_ep_ll_topk_supported:
+        raise RuntimeError(
+            "--fp4-mode predecode uses the DeepEP low-latency pipeline, but "
+            f"num_topk={num_topk} exceeds its limit "
+            f"{args.deep_ep_ll_max_topk}"
+        )
     run_low_latency_path_enabled = (
         run_fp8_ll_baseline_enabled or run_fp4_predecode_enabled
     )
@@ -1124,6 +1216,15 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     x_fp8, x_sf = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
     )
+    if fused_input_sf_group == 128:
+        x_fp8_fused, x_sf_fused = x_fp8, x_sf
+    else:
+        x_fp8_fused, x_sf_fused = per_token_cast_to_fp8(
+            x_bf16,
+            use_ue8m0=False,
+            gran_k=fused_input_sf_group,
+            use_packed_ue8m0=False,
+        )
 
     l1_fp4 = None
     l2_fp4 = None
@@ -1183,13 +1284,14 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             num_topk,
             hidden,
             intermediate_hidden,
+            activation=activation,
         )
         y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
     def fp4_prepare_inputs():
         assert sym_buffer is not None
-        sym_buffer.x[:num_tokens].copy_(x_fp8)
-        sym_buffer.x_sf[:num_tokens].copy_(x_sf)
+        sym_buffer.x[:num_tokens].copy_(x_fp8_fused)
+        sym_buffer.x_sf[:num_tokens].copy_(x_sf_fused)
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
@@ -1203,8 +1305,10 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             sym_buffer,
             cumulative_local_expert_recv_stats=cum_stats,
             recipe=(1, 1, 32),
-            activation="swiglu",
+            activation=activation,
             activation_clamp=clamp_arg,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
             fast_math=bool(args.fast_math),
         )
         return y_fused
@@ -1293,6 +1397,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             clamp_value=clamp_arg,
             num_per_channels=BASELINE_L2_ACT_SF_GRAN,
             use_ue8m0_scale=True,
+            activation=activation,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
         )
 
     def fp8_normal_l2_gemm():
@@ -1386,6 +1493,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             quant_group_size=BASELINE_L2_ACT_SF_GRAN,
             clamp_value=clamp_arg,
             use_ue8m0_scale=False,
+            activation=activation,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
         )
         state["l1_act"] = (l1_act_fp8, l1_act_sf)
 
@@ -1457,12 +1567,15 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         assert fused_out is not None, "--bench-check-reference requires an FP4 mode"
         assert l1_fp4 is not None and l2_fp4 is not None
         y_ref = _reference_fused(
-            x_fp8, x_sf, topk_idx, topk_weights,
+            x_fp8_fused, x_sf_fused, topk_idx, topk_weights,
             l1_fp4[0], l1_fp4[1], l2_fp4[0], l2_fp4[1],
             rank_idx, num_ranks, group,
             num_experts, num_topk,
             hidden, intermediate_hidden,
             args.activation_clamp,
+            activation=activation,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
         )
         diff = calc_diff(fused_out, y_ref)
         ok = diff < args.diff_tol
@@ -1475,6 +1588,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
                         "intermediate_hidden": intermediate_hidden,
                         "num_experts": num_experts,
                         "num_topk": num_topk,
+                        "activation": activation,
                         "diff": round(float(diff), 6),
                         "diff_tol": args.diff_tol,
                         "ok": bool(ok),
@@ -1676,6 +1790,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             "intermediate_hidden": intermediate_hidden,
             "num_experts": num_experts,
             "num_topk": num_topk,
+            "activation": activation,
             "recv_tokens_total": int(metrics[:, 3].sum().item()),
             "active_experts_max": int(metrics[:, 4].max().item()),
             "fp4_megamoe_us_max": None if fused_us_max is None else round(fused_us_max, 3),
@@ -1691,6 +1806,14 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             ),
             "speedup_vs_fp8_normal_max": speedup_vs_fp8_normal_max,
             "fp8_ll_baseline_enabled": run_fp8_ll_baseline_enabled,
+            "fp8_ll_skip_reason": (
+                None
+                if deep_ep_ll_topk_supported
+                else (
+                    f"num_topk={num_topk} exceeds DeepEP low-latency "
+                    f"limit {args.deep_ep_ll_max_topk}"
+                )
+            ),
             "fp8_ll_baseline_us_max": None if ll_us_max is None else round(ll_us_max, 3),
             "fp8_ll_baseline_us_mean": None if ll_us_mean is None else round(ll_us_mean, 3),
             "speedup_vs_fp8_ll_max": speedup_vs_fp8_ll_max,
@@ -1749,6 +1872,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         layers += _layer8_pro_smoke(num_ranks)
     if 9 in args.layers or args.swapab_smoke:
         layers += _layer9_swapab_small_batch(num_ranks)
+    if 10 in args.layers:
+        layers += _layer10_kimi_k3(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -1791,9 +1916,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--local-rank-idx', type=int, default=None)
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 3, 4],
-                        help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8, 9). '
+                        help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8, 9, 10). '
                              'Default: 1 3 4. Layer 8 is the Pro smoke shape; '
-                             'layer 9 is the Flash/Pro swapAB small-batch guard.')
+                             'layer 9 is the Flash/Pro swapAB small-batch guard; '
+                             'layer 10 is Kimi-K3 SiTU/MXFP8 group-32.')
     parser.add_argument('--pro-smoke', action='store_true',
                         help='Also run DeepSeek-V4-Pro smoke scenarios')
     parser.add_argument('--swapab-smoke', action='store_true',
@@ -1815,6 +1941,13 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=256)
     parser.add_argument('--num-topk', type=int, default=6)
     parser.add_argument('--activation-clamp', type=float, default=10.0)
+    parser.add_argument(
+        '--activation',
+        choices=('swiglu', 'situ'),
+        default='swiglu',
+    )
+    parser.add_argument('--activation-alpha', type=float, default=4.0)
+    parser.add_argument('--activation-linear-beta', type=float, default=25.0)
     parser.add_argument('--fast-math', type=int, default=1)
     parser.add_argument('--weight-scale', type=float, default=0.05)
     parser.add_argument(
@@ -1831,6 +1964,12 @@ if __name__ == '__main__':
                         help='Emit PROFILE_JSON with CUDA-event stage timings')
     parser.add_argument('--skip-fp8-ll-baseline', action='store_true',
                         help='Only measure the FP4 fused path')
+    parser.add_argument(
+        '--deep-ep-ll-max-topk',
+        type=int,
+        default=11,
+        help='Top-k limit of the installed DeepEP low-latency build (default: 11)',
+    )
     parser.add_argument('--run-normal-baseline', action='store_true',
                         help='Also measure the normal DeepEP dispatch/combine FP8 baseline')
     parser.add_argument('--profile-warmup', type=int, default=3)

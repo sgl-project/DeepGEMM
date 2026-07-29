@@ -45,6 +45,11 @@ public:
         int hidden, intermediate_hidden;
         int num_experts, num_topk;
         int num_ranks;
+        int l1_act_sf_gran_k;
+        int l2_act_sf_gran_k;
+        bool use_situ;
+        float situ_beta;
+        float situ_linear_beta;
         float activation_clamp;
         bool fast_math;
         // Read the four packed FP4 words for one K/32 group with a
@@ -121,6 +126,9 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {}, {},
+        {}, {},
+        {},
+        {}, {},
         {},
         {},
         {},
@@ -146,6 +154,9 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
+    args.l1_act_sf_gran_k, args.l2_act_sf_gran_k,
+    args.use_situ ? "true" : "false",
+    to_string(args.situ_beta), to_string(args.situ_linear_beta),
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.use_wide_load_decode ? "true" : "false",
@@ -191,6 +202,9 @@ static void sm90_fp8_fp4_mega_moe(
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
+    const std::string& activation,
+    const float& activation_alpha,
+    const float& activation_linear_beta,
     const float& activation_clamp,
     const bool& fast_math,
     const bool& math_wg_participates_in_fp4_decode = true,
@@ -207,6 +221,12 @@ static void sm90_fp8_fp4_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    const bool use_situ = activation == "situ";
+    const int l1_act_sf_gran_k = use_situ ? 32 : 128;
+    const int l2_act_sf_gran_k = use_situ ? 32 : 64;
+    DG_HOST_ASSERT(not use_situ or
+                   (activation_alpha > 0.0f and activation_linear_beta > 0.0f));
 
     // Sanity: SFB tensors must be uint32 (UE8M0 packed) and weight tensors
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
@@ -221,13 +241,12 @@ static void sm90_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        l1_act_sf_gran_k, l2_act_sf_gran_k, use_situ,
         use_early_b_decode, use_decode_done_mbarrier,
-        use_swap_ab, use_swap_ab_fast_amax);
+        use_swap_ab and not use_situ,
+        use_swap_ab_fast_amax and not use_situ);
 
     // Tensormap construction
-    constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
-    const int kL2ActsSFGranK = config.block_n == 64 ? 32 : 64;
-
     // Acts: FP8 e4m3, identical to FP8 path
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_max_pool_tokens,
@@ -236,7 +255,7 @@ static void sm90_fp8_fp4_mega_moe(
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
-                                                        config.block_m, kGranK,
+                                                        config.block_m, l1_act_sf_gran_k,
                                                         1, 0);
 
     // Packed FP4 weight tile: each byte = 2 nibbles. SM90 loads these as raw
@@ -276,7 +295,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int l1_output_box_m = wg_block_m;
     // Split-N with 32 post-SwiGLU cols per WG uses one combined 64-col TMA
     // store from WG0, matching the 64-col L2 activation-scale group.
-    const bool split_n_combines_l1_store = split_n_warpgroups and wg_l1_out_block_n < 64;
+    const bool split_n_combines_l1_store =
+        split_n_warpgroups and wg_l1_out_block_n < l2_act_sf_gran_k;
     const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
     const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
@@ -292,7 +312,7 @@ static void sm90_fp8_fp4_mega_moe(
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
-                                                        config.block_m, kL2ActsSFGranK,
+                                                        config.block_m, l2_act_sf_gran_k,
                                                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
                                                         intermediate_hidden / 2, num_experts_per_rank * hidden,
@@ -312,6 +332,11 @@ static void sm90_fp8_fp4_mega_moe(
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
+        .l1_act_sf_gran_k = l1_act_sf_gran_k,
+        .l2_act_sf_gran_k = l2_act_sf_gran_k,
+        .use_situ = use_situ,
+        .situ_beta = activation_alpha,
+        .situ_linear_beta = activation_linear_beta,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_wide_load_decode = use_wide_load_decode,
