@@ -248,18 +248,21 @@ static float get_fp4_sm90_prefill_threshold(const bool& use_situ) {
 
 // Whether `e` should run the prefill bundle (BLOCK_M=128 + early_b_decode +
 // ss_nsplit). Besides the monotonic threshold above, the SiTU 128/64 recipe
-// has a non-monotonic mid band: for e in (80, 112] a BLOCK_M=128 tile pads M
+// has a non-monotonic mid band: for e in (76, 112] a BLOCK_M=128 tile pads M
 // no worse than two BLOCK_M=64 tiles while halving per-expert B decodes --
-// measured +4.1%/+2.5% at batch 640/768 (e=91/110). Near e~128 the routing
-// spread makes single 128-tiles overflow into a second one, so BLOCK_M=64
-// wins big again (batch 896 decode is 15% faster); doc 15.14.
+// measured +2.6%/+3.7%/+4.7%/+4.1%/+2.5% at batch 544/576/608/640/768
+// (e=78..110). Below the band, routing spread leaves a measurable share of
+// experts with <=64 tokens whose single 64-tile beats a constant 128-row
+// tile (batch 512 decode wins 0.8%; crossover sits at e~75-77). Near e~128
+// the spread instead makes single 128-tiles overflow into a second one, so
+// BLOCK_M=64 wins big again (batch 896 decode is 15% faster); doc 15.14.
 static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
                                      const bool& use_situ) {
     const bool situ_12864 = use_situ and
         get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128;
     if (situ_12864) {
         const auto lo = static_cast<float>(
-            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_LO", 80));
+            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_LO", 76));
         const auto hi = static_cast<float>(
             get_env<int>("DG_SM90_FP4_SITU_MIDBAND_HI", 112));
         if (expected_tokens_per_expert > lo and
