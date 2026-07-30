@@ -448,8 +448,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
 
     // No FP4 stage cap (FP8 parity): always use as many pipeline stages as
     // SMEM allows. The historical 11-rule cap table is retired.
-    const int num_stages = (smem_capacity - smem_fixed) /
-                           (smem_per_stage + smem_barriers_per_stage);
+    // DG_SM90_FP4_STAGE_CAP is an experimental override for pipeline-depth
+    // sensitivity probing (doc 15.17).
+    int num_stages = (smem_capacity - smem_fixed) /
+                     (smem_per_stage + smem_barriers_per_stage);
+    if (const int cap = get_env<int>("DG_SM90_FP4_STAGE_CAP", 0); cap > 0)
+        num_stages = std::min(num_stages, cap);
     DG_HOST_ASSERT(num_stages >= 2);
     return {num_stages,
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};

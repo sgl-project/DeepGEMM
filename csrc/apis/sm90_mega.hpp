@@ -112,12 +112,25 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
            FP4SM90ConfigKind::kSwapAB)
         : (swap_ab_env_enabled and decode_band and
            expected_tokens_per_expert < swap_ab_max_e);
+    // Experimental: let the math warpgroups help the FP4 B-decode. At small
+    // batch every tile decodes a full B tile for very few valid rows, WGMMA
+    // is nearly free, and the math WGs otherwise idle-wait on the 8 assist
+    // warps (tile cost measures ~15-29us vs a ~5us floor, doc 15.17).
+    const bool math_wg_decode =
+        get_env<int>("DG_SM90_FP4_MATH_WG_DECODE", 0) != 0;
+    // Experimental override: early B-decode (decode starts on TMA arrival via
+    // its own barrier instead of the math-warp-driven chain) is only part of
+    // the prefill bundle historically; small-batch tiles are bound by the
+    // per-K-stage TMA->decode->WGMMA loop latency (doc 15.17), which early
+    // decode shortens.
+    const bool early_b_decode =
+        get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", prefill_band ? 1 : 0) != 0;
     return {
-        /*math_wg_participates_in_decode=*/ false,
-        /*num_math_wg_decode_warps=*/ 0,
+        /*math_wg_participates_in_decode=*/ math_wg_decode,
+        /*num_math_wg_decode_warps=*/ math_wg_decode ? 4 : 0,
         /*first_decode_assist_warp=*/ 2,
         /*wide_load_decode=*/ decode_band,
-        /*early_b_decode=*/ prefill_band,
+        /*early_b_decode=*/ early_b_decode,
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
         /*l2_arrival_counter=*/ false,
         /*ss_nsplit=*/ prefill_band,
