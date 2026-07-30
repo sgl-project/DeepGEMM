@@ -1658,6 +1658,27 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             fp4_profile_total,
             *[fp4_profile[name] for name, _ in fp4_sections],
         ]
+        if run_fp8_normal_baseline_enabled:
+            fp8_normal_sections = [
+                ("fp8_normal_dispatch", fp8_normal_dispatch),
+                ("fp8_normal_l1_gemm", fp8_normal_l1_gemm),
+                ("fp8_normal_swiglu_quant", fp8_normal_swiglu_quant),
+                ("fp8_normal_l2_gemm", fp8_normal_l2_gemm),
+                ("fp8_normal_combine", fp8_normal_combine),
+            ]
+            dist.barrier()
+            fp8n_profile, fp8n_profile_total = _bench_cuda_event_sections(
+                fp8_normal_sections,
+                num_warmup=args.profile_warmup,
+                num_repeat=args.profile_repeat,
+                l2_flush_gb=args.profile_l2_flush_gb,
+                barrier=dist.barrier,
+            )
+            profile_names += ["fp8_normal_total", *[name for name, _ in fp8_normal_sections]]
+            profile_values += [
+                fp8n_profile_total,
+                *[fp8n_profile[name] for name, _ in fp8_normal_sections],
+            ]
         if run_fp8_ll_baseline_enabled:
             fp8_ll_sections = [
                 ("fp8_ll_dispatch", fp8_ll_dispatch),

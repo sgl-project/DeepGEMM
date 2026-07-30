@@ -125,11 +125,15 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // decode shortens.
     const bool early_b_decode =
         get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", prefill_band ? 1 : 0) != 0;
+    // Experimental: wide-load decode is historically a decode-band feature;
+    // probe it for the prefill band too (doc 15.23).
+    const bool wide_load =
+        get_env<int>("DG_SM90_FP4_WIDE_LOAD_DECODE", decode_band ? 1 : 0) != 0;
     return {
         /*math_wg_participates_in_decode=*/ math_wg_decode,
         /*num_math_wg_decode_warps=*/ math_wg_decode ? 4 : 0,
         /*first_decode_assist_warp=*/ 2,
-        /*wide_load_decode=*/ decode_band,
+        /*wide_load_decode=*/ wide_load,
         /*early_b_decode=*/ early_b_decode,
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
         /*l2_arrival_counter=*/ false,
