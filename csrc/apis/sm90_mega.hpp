@@ -99,12 +99,19 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // the non-swap path for A/B accuracy comparison.
     const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
     // Measured crossover on H20: swapAB wins at e=18.3 (+3.1% on Kimi
-    // 128/64) and loses from e~23 on (-6..-18%), so the default bound is 20
+    // 128/64) and loses from e~23 on (-6..-18%), so the fallback bound is 20
     // (FP8 uses 30; the FP4 kernel pays extra decode work on the swapped
     // path, and larger e also lands wider WGMMA-N buckets). The original
     // swiglu tuning had 16; doc 15.15. DG_SM90_FP4_SWAP_AB_MAX_E overrides.
+    // With the SiTU 128/64 cost model active, the swapAB decision comes from
+    // the same argmin as the prefill band so all three kinds stay coherent.
     const float swap_ab_max_e = static_cast<float>(
         get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 20));
+    const bool swap_ab = use_fp4_sm90_situ_cost_model(use_situ)
+        ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
+           FP4SM90ConfigKind::kSwapAB)
+        : (swap_ab_env_enabled and decode_band and
+           expected_tokens_per_expert < swap_ab_max_e);
     return {
         /*math_wg_participates_in_decode=*/ false,
         /*num_math_wg_decode_warps=*/ 0,
@@ -114,8 +121,7 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
         /*l2_arrival_counter=*/ false,
         /*ss_nsplit=*/ prefill_band,
-        /*swap_ab=*/ swap_ab_env_enabled and decode_band and
-                     expected_tokens_per_expert < swap_ab_max_e,
+        /*swap_ab=*/ swap_ab,
         /*swap_ab_fast_amax=*/ false
     };
 }

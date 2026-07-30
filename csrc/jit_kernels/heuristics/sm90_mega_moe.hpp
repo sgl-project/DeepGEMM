@@ -246,18 +246,81 @@ static float get_fp4_sm90_prefill_threshold(const bool& use_situ) {
             : get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
 }
 
+// ---- Analytic config cost model (SiTU 128/64 recipe) ----
+// Replaces the hand-tuned swapAB/decode/prefill boundaries with a per-expert
+// expected-cost comparison. Fitted 2026-07-30 on 21 same-shape A/B
+// measurements (docs 15.12-15.15); all 21 classify correctly, and the
+// model's two out-of-sample predictions (prefill wins inside the former
+// decode band at e=220/350) were confirmed at +3.8%/+2.8% (doc 15.16).
+// With X ~ Poisson(e) tokens per expert (uniform-routing approximation),
+// in units of one regular-mainloop BLOCK_M row:
+//   R(M) = E[ceil(X/M)]*M                    expected processed rows
+//   T(M) = E[ceil(X/M)]                      per-expert B-decode passes
+//   cost_decode  = R(64) + kBDecodeRows*T(64)
+//   cost_prefill = (1-kPrefillRowGain)*R(128) + kBDecodeRows*T(128)
+//   cost_swap    = kSwapRowCost*R(8) + kSwapExpertRows*P(X>0)
+// The row/decode ratio is shape-independent to first order (both scale with
+// N*K), so the constants transfer across expert shapes; refit via
+// scratchpad fit_cost_model.py if the architecture changes.
+static float fp4_expected_num_tiles(const float& e, const int& m) {
+    // E[ceil(X/m)] via a normal approximation with continuity correction;
+    // matches the offline fitting script exactly.
+    const float sigma = std::sqrt(e);
+    float total = 0.0f;
+    for (int k = 0; ; ++ k) {
+        const float z = (static_cast<float>(k * m) + 0.5f - e) / sigma;
+        const float p = 0.5f * std::erfc(z * 0.70710678f);
+        total += p;
+        if (p < 1e-5f and static_cast<float>(k * m) > e)
+            break;
+    }
+    return total;
+}
+
+enum class FP4SM90ConfigKind { kSwapAB, kDecode, kPrefill };
+
+static FP4SM90ConfigKind get_fp4_sm90_situ_config_kind(
+    const float& expected_tokens_per_expert) {
+    constexpr float kBDecodeRows    = 6.29f;
+    constexpr float kPrefillRowGain = 0.0030f;
+    constexpr float kSwapRowCost    = 1.335f;
+    constexpr float kSwapExpertRows = 40.6f;
+    const float e = expected_tokens_per_expert;
+    if (e <= 0.0f)
+        return FP4SM90ConfigKind::kDecode;
+    const float t64  = fp4_expected_num_tiles(e, 64);
+    const float t128 = fp4_expected_num_tiles(e, 128);
+    const float t8   = fp4_expected_num_tiles(e, 8);
+    const float p_active = 1.0f - std::exp(-e);
+    const float cost_decode  = t64 * 64.0f + kBDecodeRows * t64;
+    const float cost_prefill = (1.0f - kPrefillRowGain) * t128 * 128.0f +
+                               kBDecodeRows * t128;
+    const float cost_swap = kSwapRowCost * t8 * 8.0f +
+                            kSwapExpertRows * p_active;
+    const bool swap_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
+    if (swap_enabled and cost_swap <= cost_decode and cost_swap <= cost_prefill)
+        return FP4SM90ConfigKind::kSwapAB;
+    return cost_prefill < cost_decode ? FP4SM90ConfigKind::kPrefill
+                                      : FP4SM90ConfigKind::kDecode;
+}
+
+static bool use_fp4_sm90_situ_cost_model(const bool& use_situ) {
+    return use_situ and
+           get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128 and
+           get_env<int>("DG_SM90_FP4_COST_MODEL", 1) != 0;
+}
+
 // Whether `e` should run the prefill bundle (BLOCK_M=128 + early_b_decode +
-// ss_nsplit). Besides the monotonic threshold above, the SiTU 128/64 recipe
-// has a non-monotonic mid band: for e in (76, 112] a BLOCK_M=128 tile pads M
-// no worse than two BLOCK_M=64 tiles while halving per-expert B decodes --
-// measured +2.6%/+3.7%/+4.7%/+4.1%/+2.5% at batch 544/576/608/640/768
-// (e=78..110). Below the band, routing spread leaves a measurable share of
-// experts with <=64 tokens whose single 64-tile beats a constant 128-row
-// tile (batch 512 decode wins 0.8%; crossover sits at e~75-77). Near e~128
-// the spread instead makes single 128-tiles overflow into a second one, so
-// BLOCK_M=64 wins big again (batch 896 decode is 15% faster); doc 15.14.
+// ss_nsplit). SiTU 128/64 defaults to the analytic cost model above
+// (DG_SM90_FP4_COST_MODEL=0 falls back to the hand-tuned bands, where the
+// (76, 112] mid band halves per-expert B decodes at equal M padding --
+// measured +2.6..+4.7% at batch 544..768 -- while near e~128 routing spread
+// overflows single 128-tiles so BLOCK_M=64 wins big again; doc 15.14).
 static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
                                      const bool& use_situ) {
+    if (use_fp4_sm90_situ_cost_model(use_situ))
+        return get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
+               FP4SM90ConfigKind::kPrefill;
     const bool situ_12864 = use_situ and
         get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128;
     if (situ_12864) {
