@@ -1438,14 +1438,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kSSHalfAccum = SSHalfWGMMA::kNumAccum;
             constexpr uint32_t kSSAccum = kSSNSplitActive ? kSSHalfAccum : kAccumPerThread;
             float final_accum[kAccumPerThread] = {};
-            {
+            // The K-stage loop is instantiated per (phase, swapAB-N): tile
+            // invariant decisions (the Linear1/Linear2 branch and the swapAB
+            // n_swap dispatch chain) used to run on every K-stage of the math
+            // warp's critical path, which sets the whole pipeline's steady
+            // beat; hoisting them to one dispatch per tile also lets the
+            // compiler specialize each loop body (doc 15.18).
+            auto run_k_stages = [&]<bool kIsL1, uint32_t kNSwap>() {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
 
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
                 float scale_a_0_hi, scale_a_1_hi;  // Only used in L2 (per-64 K)
-                if (block_phase == sched::BlockPhase::Linear1) {
+                if constexpr (kIsL1) {
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + wg_m_offset + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + wg_m_offset + r_1);
                 } else if constexpr (kL2ActsSFGranK == 64) {
@@ -1497,7 +1503,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     wait_fp4_decode_done(stage_idx, phase);
                 }
 
-                if (block_phase == sched::BlockPhase::Linear1) {
+                if constexpr (kIsL1) {
                     if constexpr (kL1ActsSFGranK == 32) {
                         float accum[kAccumPerThread];
                         #pragma unroll
@@ -1595,26 +1601,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 empty_barriers[stage_idx]->arrive();
                         };
 
-                        const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kSwapABFlashN24Dispatch) {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l1.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l1.template operator()<16>();
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l1.template operator()<24>();
-                            } else {
-                                run_swap_ab_l1.template operator()<64>();
-                            }
-                        } else {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l1.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l1.template operator()<16>();
-                            } else {
-                                run_swap_ab_l1.template operator()<64>();
-                            }
-                        }
+                        // N dispatch hoisted to the per-tile run_k_stages
+                        // instantiation below.
+                        run_swap_ab_l1.template operator()<kNSwap>();
                     } else {
                     // Single per-128 K-block WGMMA group
                     if constexpr (kSSNSplitActive) {
@@ -1769,30 +1758,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 empty_barriers[stage_idx]->arrive();
                         };
 
-                        const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kSwapABFlashN24Dispatch) {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l2.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l2.template operator()<16>();
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l2.template operator()<24>();
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l2.template operator()<32>();
-                            } else {
-                                run_swap_ab_l2.template operator()<64>();
-                            }
-                        } else {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l2.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l2.template operator()<16>();
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l2.template operator()<32>();
-                            } else {
-                                run_swap_ab_l2.template operator()<64>();
-                            }
-                        }
+                        // N dispatch hoisted to the per-tile run_k_stages
+                        // instantiation below.
+                        run_swap_ab_l2.template operator()<kNSwap>();
                     } else if constexpr (kL2ActsSFGranK == 32) {
                         // L2 BLOCK_N=64: L1 produced 32-column FP8 chunks with
                         // independent SF, so promote each WGMMA::K=32 slice with
@@ -1958,6 +1926,43 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
             }
+            };
+
+            // Per-tile dispatch of the specialized K-stage loop. `n_swap` and
+            // the phase are tile constants, so decide them once here instead
+            // of on every K-stage inside the loop.
+            if constexpr (kSwapABL1Active) {
+                const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    if constexpr (kSwapABFlashN24Dispatch) {
+                        if (n_swap <= 8) run_k_stages.template operator()<true, 8>();
+                        else if (n_swap <= 16) run_k_stages.template operator()<true, 16>();
+                        else if (n_swap <= 24) run_k_stages.template operator()<true, 24>();
+                        else run_k_stages.template operator()<true, 64>();
+                    } else {
+                        if (n_swap <= 8) run_k_stages.template operator()<true, 8>();
+                        else if (n_swap <= 16) run_k_stages.template operator()<true, 16>();
+                        else run_k_stages.template operator()<true, 64>();
+                    }
+                } else {
+                    if constexpr (kSwapABFlashN24Dispatch) {
+                        if (n_swap <= 8) run_k_stages.template operator()<false, 8>();
+                        else if (n_swap <= 16) run_k_stages.template operator()<false, 16>();
+                        else if (n_swap <= 24) run_k_stages.template operator()<false, 24>();
+                        else if (n_swap <= 32) run_k_stages.template operator()<false, 32>();
+                        else run_k_stages.template operator()<false, 64>();
+                    } else {
+                        if (n_swap <= 8) run_k_stages.template operator()<false, 8>();
+                        else if (n_swap <= 16) run_k_stages.template operator()<false, 16>();
+                        else if (n_swap <= 32) run_k_stages.template operator()<false, 32>();
+                        else run_k_stages.template operator()<false, 64>();
+                    }
+                }
+            } else {
+                if (block_phase == sched::BlockPhase::Linear1)
+                    run_k_stages.template operator()<true, 0>();
+                else
+                    run_k_stages.template operator()<false, 0>();
             }
 
             // Skip epilogue when block is past valid M (still must release via empty).
