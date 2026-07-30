@@ -87,10 +87,12 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     (void)intermediate_hidden;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    // Decode -> prefill boundary is activation-specific. Kimi/SiTU uses its
-    // own higher threshold so DSV4/SwiGLU keeps the existing e=80 tuning.
-    const float prefill_threshold = get_fp4_sm90_prefill_threshold(use_situ);
-    const bool prefill_band = expected_tokens_per_expert >= prefill_threshold;
+    // Decode -> prefill boundary is activation-specific (Kimi/SiTU keeps its
+    // own tuning so DSV4/SwiGLU stays on e=80), and the SiTU 128/64 recipe
+    // additionally has a non-monotonic prefill mid band; share the predicate
+    // with the block-config heuristics so the feature bundle never mixes.
+    const bool prefill_band = is_fp4_sm90_prefill_band(
+        expected_tokens_per_expert, use_situ);
     const bool decode_band =
         expected_tokens_per_expert > 0.0f and !prefill_band;
     // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force

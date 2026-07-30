@@ -246,6 +246,30 @@ static float get_fp4_sm90_prefill_threshold(const bool& use_situ) {
             : get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
 }
 
+// Whether `e` should run the prefill bundle (BLOCK_M=128 + early_b_decode +
+// ss_nsplit). Besides the monotonic threshold above, the SiTU 128/64 recipe
+// has a non-monotonic mid band: for e in (80, 112] a BLOCK_M=128 tile pads M
+// no worse than two BLOCK_M=64 tiles while halving per-expert B decodes --
+// measured +4.1%/+2.5% at batch 640/768 (e=91/110). Near e~128 the routing
+// spread makes single 128-tiles overflow into a second one, so BLOCK_M=64
+// wins big again (batch 896 decode is 15% faster); doc 15.14.
+static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
+                                     const bool& use_situ) {
+    const bool situ_12864 = use_situ and
+        get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128;
+    if (situ_12864) {
+        const auto lo = static_cast<float>(
+            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_LO", 80));
+        const auto hi = static_cast<float>(
+            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_HI", 112));
+        if (expected_tokens_per_expert > lo and
+            expected_tokens_per_expert <= hi)
+            return true;
+    }
+    return expected_tokens_per_expert >=
+           get_fp4_sm90_prefill_threshold(use_situ);
+}
+
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -255,7 +279,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn =
-        expected_tokens_per_expert >= get_fp4_sm90_prefill_threshold(use_situ);
+        is_fp4_sm90_prefill_band(expected_tokens_per_expert, use_situ);
     const bool ultra_small_split_n =
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f;
     int block_m = auto_split_mn ? 128 : 64;
@@ -401,7 +425,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_split_n_shape_band =
         fp4_flash_or_pro_shape and
         expected_tokens_per_expert > 0.0f and
-        expected_tokens_per_expert < get_fp4_sm90_prefill_threshold(use_situ);
+        not is_fp4_sm90_prefill_band(expected_tokens_per_expert, use_situ);
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
@@ -430,7 +454,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and
-        expected_tokens_per_expert >= get_fp4_sm90_prefill_threshold(use_situ);
+        is_fp4_sm90_prefill_band(expected_tokens_per_expert, use_situ);
     const bool fp4_decode_assist_thread_kernel_band =
         fp4_2wg_decode_offload_kernel_band or
         (fp4_small_block_n_kernel and
