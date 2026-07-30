@@ -98,13 +98,13 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
     // the non-swap path for A/B accuracy comparison.
     const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
-    // Measured crossover on H20 for swiglu shapes: swapAB wins clearly at
-    // e<=12, ties at e~16 and loses beyond, so the default bound is 16 (FP8
-    // uses 30; the FP4 kernel pays extra decode work on the swapped path).
-    // DG_SM90_FP4_SWAP_AB_MAX_E overrides the bound for per-shape tuning
-    // (e.g. Kimi's tile-quantization tail band around e~73, doc 15.13).
+    // Measured crossover on H20: swapAB wins at e=18.3 (+3.1% on Kimi
+    // 128/64) and loses from e~23 on (-6..-18%), so the default bound is 20
+    // (FP8 uses 30; the FP4 kernel pays extra decode work on the swapped
+    // path, and larger e also lands wider WGMMA-N buckets). The original
+    // swiglu tuning had 16; doc 15.15. DG_SM90_FP4_SWAP_AB_MAX_E overrides.
     const float swap_ab_max_e = static_cast<float>(
-        get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 16));
+        get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 20));
     return {
         /*math_wg_participates_in_decode=*/ false,
         /*num_math_wg_decode_warps=*/ 0,
