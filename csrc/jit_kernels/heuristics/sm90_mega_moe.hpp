@@ -369,10 +369,6 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     // Simplified: schedule FP4 expert waves exactly like the FP8 path. The
     // historical flash/pro wave tables (9 + 12 first-match rules) were tuned
     // point-by-point on benchmark batches and are retired.
-    // DG_SM90_FP4_EXPERTS_PER_WAVE is an experimental override for wave-size
-    // sensitivity probing (doc 15.22).
-    if (const int w = get_env<int>("DG_SM90_FP4_EXPERTS_PER_WAVE", 0); w > 0)
-        return std::min(w, num_experts_per_rank);
     return get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
@@ -452,12 +448,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
 
     // No FP4 stage cap (FP8 parity): always use as many pipeline stages as
     // SMEM allows. The historical 11-rule cap table is retired.
-    // DG_SM90_FP4_STAGE_CAP is an experimental override for pipeline-depth
-    // sensitivity probing (doc 15.17).
-    int num_stages = (smem_capacity - smem_fixed) /
-                     (smem_per_stage + smem_barriers_per_stage);
-    if (const int cap = get_env<int>("DG_SM90_FP4_STAGE_CAP", 0); cap > 0)
-        num_stages = std::min(num_stages, cap);
+    const int num_stages = (smem_capacity - smem_fixed) /
+                           (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(num_stages >= 2);
     return {num_stages,
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
