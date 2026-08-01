@@ -9,6 +9,9 @@ import tvm_ffi
 
 from .cuda_helpers import find_cuda_home, get_cuda_arch
 
+_SM90_TINY_WEIGHT_SCALE_THRESHOLD = 1.0e-12
+_SM90_PRUNED_WEIGHT_SCALE = 1.0e-5
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -374,11 +377,65 @@ def get_symm_buffer_for_mega_moe(group,
     )
 
 
+def _sanitize_sm90_fp8_weight_blocks(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    threshold: float = _SM90_TINY_WEIGHT_SCALE_THRESHOLD,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Make effectively pruned FP8 blocks safe for SM90 MegaMoE."""
+    if weight.ndim != 3 or scale.ndim != 3:
+        raise ValueError(
+            f"SM90 MegaMoE expects rank-3 weights/scales, got "
+            f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+        )
+    num_experts, n, k = weight.shape
+    expected_scale_shape = (num_experts, n // 128, k // 128)
+    if n % 128 != 0 or k % 128 != 0:
+        raise ValueError(f"SM90 FP8 weight shape must be 128-aligned, got {(n, k)}")
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"SM90 FP8 scale shape mismatch: got {tuple(scale.shape)}, "
+            f"expected {expected_scale_shape}"
+        )
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise ValueError(f"SM90 MegaMoE expects FP8 weights, got {weight.dtype}")
+
+    tiny = scale.abs() < threshold
+    if not bool(tiny.any()):
+        return weight, scale
+
+    sanitized_weight = weight.clone()
+    sanitized_scale = scale.clone()
+    weight_blocks = sanitized_weight.view(
+        num_experts,
+        n // 128,
+        128,
+        k // 128,
+        128,
+    )
+    weight_blocks.view(torch.uint8).masked_fill_(
+        tiny[:, :, None, :, None],
+        0,
+    )
+    for expert in tiny.any(dim=(1, 2)).nonzero(as_tuple=False).flatten().tolist():
+        normal_scales = sanitized_scale[expert][~tiny[expert]]
+        replacement = (
+            normal_scales.median()
+            if normal_scales.numel()
+            else sanitized_scale.new_tensor(_SM90_PRUNED_WEIGHT_SCALE)
+        )
+        sanitized_scale[expert].masked_fill_(tiny[expert], replacement)
+    return sanitized_weight, sanitized_scale
+
+
 def transform_weights_for_mega_moe_sm90(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor]
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     l1_fp8, l1_sf = l1_weights
+    l1_fp8, l1_sf = _sanitize_sm90_fp8_weight_blocks(l1_fp8, l1_sf)
+    l2_fp8, l2_sf = _sanitize_sm90_fp8_weight_blocks(*l2_weights)
 
     def _interleave_one(t, gran: int = 8) -> torch.Tensor:
         g, n, *rest = t.shape
@@ -387,7 +444,7 @@ def transform_weights_for_mega_moe_sm90(
         up = t[:, half:].reshape(g, half // gran, gran, *rest)
         return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
 
-    return (_interleave_one(l1_fp8), l1_sf), l2_weights
+    return (_interleave_one(l1_fp8), l1_sf), (l2_fp8, l2_sf)
 
 
 def fp8_mega_moe(y: torch.Tensor,
