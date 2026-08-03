@@ -35,7 +35,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, typename cd_dtype_t>
+          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         int* grouped_layout,
@@ -52,7 +52,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
 
-    // C/D type: only FP32 with accumulation
+    // C/D type: FP32, with optional accumulation
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
 
     // Types
@@ -330,7 +330,9 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
             // Use TMA store to write back to global memory
             if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
-                cute::SM90_TMA_REDUCE_ADD_2D::copy(
+                using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                    cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                cute_tma_t::copy(
                     &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
                     current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
                 cute::tma_store_arrive();

@@ -193,6 +193,22 @@ def test_k_grouped_gemm_contiguous() -> None:
             diff = calc_diff(d, ref_d)
             assert diff < 0.001, f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}'
 
+            # Hopper NT can use a plain TMA store when C is absent. Prefill D
+            # with NaNs and require the beta=0 path to overwrite every byte
+            # exactly as the established zero-C accumulation path did.
+            if get_arch_major() == 9 and all(group_k > 0 for group_k in new_ks):
+                d.zero_()
+                k_grouped_fp8_gemm_contiguous(
+                    a, b, d, new_ks, new_ks_tensor, d, recipe=recipe
+                )
+                accumulated_d = d.clone()
+                d.fill_(float('nan'))
+                k_grouped_fp8_gemm_contiguous(
+                    a, b, d, new_ks, new_ks_tensor, None, recipe=recipe
+                )
+                assert torch.isfinite(d).all()
+                assert torch.equal(d, accumulated_d)
+
         # Test performance
         k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=use_ue8m0, gran_k=gran_k)
         ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')

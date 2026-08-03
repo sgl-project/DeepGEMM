@@ -76,6 +76,7 @@ try:
     # TODO: remove these later
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
+    supports_k_grouped_fp8_gemm_beta_zero = True
 except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
     pass

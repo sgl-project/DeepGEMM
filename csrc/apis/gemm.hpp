@@ -336,7 +336,12 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(a.first.is_contiguous());
     DG_HOST_ASSERT(b.first.is_contiguous());
     DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(c.has_value() and c.value().is_contiguous());
+    DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
+    if (not c.has_value()) {
+        // A group with K=0 schedules no CTA, so beta=0 cannot overwrite its D tile.
+        for (const auto k: ks)
+            DG_HOST_ASSERT(k > 0);
+    }
 
     // Early return for trivial cases
     if (early_return(m, n, accumulate(ks.begin(), ks.end(), 0), d, c))

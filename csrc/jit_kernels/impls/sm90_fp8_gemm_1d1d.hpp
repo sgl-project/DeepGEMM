@@ -44,7 +44,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}, {},
+        {}, {}, {},
         {},
         {}, {}
     >);
@@ -60,6 +60,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+        args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype));
     }
 
@@ -82,7 +83,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -152,7 +153,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                          const torch::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // TODO: refactor with the mk alignment function
