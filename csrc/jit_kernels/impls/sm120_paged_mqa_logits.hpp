@@ -53,13 +53,13 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm120_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
-                                            const torch::Tensor& schedule_metadata,
-                                            const int& batch_size, const int& next_n,
-                                            const int& block_kv, const int& num_sms,
-                                            const bool& is_context_lens_2d,
-                                            const int& num_next_n_atoms,
-                                            const bool& is_varlen, const int* indices_ptr) {
+static void sm120_paged_mqa_logits_metadata_raw(int* context_lens_ptr,
+                                                int* schedule_metadata_ptr,
+                                                const int& batch_size, const int& next_n,
+                                                const int& block_kv, const int& num_sms,
+                                                const bool& is_context_lens_2d,
+                                                const int& num_next_n_atoms,
+                                                const bool& is_varlen, const int* indices_ptr) {
     constexpr int split_kv = 128;
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
@@ -78,14 +78,26 @@ static void sm120_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .next_n = next_n,
         .num_next_n_atoms = num_next_n_atoms,
         .is_context_lens_2d = is_context_lens_2d,
-        .context_lens = context_lens.data_ptr<int>(),
+        .context_lens = context_lens_ptr,
         .indices = const_cast<int*>(indices_ptr),
-        .schedule_metadata = schedule_metadata.data_ptr<int>(),
+        .schedule_metadata = schedule_metadata_ptr,
         .launch_args = LaunchArgs(1, num_threads, smem_size)
     };
     const auto code = SM120PagedMQALogitsMetadataRuntime::generate(args);
     const auto runtime = compiler->build("sm120_paged_mqa_logits_metadata", code);
     SM120PagedMQALogitsMetadataRuntime::launch(runtime, args);
+}
+
+static void sm120_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                            const torch::Tensor& schedule_metadata,
+                                            const int& batch_size, const int& next_n,
+                                            const int& block_kv, const int& num_sms,
+                                            const bool& is_context_lens_2d,
+                                            const int& num_next_n_atoms,
+                                            const bool& is_varlen, const int* indices_ptr) {
+    sm120_paged_mqa_logits_metadata_raw(
+        context_lens.data_ptr<int>(), schedule_metadata.data_ptr<int>(), batch_size, next_n,
+        block_kv, num_sms, is_context_lens_2d, num_next_n_atoms, is_varlen, indices_ptr);
 }
 
 // ---- FP8 paged ----

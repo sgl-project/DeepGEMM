@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <tvm/ffi/container/tensor.h>
@@ -573,13 +574,61 @@ Tensor dg_fp8_mqa_logits(TensorView q, TensorView kv_data, TensorView kv_sf,
 
 Tensor dg_get_paged_mqa_logits_metadata(TensorView context_lens, int64_t block_kv,
                                        int64_t num_sms, Optional<TensorView> indices) {
-    auto indices_val = indices.has_value()?
-        std::optional<torch::Tensor>(convert_to_torch_tensor(indices.value()))
-        : std::nullopt;
-    auto result = attention::get_paged_mqa_logits_metadata(
-        convert_to_torch_tensor(context_lens), static_cast<int>(block_kv),
-        static_cast<int>(num_sms), indices_val);
-    return Tensor::FromDLPack(at::toDLPack(result));
+    DG_HOST_ASSERT(context_lens.ndim() == 2);
+    DG_HOST_ASSERT(context_lens.dtype().code == kDLInt and context_lens.dtype().bits == 32 and
+                   context_lens.dtype().lanes == 1);
+    DG_HOST_ASSERT(context_lens.IsContiguous());
+
+    const int batch_size = static_cast<int>(context_lens.size(0));
+    const int next_n = static_cast<int>(context_lens.size(1));
+    const bool is_varlen = indices.has_value();
+    int* indices_ptr = nullptr;
+    if (is_varlen) {
+        const auto indices_view = indices.value();
+        DG_HOST_ASSERT(indices_view.ndim() == 1 and indices_view.size(0) == batch_size);
+        DG_HOST_ASSERT(indices_view.dtype().code == kDLInt and indices_view.dtype().bits == 32 and
+                       indices_view.dtype().lanes == 1);
+        DG_HOST_ASSERT(indices_view.IsContiguous());
+        indices_ptr = reinterpret_cast<int*>(
+            static_cast<char*>(indices_view.data_ptr()) + indices_view.byte_offset());
+    }
+
+    std::array<int64_t, 2> output_shape{num_sms + 1, 2};
+    auto schedule_metadata = Tensor::FromEnvAlloc(
+        TVMFFIEnvTensorAlloc, ShapeView(output_shape.data(), output_shape.size()),
+        context_lens.dtype(), context_lens.device());
+    auto* context_lens_ptr = reinterpret_cast<int*>(
+        static_cast<char*>(context_lens.data_ptr()) + context_lens.byte_offset());
+    auto* schedule_metadata_ptr = static_cast<int*>(schedule_metadata.data_ptr());
+
+    const auto arch_major = device_runtime->get_arch_major();
+    if (is_varlen) {
+        DG_HOST_ASSERT(arch_major == 10 and next_n == 1 and (block_kv == 64 or block_kv == 32));
+        sm100_paged_mqa_logits_metadata_raw(
+            context_lens_ptr, schedule_metadata_ptr, batch_size, batch_size * next_n, next_n,
+            static_cast<int>(num_sms), true, true, indices_ptr);
+    } else if (arch_major == 10) {
+        DG_HOST_ASSERT(block_kv == 64 or block_kv == 32);
+        sm100_paged_mqa_logits_metadata_raw(
+            context_lens_ptr, schedule_metadata_ptr, batch_size, batch_size * next_n, next_n,
+            static_cast<int>(num_sms), true, false, nullptr);
+    } else if (arch_major == 12) {
+        DG_HOST_ASSERT(block_kv == 64);
+        const int next_n_atom = (next_n >= 2) ? 2 : 1;
+        const int num_next_n_atoms = (next_n + next_n_atom - 1) / next_n_atom;
+        sm120_paged_mqa_logits_metadata_raw(
+            context_lens_ptr, schedule_metadata_ptr, batch_size, next_n,
+            static_cast<int>(block_kv), static_cast<int>(num_sms), true, num_next_n_atoms,
+            false, nullptr);
+    } else if (arch_major == 9) {
+        DG_HOST_ASSERT(block_kv == 64);
+        sm90_paged_mqa_logits_metadata_raw(
+            context_lens_ptr, schedule_metadata_ptr, batch_size, next_n,
+            static_cast<int>(block_kv), static_cast<int>(num_sms), true, false, nullptr);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+    return schedule_metadata;
 }
 
 Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,

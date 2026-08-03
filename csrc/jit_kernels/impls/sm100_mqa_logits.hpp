@@ -52,12 +52,12 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
-                                            const torch::Tensor& schedule_meta,
-                                            const int& num_requests, const int& num_q_tokens_total,
-                                            const int& next_n, const int& num_sms,
-                                            const bool& is_context_lens_2d, const bool& is_varlen,
-                                            const int* indices_ptr) {
+static void sm100_paged_mqa_logits_metadata_raw(int* context_lens_ptr,
+                                                int* schedule_meta_ptr,
+                                                const int& num_requests, const int& num_q_tokens_total,
+                                                const int& next_n, const int& num_sms,
+                                                const bool& is_context_lens_2d, const bool& is_varlen,
+                                                const int* indices_ptr) {
     constexpr int split_kv = 256;
     const int num_threads = 256;
     // smem: prefix_work[num_requests] + request_q_token_start[num_requests]
@@ -72,14 +72,25 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .num_sms = num_sms,
         .num_requests = num_requests,
         .num_q_tokens_total = num_q_tokens_total,
-        .context_lens = context_lens.data_ptr<int>(),
+        .context_lens = context_lens_ptr,
         .indices = const_cast<int*>(indices_ptr),
-        .schedule_meta = schedule_meta.data_ptr<int>(),
+        .schedule_meta = schedule_meta_ptr,
         .launch_args = LaunchArgs(1, num_threads, smem_size)
     };
     const auto code = SM100PagedMQALogitsMetadataRuntime::generate(args);
     const auto runtime = compiler->build("sm100_paged_mqa_logits_metadata", code);
     SM100PagedMQALogitsMetadataRuntime::launch(runtime, args);
+}
+
+static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
+                                            const torch::Tensor& schedule_meta,
+                                            const int& num_requests, const int& num_q_tokens_total,
+                                            const int& next_n, const int& num_sms,
+                                            const bool& is_context_lens_2d, const bool& is_varlen,
+                                            const int* indices_ptr) {
+    sm100_paged_mqa_logits_metadata_raw(
+        context_lens.data_ptr<int>(), schedule_meta.data_ptr<int>(), num_requests,
+        num_q_tokens_total, next_n, num_sms, is_context_lens_2d, is_varlen, indices_ptr);
 }
 
 // Unified contiguous-KV runtime for FP4/FP8; FP8 reuses the unused `sf_q` descriptor slot

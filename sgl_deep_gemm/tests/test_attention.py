@@ -77,6 +77,30 @@ def ref_diff_tol(has_bf16: bool) -> float:
     return 3e-5 if has_bf16 else 5e-6
 
 
+def test_paged_mqa_logits_metadata() -> None:
+    print('Testing paged MQA logits metadata:')
+    num_sms = deep_gemm.get_num_sms()
+    cases = (
+        [[64]],
+        [[64, 128]],
+        [[1], [63], [64], [65], [1024]],
+        [[31, 32, 33], [63, 64, 65]],
+    )
+
+    for values in cases:
+        context_lens = torch.tensor(values, device='cuda', dtype=torch.int32)
+        schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, 64, num_sms
+        )
+        torch.cuda.synchronize()
+
+        assert schedule_meta.shape == (num_sms + 1, 2)
+        assert schedule_meta.dtype == torch.int32
+        assert schedule_meta.device == context_lens.device
+        assert schedule_meta.is_contiguous()
+    print()
+
+
 def dtype_tag(dtype: torch.dtype) -> str:
     return 'BF16' if dtype == torch.bfloat16 else 'FP32'
 
@@ -493,5 +517,6 @@ if __name__ == '__main__':
     random.seed(0)
 
     test_gemm_skip_head_mid()
+    test_paged_mqa_logits_metadata()
     test_mqa_logits()
     test_paged_mqa_logits()
