@@ -153,6 +153,7 @@ fi
 # pre_dispatch tests use deep_gemm's own symmetric buffer.
 MEGA_MOE_BLACKWELL=(
   test_mega_moe.py
+  test_mega_moe_situ.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_pre_dispatch.py
@@ -181,6 +182,7 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
       skip_test test_mega_moe.py "deep_ep with ElasticBuffer not installed"
     fi
   fi
+  [ -f "${TESTS_DIR}/test_mega_moe_situ.py" ] && run_test test_mega_moe_situ.py --num-processes 1
   L1_NPROC="${NPROC}"
   if [ "${L1_NPROC}" -gt 2 ]; then
     L1_NPROC=2

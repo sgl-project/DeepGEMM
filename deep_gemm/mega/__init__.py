@@ -15,6 +15,14 @@ except Exception as exception:
 from .. import _C
 
 _MAX_CANDIDATE_BLOCK_M = 192
+_FP8_FP4_ACTIVATIONS = ('swiglu', 'situ')
+
+
+def _validate_fp8_fp4_activation(activation: str) -> None:
+    assert activation in _FP8_FP4_ACTIVATIONS, (
+        f'FP8xFP4 MegaMoE activation must be one of '
+        f'{_FP8_FP4_ACTIVATIONS}, got `{activation}`'
+    )
 
 
 class SymmBuffer:
@@ -25,7 +33,13 @@ class SymmBuffer:
                  num_ring_tokens: int,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        if mma_type == 'fp8xfp4':
+            _validate_fp8_fp4_activation(activation)
+        else:
+            assert activation == 'swiglu', (
+                f'Only `swiglu` activation is supported for `{mma_type}`, '
+                f'got `{activation}`'
+            )
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -145,7 +159,7 @@ def transform_weights_for_mega_moe(
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
              Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+    _validate_fp8_fp4_activation(activation)
     if isinstance(l1_weights, tuple):
         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
@@ -170,6 +184,10 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    _validate_fp8_fp4_activation(activation)
+    assert activation != 'situ' or activation_clamp is None, (
+        '`activation_clamp` is not supported with `activation="situ"`'
+    )
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_fp4_mega_moe(
