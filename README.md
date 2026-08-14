@@ -113,7 +113,7 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), activation, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
 
 ```python
 # Allocate symmetric memory buffer
@@ -136,8 +136,6 @@ buffer.topk_weights[:num_tokens].copy_(topk_weights)
 y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 ```
-
-The FP8xFP4 kernel accepts `activation="swiglu"` (default) and `activation="situ"`. Pass the same activation to `get_symm_buffer_for_mega_moe`, `transform_weights_for_mega_moe`, and `fp8_fp4_mega_moe`. The SiTU path uses the Kimi-K3 constants beta=4.0 and linear beta=25.0; `activation_clamp` applies only to SwiGLU.
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 

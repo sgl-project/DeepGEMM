@@ -62,7 +62,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(
         _cast_grouped_weights_to_fp4(l1_weights),
         _cast_grouped_weights_to_fp4(l2_weights),
-        activation="situ",
     )
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -71,7 +70,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk,
         hidden,
         intermediate_hidden,
-        activation="situ",
     )
     cumulative_recv_stats = torch.zeros((num_experts,), dtype=torch.int, device="cuda")
 
@@ -121,7 +119,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     try:
         run("situ", activation_clamp=0.03125)
-    except AssertionError as error:
+    except RuntimeError as error:
         assert "activation_clamp" in str(error)
     else:
         raise AssertionError("SiTU must reject the unrelated activation_clamp option")
