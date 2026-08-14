@@ -16,7 +16,9 @@ from deep_gemm.testing import calc_diff, get_arch_major
 from deep_gemm.utils import ceil_div, per_token_cast_to_fp8
 
 
-if get_arch_major() == 12:
+if get_arch_major() != 12:
+    print('SKIP: SM120 runtime compiled-dimension test requires compute capability 12.x')
+else:
     cache_dir = Path(os.environ['DG_JIT_CACHE_DIR']) / 'cache'
 
     def kernel_dirs(name):
@@ -95,6 +97,28 @@ if get_arch_major() == 12:
             gemm_kernels = current_kernels
         else:
             assert current_kernels == gemm_kernels
+
+    kernels_before_non_swap = kernel_dirs('sm120_fp8_fp4_gemm_1d1d')
+    tokens = 64
+    activation = torch.randn((tokens, k), device='cuda', dtype=torch.bfloat16)
+    reference = activation @ matrix_weight.T
+    activation_fp8 = per_token_cast_to_fp8(activation, use_ue8m0=True)
+    output = torch.empty((tokens, n), device='cuda', dtype=torch.bfloat16)
+
+    deep_gemm.fp8_fp4_gemm_nt(
+        activation_fp8,
+        matrix_weight_fp8,
+        output,
+        recipe=(1, 1, 128),
+        compiled_dims='nk',
+    )
+    assert calc_diff(output, reference) < 1e-3
+
+    non_swap_kernels = (
+        kernel_dirs('sm120_fp8_fp4_gemm_1d1d') - kernels_before_non_swap
+    )
+    assert len(non_swap_kernels) == 1
+    assert_compiled_shape(next(iter(non_swap_kernels)), (0, 1024, 4096))
 '''
 
 
@@ -102,6 +126,7 @@ def test_sm120_swap_ab_runtime_token_dim():
     with tempfile.TemporaryDirectory(prefix='deep-gemm-runtime-dim-') as cache_dir:
         env = os.environ.copy()
         env['DG_JIT_CACHE_DIR'] = cache_dir
+        env.pop('PYTHONOPTIMIZE', None)
         subprocess.run(
             [sys.executable, '-c', TEST_PROGRAM],
             check=True,
