@@ -24,6 +24,7 @@ public:
         int num_experts, num_shared_experts, num_topk;
         int num_ranks;
         float activation_clamp;
+        bool use_situ;
         bool fast_math;
         // Stream A0.1: enable FP4 (E2M1) activations from L1 epilogue.
         // Default false — keeps the FP8-acts baseline byte-identical.
@@ -111,6 +112,7 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
+    args.use_situ ? "true" : "false",
     args.fast_math ? "true" : "false",
     args.use_fp4_acts ? "true" : "false",
     args.use_mxf4_kind ? "true" : "false",
@@ -164,6 +166,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
+    const bool& use_situ,
     const bool& fast_math,
     const bool& use_fp4_acts = false,
     const bool& use_mxf4_kind = false,
@@ -383,6 +386,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_topk = num_topk,
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
+        .use_situ = use_situ,
         .fast_math = fast_math,
         .use_fp4_acts = use_fp4_acts,
         .use_mxf4_kind = use_mxf4_kind,

@@ -34,6 +34,7 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    bool kUseSitu,
     bool kFastMath,
     // ====== Stream A0.1 — DG_USE_FP4_ACTS ======
     // When true, the L1 epilogue quantizes its SwiGLU outputs to E2M1 (FP4) +
@@ -1377,14 +1378,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
 
-                        // Apply activation: SwiGLU, or Kimi-K3 SiTU via sentinel
+                        // Apply the explicitly selected SwiGLU or Kimi-K3 SiTU activation.
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
-                        // K3-SITU-PATCH: kActivationClamp == 0.03125f (2^-5 magic;
-                        // host asserts clamp >= 0 so negatives can't sentinel) selects SiTU:
+                        // SiTU:
                         //   act = kSituBeta * tanh(gate/kSituBeta) * sigmoid(gate)
                         //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
                         // K3 config constants baked in (activation_situ_{beta,linear_beta}).
-                        constexpr bool kUseSitu = (kActivationClamp == 0.03125f);
                         constexpr float kSituBeta = 4.0f;
                         constexpr float kSituLinearBeta = 25.0f;
                         auto fp32_values = reinterpret_cast<float*>(values);
@@ -1414,7 +1413,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             auto up = __bfloat1622float2(bf16_up);
                             if constexpr (kUseSitu) {
-                                // K3-SITU-PATCH: tanh-bounded gate, soft-clipped up
+                                // Tanh-bounded gate and soft-clipped up branch.
                                 gate = {kSituBeta * tanhf(gate.x / kSituBeta) * sig.x,
                                         kSituBeta * tanhf(gate.y / kSituBeta) * sig.y};
                                 up = {kSituLinearBeta * tanhf(up.x / kSituLinearBeta),
