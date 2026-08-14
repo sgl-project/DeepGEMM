@@ -144,9 +144,10 @@ static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>&
         eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
     if (swap_ab) {
+        // Keep compile-time dimensions attached to the caller's logical axes.
         sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
                                 eff_m, eff_n, k, gran_k_a, gran_k_b,
-                                k_major, k_major, compiled_dims,
+                                k_major, k_major, swap_mn_compiled_dims(compiled_dims),
                                 std::nullopt, true);
     } else {
         sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
