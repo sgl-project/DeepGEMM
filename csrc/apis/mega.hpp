@@ -38,7 +38,11 @@ get_symm_buffer_size_for_mega_moe(
     const std::string& mma_type, const std::string& activation,
     const int& num_ring_tokens) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
+
+    // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
+    const auto mma_kind = parse_mma_kind(mma_type);
+    DG_HOST_ASSERT(activation == "swiglu" or
+                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
 
     // Pool capacity must fit at least one full wave (one expert per wave) and aligned to block size
     const auto num_experts_per_rank = num_experts / num_ranks;
@@ -48,7 +52,6 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(num_min_ring_tokens <= num_ring_tokens and num_ring_tokens <= num_max_ring_tokens);
 
     // Parse MMA type
-    const auto mma_kind = parse_mma_kind(mma_type);
     const auto num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
     const auto with_sf = is_mma_with_sf(mma_kind);
 
@@ -220,7 +223,9 @@ static void fp8_fp4_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
+    const bool use_situ = activation == "situ";
 
     // Activation checks
     const auto activation_clamp =
@@ -302,7 +307,7 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math,
+                               activation_clamp, use_situ, fast_math,
                                use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
