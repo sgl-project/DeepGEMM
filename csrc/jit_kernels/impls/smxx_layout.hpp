@@ -110,6 +110,11 @@ static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const to
     const auto dim = sf.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
     DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat);
+    // The downstream paths launch device kernels over `sf` (or read
+    // `.data_ptr()` on the JIT launch path); a CPU tensor would crash the
+    // process at launch time (illegal device address) instead of failing
+    // cleanly. Validate the device up front.
+    DG_HOST_ASSERT(sf.is_cuda());
     const auto batched_sf = dim == 2 ? sf.unsqueeze(0) : sf;
 
     const auto [num_sf_batches, mn, sf_k] = get_shape<3>(batched_sf);
