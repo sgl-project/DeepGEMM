@@ -326,6 +326,18 @@ struct SM120ArchSpec {
         if (num_mn_blocks >= desc.num_sms / 2)
             return 1;
 
+        // Single-token decode (M well below block_m) leaves the split-K
+        // reduction dominated by launch and write-back cost rather than by the
+        // partial-sum arithmetic it parallelises: the reduction reads
+        // split_k * M * N floats to produce M * N, and at M = 4 that is a
+        // separate kernel whose runtime exceeds the GEMM time it saves.
+        // Measured on SM120 (RTX PRO 6000, DeepSeek-V4-Flash decode, M = 4,
+        // N = 8192, K = 1024): the split GEMM plus reduction costs about
+        // 22.4 us against about 13.2 us for the same projection without a
+        // split. Keep split-K for shapes with a real M tile.
+        if (desc.get_expected_m() * 4 <= layout.block_m)
+            return 1;
+
         const int target_blocks = desc.num_sms * 3 / 4;
         int split_k = ceil_div(target_blocks, num_mn_blocks);
 
