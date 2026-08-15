@@ -37,24 +37,42 @@ struct SM90ArchSpec {
 
         // Block N candidates
         std::vector<int> block_n_candidates;
-        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
-        int start = step;
-        // Avoid bank conflicts for 1D1D kernel FP32 output
-        if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
-            DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
-            DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
-            start = 24;
-            block_n_candidates.push_back(16);
+        if (desc.batch_invariant) {
+            // N/K are model dimensions for the inference paths and do not vary
+            // with the batch. Smaller output widths need a smaller atom to
+            // retain enough CTAs; wider GEMMs use N=64 to reduce issue cost.
+            const int wgmma_atom_n = desc.n <= 1024 ? 32 : 64;
+            // The 1D2D kernel decomposes wider CTA tiles into fixed
+            // WGMMA atoms. This keeps each output element's tensor
+            // core reduction fixed while retaining the CTA tiling choices that
+            // matter for performance. The 1D1D kernel does not yet implement
+            // atom decomposition, so keep its CTA tile fixed as well.
+            if (desc.kernel_type == KernelType::Kernel1D2D) {
+                for (int i = wgmma_atom_n; i <= 192; i += wgmma_atom_n)
+                    block_n_candidates.push_back(i);
+            } else {
+                block_n_candidates = {wgmma_atom_n};
+            }
+        } else {
+            int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
+            int start = step;
+            // Avoid bank conflicts for 1D1D kernel FP32 output
+            if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
+                DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
+                DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
+                start = 24;
+                block_n_candidates.push_back(16);
+            }
+            // Register spills
+            int end = 256;
+            if (desc.kernel_type == KernelType::Kernel1D2D)
+                end = 192;
+            if (desc.kernel_type == KernelType::Kernel1D1D)
+                end = 160;
+            // Enumerate
+            for (int i = start; i <= end; i += step)
+                block_n_candidates.push_back(i);
         }
-        // Register spills
-        int end = 256;
-        if (desc.kernel_type == KernelType::Kernel1D2D)
-            end = 192;
-        if (desc.kernel_type == KernelType::Kernel1D1D)
-            end = 160;
-        // Enumerate
-        for (int i = start; i <= end; i += step)
-            block_n_candidates.push_back(i);
 
         // Block K is always in a fixed manner
         const int block_k = 128 / get_element_size(desc.get_mma_kind());

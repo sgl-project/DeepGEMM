@@ -30,6 +30,12 @@ static int get_compiled_dim(const int& dim, const char& name, const std::string&
     return 0;
 }
 
+static bool use_batch_invariant_fp8(const torch::Tensor& a, const torch::Tensor& b) {
+    return heuristics_runtime->get_batch_invariant() and
+           a.scalar_type() == torch::kFloat8_e4m3fn and
+           b.scalar_type() == torch::kFloat8_e4m3fn;
+}
+
 static std::string to_string(const cute::UMMA::Major& major) {
     switch (major) {
         case cute::UMMA::Major::K:  return "cute::UMMA::Major::K";

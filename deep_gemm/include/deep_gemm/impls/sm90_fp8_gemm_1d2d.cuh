@@ -43,7 +43,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
-          uint32_t kNumSMs, GemmType kGemmType,
+          uint32_t kNumSMs, GemmType kGemmType, uint32_t kBatchInvariantAtomN,
           typename cd_dtype_t,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -64,9 +64,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
 
     // Types
-    using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
+    static constexpr uint32_t kWGMMAAtomN =
+        kBatchInvariantAtomN > 0 ? kBatchInvariantAtomN : BLOCK_N;
+    using WGMMA = typename mma::sm90::FP8MMASelector<kWGMMAAtomN>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0 or BLOCK_M < WGMMA::M, "Invalid block size");
+    DG_STATIC_ASSERT(BLOCK_N % WGMMA::N == 0, "Invalid WGMMA atom decomposition");
+    static constexpr uint32_t kNumWGMMAAtoms = BLOCK_N / WGMMA::N;
+    static constexpr uint32_t kNumAccum = WGMMA::kNumAccum * kNumWGMMAAtoms;
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -253,7 +258,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Accumulation for WGMMA or CUDA promotion
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
+            float accum[kNumAccum], final_accum[kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
             
             // Pick threads whose WGMMA results are to be stored in shared memory
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for `BLOCK_M < 64`");
@@ -305,18 +310,23 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                             // Commit WGMMA instructions
                             #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            for (uint32_t i = 0; i < kNumAccum; ++ i)
                                 ptx::warpgroup_fence_operand(accum[i]);
                             ptx::warpgroup_arrive();
                             #pragma unroll
                             for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                                 a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
-                                b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
-                                WGMMA::wgmma(a_desc, b_desc, accum, k);
+                                #pragma unroll
+                                for (uint32_t n_atom = 0; n_atom < kNumWGMMAAtoms; ++ n_atom) {
+                                    b_desc.reg32_[0] = b_desc_base_lo +
+                                        (n_atom * WGMMA::N * BLOCK_K + k * WGMMA::K) / 16;
+                                    WGMMA::wgmma(a_desc, b_desc,
+                                                 accum + n_atom * WGMMA::kNumAccum, k);
+                                }
                             }
                             ptx::warpgroup_commit_batch();
                             #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            for (uint32_t i = 0; i < kNumAccum; ++ i)
                                 ptx::warpgroup_fence_operand(accum[i]);
                             ptx::warpgroup_wait<0>();
 
@@ -335,9 +345,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             if constexpr (not kMustUseUniformedScaleB)
                                 scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
 
-                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                            auto shifted_accum = final_accum + kNumAccum * local_idx;
                             #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                            for (uint32_t i = 0; i < kNumAccum / 4; ++ i) {
                                 // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
                                 const bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
                                 shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
@@ -375,13 +385,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
 
             // Write back to shared memory using STSM and issue TMA stores
-            DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+            DG_STATIC_ASSERT(kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
             for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
                 auto m_offset = local_idx * WAVE_BLOCK_M;
-                auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                auto shifted_accum = final_accum + kNumAccum * local_idx;
                 #pragma unroll
-                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                for (auto i = 0; i < kNumAccum / 4; ++ i) {
                     // Swizzle or padding into the correct address
                     uint8_t* smem_ptr = nullptr;
                     if constexpr (kSwizzleDMode > 0) {

@@ -42,6 +42,16 @@ struct SM100ArchSpec {
             return candidates;
         }
 
+        if (desc.batch_invariant) {
+            // A fixed swapped layout keeps the tcgen05 instruction at
+            // UMMA.M=128, UMMA.N=64 for every batch/M shape. Use one CTA per
+            // cluster so changing the batch cannot select the 2-SM variant.
+            const auto layout = Layout{/*swap_ab=*/true,
+                                       /*block_m=*/64, /*block_n=*/128, block_k,
+                                       /*cluster_m=*/1, /*cluster_n=*/1};
+            return {layout};
+        }
+
         // Enumerate all candidates
         std::vector<Layout> candidates;
         for (int swap_ab = 0; swap_ab < 2; ++ swap_ab) {

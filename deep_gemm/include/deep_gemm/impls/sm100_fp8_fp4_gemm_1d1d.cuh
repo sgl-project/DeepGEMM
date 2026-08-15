@@ -26,7 +26,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          bool kSwapAB, bool kEnsureZeroPadding,
+          bool kSwapAB, bool kEnsureZeroPadding, bool kBatchInvariant,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
           typename epilogue_type_t>
@@ -208,7 +208,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // Use dynamic load block M, when swap-AB is enabled
-            const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
+            const auto load_block_m = kSwapAB and not kBatchInvariant ?
+                scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
             // For k-grouped layout, the number of block K is variable
             const auto num_total_k_blocks = math::ceil_div(scheduler.current_shape_k, BLOCK_K);
@@ -328,7 +329,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             };
 
             // Dynamic update of UMMA N based on effective M, when swap-AB is enabled
-            if constexpr (kSwapAB) {
+            if constexpr (kSwapAB and not kBatchInvariant) {
                 uint32_t umma_n = scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, umma_n);
             }

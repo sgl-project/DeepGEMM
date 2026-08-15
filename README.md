@@ -87,6 +87,20 @@ During the inference decoding phase, when CUDA graph is enabled and the CPU is u
 
 Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
+#### Batch-invariant FP8 GEMMs
+
+For deterministic inference, FP8 x FP8 GEMMs can keep each output element's tensor-core reduction independent of the batch/M shape:
+
+```python
+# Enable this before model warmup so the invariant JIT variants are compiled.
+deep_gemm.set_batch_invariant(True)
+
+# Applies to dense, batched, and M-grouped contiguous/masked FP8 GEMMs.
+deep_gemm.fp8_gemm_nt(a, b, d)
+```
+
+When only the batch composition or M dimension changes, rows with identical FP8 inputs and scaling factors produce bitwise-identical outputs on the same GPU and software stack. The mode fixes the tensor-core reduction atom, while still allowing batch-dependent CTA tiling where that does not change a row's reduction order. It does not affect FP4 or BF16 kernels, input quantization, routing, or other operators, and it does not promise bitwise equality across GPU architectures or CUDA/compiler versions.
+
 #### V3.2 MQA kernels for the indexer
 
 The kernel family has two versions, non-paged (for prefilling) and paged (for decoding).
@@ -149,6 +163,7 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.set_mk_alignment_for_contiguous_layout` / `get_mk_alignment_for_contiguous_layout`: set/get the group-level M/K alignment for contiguous layout
 - `deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout`: get the theoretical minimum M/K alignment
 - `deep_gemm.set_ignore_compile_dims`: configure dimensions to ignore during JIT compilation
+- `deep_gemm.set_batch_invariant` / `get_batch_invariant`: enable/query batch-invariant FP8 GEMM reductions
 - `deep_gemm.set_block_size_multiple_of`: constrain block sizes to be multiples of a given value
 - `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into the required layout
 - `deep_gemm.get_tma_aligned_size`: get the required TMA alignment size

@@ -10,6 +10,7 @@ class HeuristicsRuntime {
     static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
 
     bool ignore_compile_dims = false;
+    bool batch_invariant = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
     int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
@@ -21,6 +22,14 @@ public:
 
     bool get_ignore_compile_dims() const {
         return ignore_compile_dims;
+    }
+
+    void set_batch_invariant(const bool& new_value) {
+        batch_invariant = new_value;
+    }
+
+    bool get_batch_invariant() const {
+        return batch_invariant;
     }
 
     void set_block_size_multiple_of(const int& new_block_m_multiple_of, const int& new_block_n_multiple_of) {

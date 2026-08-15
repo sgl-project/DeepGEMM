@@ -47,7 +47,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {}, {},
+        {}, {}, {},
         {},
         {}
     >);
@@ -64,6 +64,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+        args.gemm_desc.batch_invariant ? (args.gemm_desc.n <= 1024 ? 32 : 64) : 0,
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type));
     }
@@ -98,7 +99,8 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -175,7 +177,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
-        .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
+        .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -242,7 +245,8 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .with_accumulation = false,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
-        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
+        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -307,7 +311,8 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .batch_invariant = use_batch_invariant_fp8(a, b)
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
