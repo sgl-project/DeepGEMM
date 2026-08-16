@@ -110,6 +110,7 @@ DEFAULT_SINGLE_GPU_TESTS=(
   test_attention.py
 )
 SM120_SINGLE_GPU_TESTS=(
+  test_runtime_compiled_dims.py
   test_bf16.py
   test_einsum.py
   test_fp8_fp4.py

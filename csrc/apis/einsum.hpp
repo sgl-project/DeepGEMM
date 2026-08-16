@@ -197,7 +197,8 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
             b, transformed_sfa_swap, a, transformed_sfb_swap, c, d,
             batch_size, /*m=*/n, /*n=*/m, k,
             gran_k_a_swap, gran_k_b_swap,
-            major_b, major_a, compiled_dims,
+            // Keep compile-time dimensions attached to the caller's logical axes.
+            major_b, major_a, swap_mn_compiled_dims(compiled_dims),
             /*swap_ab=*/true);
         return;
     }

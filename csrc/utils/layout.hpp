@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cute/arch/mma_sm100_umma.hpp>
+#include <string>
 #include <torch/torch.h>
 
 #include "math.hpp"
@@ -8,6 +9,16 @@
 #include "../jit/device_runtime.hpp"
 
 namespace deep_gemm {
+
+static std::string swap_mn_compiled_dims(std::string compiled_dims) {
+    for (auto& dim: compiled_dims) {
+        if (dim == 'm')
+            dim = 'n';
+        else if (dim == 'n')
+            dim = 'm';
+    }
+    return compiled_dims;
+}
 
 // Major-ness stuffs
 static void major_check(const torch::Tensor& t) {
