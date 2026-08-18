@@ -1652,7 +1652,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             clamp_up(u0);
                             const float weight_0 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_0)
-                                .get_base_ptr<float>();
+                                .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] =
                                 silu(g0) * u0 * weight_0;
                         }
@@ -1663,7 +1663,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             clamp_up(u1);
                             const float weight_1 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_1)
-                                .get_base_ptr<float>();
+                                .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] =
                                 silu(g1) * u1 * weight_1;
                         }
@@ -1821,10 +1821,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 // Apply token weight: SwiGLU * topk_weight (single load per row)
                 const float weight_r0 = valid_r0 ? *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r0)
-                    .get_base_ptr<float>() : 0.0f;
+                    .template get_base_ptr<float>() : 0.0f;
                 const float weight_r1 = valid_r1 ? *l1_topk_weights_buffer
                     .get_data_buffer(m_idx + row_offset_r1)
-                    .get_base_ptr<float>() : 0.0f;
+                    .template get_base_ptr<float>() : 0.0f;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     swiglu_r0[p][0] *= weight_r0;
