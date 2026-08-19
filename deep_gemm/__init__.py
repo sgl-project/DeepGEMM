@@ -25,6 +25,17 @@ from ._C import (
     get_pdl,
 )
 
+# Optional: present when built with FP8 + tensormap support (CUDA >= 12.1).
+# Wrap as tuple: tvm_ffi.Array hashes by identity, so dict/set dedup would fail.
+try:
+    _get_best_gemm_config_key = _C.get_best_gemm_config_key
+
+    def get_best_gemm_config_key(*args, **kwargs):
+        return tuple(_get_best_gemm_config_key(*args, **kwargs))
+except AttributeError as e:
+    print(f"Could not import get_best_gemm_config_key. Error: {e}")
+    pass
+
 # cuBLASLt Kernels
 from ._C import (
     cublaslt_gemm_nt, cublaslt_gemm_nn,
