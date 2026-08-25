@@ -1,5 +1,6 @@
 #pragma once
 
+#include <set>
 #include <torch/python.h>
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -138,6 +139,40 @@ static void __instantiate_kernel() {{
     }
 };
 
+// `layout::SymBuffer` reaches peers by plain pointer arithmetic, so every rank's symmetric buffer
+// must be mapped into this GPU's address space, i.e. all ranks must share one NVLink/P2P domain.
+// Otherwise the kernel faults asynchronously, far away from the actual cause.
+static void check_sym_buffer_ptrs(const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx) {
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(0 <= rank_idx and rank_idx < num_ranks);
+    if (num_ranks == 1 or get_env<int>("DG_SKIP_SYM_BUFFER_CHECK", 0))
+        return;
+
+    // Symmetric buffers are allocated once at rendezvous, so validate every pointer set only once
+    int device_idx;
+    DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
+    const auto key = std::make_pair(device_idx, sym_buffer_ptrs);
+    static thread_local std::set<std::pair<int, std::vector<int64_t>>> validated;
+    if (validated.count(key) > 0)
+        return;
+
+    for (int i = 0; i < num_ranks; ++ i) {
+        int ordinal = 0;
+        const auto error = lazy_cuPointerGetAttribute(
+            &ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+            static_cast<CUdeviceptr>(sym_buffer_ptrs[i]));
+        if (error == CUDA_ERROR_INVALID_VALUE) {
+            DG_HOST_UNREACHABLE(fmt::format(
+                "Symmetric buffer of rank {} (0x{:x}) is not mapped into the address space of rank {}. "
+                "MegaMoE addresses peers directly, so all {} ranks must share a single NVLink/P2P domain, "
+                "which is a single node on SM90; it cannot span nodes over IB/RDMA",
+                i, static_cast<uint64_t>(sym_buffer_ptrs[i]), rank_idx, num_ranks));
+        }
+        DG_CUDA_DRIVER_CHECK(error);
+    }
+    validated.insert(key);
+}
+
 static void sm90_fp8_mega_moe(
     const torch::Tensor& y,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
@@ -156,6 +191,7 @@ static void sm90_fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    check_sym_buffer_ptrs(sym_buffer_ptrs, rank_idx);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90(
