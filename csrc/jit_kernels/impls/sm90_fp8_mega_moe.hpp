@@ -157,18 +157,26 @@ static void check_sym_buffer_ptrs(const std::vector<int64_t>& sym_buffer_ptrs, c
         return;
 
     for (int i = 0; i < num_ranks; ++ i) {
-        int ordinal = 0;
-        const auto error = lazy_cuPointerGetAttribute(
-            &ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-            static_cast<CUdeviceptr>(sym_buffer_ptrs[i]));
-        if (error == CUDA_ERROR_INVALID_VALUE) {
+        // Symmetric memory hands out a null pointer for peers outside the local P2P domain,
+        // which `SymBuffer` then turns into an offset of `-base`
+        auto addressable = sym_buffer_ptrs[i] != 0;
+        if (addressable) {
+            int ordinal = 0;
+            const auto error = lazy_cuPointerGetAttribute(
+                &ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                static_cast<CUdeviceptr>(sym_buffer_ptrs[i]));
+            if (error == CUDA_ERROR_INVALID_VALUE)
+                addressable = false;
+            else
+                DG_CUDA_DRIVER_CHECK(error);
+        }
+        if (not addressable) {
             DG_HOST_UNREACHABLE(fmt::format(
-                "Symmetric buffer of rank {} (0x{:x}) is not mapped into the address space of rank {}. "
+                "Symmetric buffer of rank {} (0x{:x}) is not addressable from rank {}. "
                 "MegaMoE addresses peers directly, so all {} ranks must share a single NVLink/P2P domain, "
                 "which is a single node on SM90; it cannot span nodes over IB/RDMA",
                 i, static_cast<uint64_t>(sym_buffer_ptrs[i]), rank_idx, num_ranks));
         }
-        DG_CUDA_DRIVER_CHECK(error);
     }
     validated.insert(key);
 }
