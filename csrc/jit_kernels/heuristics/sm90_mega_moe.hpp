@@ -61,6 +61,71 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
+// SM90 retains the original wave scheduler and its ring-capacity heuristic.
+// Keep these helpers local to the Hopper path: upstream's SM100 scheduler now
+// sizes live task pools directly and no longer exposes the legacy helpers.
+static int get_num_wave_pool_tokens_for_mega_moe_sm90(
+    const int& num_ranks, const int& num_topk, const int& num_max_tokens_per_rank,
+    const int& num_experts_per_wave, const int& block_m) {
+    DG_HOST_ASSERT(num_max_tokens_per_rank % block_m == 0);
+    const auto num_tokens_from_all_ranks = num_max_tokens_per_rank * num_ranks;
+    if (num_experts_per_wave == 1)
+        return num_tokens_from_all_ranks;
+
+    return std::min(
+        num_tokens_from_all_ranks * num_experts_per_wave,
+        math::align(
+            num_tokens_from_all_ranks * num_topk + num_experts_per_wave * (block_m - 1),
+            block_m));
+}
+
+static int get_num_experts_per_wave_for_mega_moe_sm90_legacy(
+    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
+    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
+    int num_max_experts_per_wave = num_experts_per_rank;
+    while (num_max_experts_per_wave > 0 and
+           get_num_wave_pool_tokens_for_mega_moe_sm90(
+               num_ranks, num_topk, num_max_tokens_per_rank,
+               num_max_experts_per_wave, block_m) > num_ring_tokens)
+        --num_max_experts_per_wave;
+    DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
+
+    constexpr int kImbalanceFactor = 2;
+    const float num_expected_tokens_per_expert =
+        static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
+    const int num_expected_m_blocks = std::max(
+        ceil_div(static_cast<int>(std::ceil(num_expected_tokens_per_expert)), block_m), 1);
+    const int num_l1_n_blocks = (2 * intermediate_hidden) / block_n;
+    const int num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks;
+    int num_min_expected_experts_to_fill_sms =
+        ceil_div(kImbalanceFactor * num_sms, num_expected_l1_blocks_per_expert);
+
+    if (num_expected_tokens_per_expert < 1)
+        num_min_expected_experts_to_fill_sms = num_experts_per_rank;
+    if (num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave)
+        return num_max_experts_per_wave;
+    if (num_expected_l1_blocks_per_expert >= num_sms)
+        return num_min_expected_experts_to_fill_sms;
+
+    const int num_sweep_max_experts_per_wave = std::min(
+        num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2);
+    int best_num_experts_per_wave = num_min_expected_experts_to_fill_sms;
+    float best_tail_ratio = -1.0f;
+    for (int num_experts_per_wave = num_min_expected_experts_to_fill_sms;
+         num_experts_per_wave <= num_sweep_max_experts_per_wave;
+         ++num_experts_per_wave) {
+        const int remainder = num_experts_per_rank % num_experts_per_wave;
+        const float tail_ratio = remainder == 0 ?
+            1.0f : static_cast<float>(remainder) / num_experts_per_wave;
+        if (tail_ratio > best_tail_ratio) {
+            best_tail_ratio = tail_ratio;
+            best_num_experts_per_wave = num_experts_per_wave;
+        }
+    }
+    return best_num_experts_per_wave;
+}
+
 static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
@@ -77,7 +142,7 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
         if (single_wave_blocks >= 4 * num_sms)
             return num_experts_per_rank;
     }
-    return get_num_experts_per_wave_for_mega_moe(
+    return get_num_experts_per_wave_for_mega_moe_sm90_legacy(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);

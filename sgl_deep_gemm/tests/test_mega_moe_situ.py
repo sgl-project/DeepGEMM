@@ -62,6 +62,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(
         _cast_grouped_weights_to_fp4(l1_weights),
         _cast_grouped_weights_to_fp4(l2_weights),
+        activation="situ",
     )
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -70,7 +71,33 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk,
         hidden,
         intermediate_hidden,
+        activation="situ",
     )
+
+    try:
+        deep_gemm.transform_weights_for_mega_moe(
+            l1_weights, l2_weights, activation="situ"
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("SiTU must reject BF16 weight transformation")
+
+    try:
+        deep_gemm.get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            mma_type="bf16xbf16",
+            activation="situ",
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("SiTU must reject BF16 symmetric-buffer allocation")
     cumulative_recv_stats = torch.zeros((num_experts,), dtype=torch.int, device="cuda")
 
     def run(activation: str, activation_clamp=None):

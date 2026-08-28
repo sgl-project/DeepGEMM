@@ -38,7 +38,7 @@ class MajorTypeAB(enum.Enum):
 
     def is_mn_major(self):
         return self.value == 1
-    
+
 
 class QuantConfig:
     _legacy_quant_config = (128, 128, False, False)
@@ -316,7 +316,7 @@ def generate_normal(m: int, n: int, k: int,
         a = a if major_a.is_k_major() else a.T.contiguous().T
         b = b if major_b.is_k_major() else b.T.contiguous().T
         return a, b, c, d, ref_d
-    
+
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
     b = cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0,
@@ -362,7 +362,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
     assert major_a.is_k_major()
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)
 
     return m, a, b, grouped_layout, d, ref_d
 
@@ -399,7 +399,7 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
 
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = grouped_cast_fp8_fp4_with_major(a, MajorTypeAB.KMajor, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)
 
     if not use_psum_layout:
         # Zero SFA padding rows (beyond `masked_m`) so the pack kernel reads regular zeros

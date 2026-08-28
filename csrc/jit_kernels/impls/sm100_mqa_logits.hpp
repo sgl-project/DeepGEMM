@@ -162,6 +162,37 @@ public:
 
     static std::string generate_impl(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
+        const bool is_fp4 = args.qk_dtype == kPackedFP4;
+        const bool is_mxfp8 = args.is_mx_sf and not is_fp4;
+
+        if (not is_mxfp8) {
+            return fmt::format(R"(
+#include <deep_gemm/impls/sm100_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<
+        {},
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {},
+        {}, {}
+    >);
+}};
+)", is_fp4 ? "true" : "false",
+        args.num_heads, args.head_dim,
+        args.is_compressed_logits,
+        args.block_q, args.split_kv,
+        args.num_q_stages, args.num_kv_stages,
+        args.launch_args.grid_dim.first,
+        args.num_specialized_threads, args.num_math_threads,
+        to_string(args.logits_dtype),
+        args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
+        }
 
         return fmt::format(R"(
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
@@ -169,7 +200,7 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<
+    auto ptr = reinterpret_cast<void*>(&sm100_mxfp8_mqa_logits<
         {}, {},
         {},
         {}, {},
@@ -337,13 +368,45 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        const bool is_fp4 = args.qk_dtype == kPackedFP4;
+        const bool is_mxfp8 = args.is_mx_sf and not is_fp4;
+
+        if (not is_mxfp8) {
+            return fmt::format(R"(
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<
+        {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {}
+    >);
+}};
+)", is_fp4 ? "true" : "false",
+        args.tokens_per_request, args.num_heads,
+        args.head_dim, args.page_kv,
+        args.is_context_lens_2d, args.is_varlen ? "true" : "false",
+        args.num_q_stages, args.num_kv_stages,
+        args.split_kv, args.splits_per_chunk,
+        args.num_specialized_threads, args.num_math_threads,
+        to_string(args.logits_dtype),
+        args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
+        }
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_mxfp8_paged_mqa_logits<
         {}, {},
         {}, {},
         {}, {}, {},

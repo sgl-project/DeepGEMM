@@ -11,7 +11,7 @@ from generators import (
     generate_m_grouped_contiguous, generate_k_grouped_contiguous,
 )
 
-def test_m_grouped_gemm_contiguous_tl() -> None:    
+def test_m_grouped_gemm_contiguous_tl() -> None:
     print('Testing m-grouped contiguous Triton GEMM:')
     for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, _, _ in enumerate_m_grouped_contiguous(torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -47,7 +47,7 @@ def test_m_grouped_gemm_contiguous_tl() -> None:
     print()
 
 
-def test_k_grouped_gemm_contiguous_tl() -> None:    
+def test_k_grouped_gemm_contiguous_tl() -> None:
     print('Testing k-grouped contiguous Triton GEMM:')
     for num_groups, m, n, major_a, major_b, _, aligned_ks_cpu, expected_k_per_group, _, k_alignment, use_psum_layout in enumerate_k_grouped_contiguous(torch.bfloat16):
         # Legacy Triton kernels do not mask per-group K tails inside the BLOCK_SIZE_K loop.
