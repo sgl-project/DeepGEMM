@@ -2,9 +2,12 @@
 
 #include <torch/python.h>
 
+#include <optional>
+
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
+#include "../heuristics/mega_moe.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
@@ -13,21 +16,23 @@ namespace deep_gemm {
 
 // JIT runtime for `sm100_mega_moe_pre_dispatch` (see
 // `deep_gemm/include/deep_gemm/impls/sm100_mega_moe_pre_dispatch.cuh`).
-// Templated on (kGroupSize, kUseFp4Acts, kUsePDL); host fn picks the
+// Templated on (kGroupSize, kMmaKind, kUsePDL); host fn picks the
 // instantiation from explicit args.
 class SM100MegaMoEPreDispatchRuntime final : public LaunchRuntime<SM100MegaMoEPreDispatchRuntime> {
 public:
     struct Args {
         int group_size;
-        bool use_fp4_acts;
+        MmaKind mma_kind;
         bool use_pdl;
 
         // Runtime args (passed to the kernel via the params struct).
         const void* x;
         const void* topk_idx;
         const void* topk_weights;
+        const void* expert_scales;
         void*       buf_x;
         void*       buf_x_sf;
+        void*       buf_x_scales;
         void*       buf_topk_idx;
         void*       buf_topk_weights;
         uint32_t    num_tokens;
@@ -51,14 +56,15 @@ static void __instantiate_kernel() {{
     >);
 }};
 )", args.group_size,
-    args.use_fp4_acts ? "true" : "false",
+    to_mma_kind_name(args.mma_kind),
     args.use_pdl ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.x, args.topk_idx, args.topk_weights,
-            args.buf_x, args.buf_x_sf, args.buf_topk_idx, args.buf_topk_weights,
+            args.x, args.topk_idx, args.topk_weights, args.expert_scales,
+            args.buf_x, args.buf_x_sf, args.buf_x_scales,
+            args.buf_topk_idx, args.buf_topk_weights,
             args.num_tokens, args.padded_max, args.hidden, args.num_groups, args.top_k));
     }
 };
@@ -67,7 +73,7 @@ static void __instantiate_kernel() {{
 //   - x:            (M, H) bf16, contiguous.
 //   - topk_idx:     (M, K) int32, contiguous.
 //   - topk_weights: (M, K) float, contiguous.
-//   - buf_x:        (P, H) fp8_e4m3 if !use_fp4_acts, else (P, H/2) int8 (packed FP4).
+//   - buf_x:        (P, H) fp8_e4m3 for `fp8xfp4`, else (P, H/2) int8 (packed FP4).
 //   - buf_x_sf:     (P, G/4) int32, contiguous; G = H / group_size; each int32
 //                   stores 4 UE8M0 bytes row-major.
 //   - buf_topk_idx: (P, K) int64.
@@ -87,8 +93,29 @@ static void mega_moe_pre_dispatch(
     const torch::Tensor& buf_topk_weights,
     const int& num_tokens,
     const int& group_size,
-    const bool& use_fp4_acts) {
-    DG_HOST_ASSERT(group_size == 32 || group_size == 64 || group_size == 128);
+    const std::string& mma_type,
+    const std::optional<torch::Tensor>& buf_x_scales,
+    const std::optional<torch::Tensor>& expert_scales) {
+    const auto mma_kind = parse_mma_kind(mma_type);
+    DG_HOST_ASSERT(mma_kind != MmaKind::BF16);
+    const bool is_packed_fp4 = mma_kind == MmaKind::MXFP4 or mma_kind == MmaKind::NVFP4;
+    if (mma_kind == MmaKind::NVFP4) {
+        // NVFP4 per-token acts: 16-elem UE4M3 block SFs plus one FP32 outer
+        // scale per token (written to `buf_x_scales`).
+        DG_HOST_ASSERT(group_size == 16);
+        DG_HOST_ASSERT(buf_x_scales.has_value());
+        DG_HOST_ASSERT(buf_x_scales->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(buf_x_scales->is_contiguous());
+        DG_HOST_ASSERT(buf_x_scales->numel() >= num_tokens);
+    } else {
+        DG_HOST_ASSERT(group_size == 32 || group_size == 64 || group_size == 128);
+        DG_HOST_ASSERT(!buf_x_scales.has_value());
+    }
+    if (expert_scales.has_value()) {
+        DG_HOST_ASSERT(expert_scales->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(expert_scales->is_contiguous());
+        DG_HOST_ASSERT(expert_scales->dim() == 1);
+    }
     DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(x.is_contiguous());
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
@@ -123,7 +150,7 @@ static void mega_moe_pre_dispatch(
     DG_HOST_ASSERT(static_cast<int>(buf_x_sf.size(0)) == padded_max);
     DG_HOST_ASSERT(static_cast<int>(buf_x_sf.size(1)) == num_groups / 4);
 
-    if (use_fp4_acts) {
+    if (is_packed_fp4) {
         // Packed FP4: (P, hidden/2) bytes. The symm-buffer slice views this
         // as kPackedFP4 (int8); accept either int8 / uint8 / float8_e4m3fn
         // re-views since callers may bind the slot differently.
@@ -149,13 +176,17 @@ static void mega_moe_pre_dispatch(
 
     SM100MegaMoEPreDispatchRuntime::Args args = {
         .group_size = group_size,
-        .use_fp4_acts = use_fp4_acts,
+        .mma_kind = mma_kind,
         .use_pdl = use_pdl,
         .x = x.const_data_ptr(),
         .topk_idx = topk_idx.const_data_ptr(),
         .topk_weights = topk_weights.const_data_ptr(),
+        .expert_scales = expert_scales.has_value()
+            ? expert_scales->const_data_ptr() : nullptr,
         .buf_x = buf_x.data_ptr(),
         .buf_x_sf = buf_x_sf.data_ptr(),
+        .buf_x_scales = buf_x_scales.has_value()
+            ? buf_x_scales->data_ptr() : nullptr,
         .buf_topk_idx = buf_topk_idx.data_ptr(),
         .buf_topk_weights = buf_topk_weights.data_ptr(),
         .num_tokens = static_cast<uint32_t>(num_tokens),

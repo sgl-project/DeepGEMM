@@ -7,12 +7,35 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    MXFP4       = 2,
+    NVFP4       = 3,
 };
 
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
     switch (mma_kind) {
         case MmaKind::BF16:     return 2;
         case MmaKind::MXFP8FP4: return 1;
+        case MmaKind::MXFP4:    return 1;
+        case MmaKind::NVFP4:    return 1;
+        default: return 0;
+    }
+}
+
+constexpr CUTLASS_HOST_DEVICE int get_element_bits(const MmaKind& mma_kind) {
+    switch (mma_kind) {
+        case MmaKind::BF16:     return 16;
+        case MmaKind::MXFP8FP4: return 8;
+        case MmaKind::MXFP4:    return 4;
+        case MmaKind::NVFP4:    return 4;
+        default: return 0;
+    }
+}
+
+constexpr CUTLASS_HOST_DEVICE int get_sf_gran_k(const MmaKind& mma_kind) {
+    switch (mma_kind) {
+        case MmaKind::MXFP8FP4: return 32;
+        case MmaKind::MXFP4:    return 32;
+        case MmaKind::NVFP4:    return 16;
         default: return 0;
     }
 }
