@@ -29,7 +29,8 @@ import torch.distributed as dist
 from typing import Tuple
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp8, per_token_cast_to_fp4
+from deep_gemm.utils import (per_token_cast_to_fp8, per_token_cast_to_fp4,
+                             per_token_cast_to_nvfp4, transform_ue4m3_sf_into_required_layout)
 from deep_gemm.utils.dist import dist_print, init_dist
 
 
@@ -69,6 +70,11 @@ def _decode_fp4_packed(packed_bytes: torch.Tensor) -> torch.Tensor:
 def _decode_fp8_e4m3(fp8_bytes: torch.Tensor) -> torch.Tensor:
     """Decode (M, N) int8 buffer of FP8 E4M3 to float32."""
     return fp8_bytes.view(torch.float8_e4m3fn).to(torch.float)
+
+
+def _decode_ue4m3(sf_bytes: torch.Tensor) -> torch.Tensor:
+    """Decode UE4M3 SF bytes (NVFP4) — same bit layout as unsigned `float8_e4m3fn`."""
+    return sf_bytes.to(torch.uint8).view(torch.float8_e4m3fn).float()
 
 
 def _decode_ue8m0(sf_bytes: torch.Tensor) -> torch.Tensor:
@@ -156,7 +162,8 @@ def _dequant_l1_acts_fp4(l2_acts_bytes: torch.Tensor,
                          intermediate_hidden: int,
                          num_padded_sf_pool_tokens: int,
                          valid_slots: int,
-                         gran_k: int = 32) -> torch.Tensor:
+                         gran_k: int = 16,
+                         use_ue4m3: bool = True) -> torch.Tensor:
     """Decode the FP4 L1 output bytes from the same symm buffer slot.
 
     Per A0.1's TMA descriptor: only the first `intermediate_hidden / 2` bytes
@@ -169,7 +176,7 @@ def _dequant_l1_acts_fp4(l2_acts_bytes: torch.Tensor,
     decoded = _decode_fp4_packed(raw_bytes)  # (V, I)
     sf = _decode_sf_buffer_to_per_token(
         l2_acts_sf_bytes, num_padded_sf_pool_tokens,
-        intermediate_hidden, valid_slots, gran_k)
+        intermediate_hidden, valid_slots, gran_k, use_ue4m3=use_ue4m3)
     n_blocks = intermediate_hidden // gran_k
     decoded = decoded.view(valid_slots, n_blocks, gran_k)
     sf = sf.view(valid_slots, n_blocks, 1)
@@ -180,7 +187,8 @@ def _decode_sf_buffer_to_per_token(sf_bytes_int32: torch.Tensor,
                                    num_padded_sf_pool_tokens: int,
                                    intermediate_hidden: int,
                                    valid_slots: int,
-                                   gran_k: int) -> torch.Tensor:
+                                   gran_k: int,
+                                   use_ue4m3: bool = False) -> torch.Tensor:
     """Read out per-token-K-block UE8M0 SF bytes from the M-major SF buffer.
 
     The SF buffer in the kernel uses an M-major / per-32-elements layout with a
@@ -220,7 +228,7 @@ def _decode_sf_buffer_to_per_token(sf_bytes_int32: torch.Tensor,
         # word at that token's k_uint slot.
         word = sf_bytes_int32[sf_pool_token_idx, k_uint_idx]   # int32 (V,)
         out[:, kb] = ((word >> (byte_idx * 8)) & 0xFF).to(torch.uint8)
-    return _decode_ue8m0(out)
+    return _decode_ue4m3(out) if use_ue4m3 else _decode_ue8m0(out)
 
 
 def _gather_l2_buffers(buffer):
@@ -255,24 +263,39 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         (num_experts_per_rank,), dtype=torch.int, device='cuda')
 
     # FP8 / FP4 quantizations needed by the kernel
+    fp4_mma_type = args.fp4_mma_type
+    fp4_is_nvfp4 = fp4_mma_type == 'nvfp4xnvfp4'
+    fp4_gran_k = 16 if fp4_is_nvfp4 else 32
     x_fp8 = per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    x_fp4 = per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    x_fp4 = per_token_cast_to_nvfp4(x_bf16, gran_k=16, use_packed_ue4m3=True) if fp4_is_nvfp4 \
+        else per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
-    def cast_grouped_weights_to_fp4(bf16_weights):
+    def cast_grouped_weights_to_fp4(bf16_weights, use_nvfp4: bool):
+        gran_k = 16 if use_nvfp4 else 32
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        w_sf = torch.empty((num_groups, n, k // gran_k), device='cuda', dtype=torch.float)
         for i in range(num_groups):
-            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
-        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+            if use_nvfp4:
+                w[i], w_sf[i] = per_token_cast_to_nvfp4(bf16_weights[i], gran_k=gran_k)
+            else:
+                w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=gran_k)
+        w_sf = transform_ue4m3_sf_into_required_layout(w_sf, n) if use_nvfp4 else \
+            deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, gran_k), num_groups)
         return w, w_sf
 
-    l1_weights_fp4 = cast_grouped_weights_to_fp4(l1_weights_bf16)
-    l2_weights_fp4 = cast_grouped_weights_to_fp4(l2_weights_bf16)
-    transformed_l1_weights, transformed_l2_weights = \
-        deep_gemm.transform_weights_for_mega_moe(l1_weights_fp4, l2_weights_fp4)
+    def transform_weights(mma_type: str):
+        use_nvfp4 = mma_type == 'nvfp4xnvfp4'
+        return deep_gemm.transform_weights_for_mega_moe(
+            cast_grouped_weights_to_fp4(l1_weights_bf16, use_nvfp4),
+            cast_grouped_weights_to_fp4(l2_weights_bf16, use_nvfp4),
+            'swiglu', mma_type)
 
-    def run_once(buffer, x_src):
+    weights_per_arm = {False: transform_weights('fp8xfp4'),
+                       True: transform_weights(fp4_mma_type)}
+
+    def run_once(buffer, x_src, use_fp4_acts: bool = False):
+        transformed_l1_weights, transformed_l2_weights = weights_per_arm[use_fp4_acts]
         buffer.x[:num_tokens].copy_(x_src[0])
         buffer.x_sf[:num_tokens].copy_(x_src[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -284,19 +307,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             transformed_l1_weights, transformed_l2_weights,
             buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            recipe=(1, 1, fp4_gran_k) if use_fp4_acts else (1, 1, 32),
             activation_clamp=activation_clamp,
             fast_math=bool(args.fast_math)
         )
         return y, cumulative_local_expert_recv_stats.clone()
 
-    # Buffer layout depends on DG_USE_FP4_ACTS; set the env before allocating.
     def make_buffer(use_fp4_acts):
-        os.environ['DG_USE_FP4_ACTS'] = '1' if use_fp4_acts else '0'
         os.environ['DG_COMM_KERNEL_DEBUG'] = '0'  # don't zero buffer between calls
         return deep_gemm.get_symm_buffer_for_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden
+            hidden, intermediate_hidden,
+            mma_type=fp4_mma_type if use_fp4_acts else 'fp8xfp4'
         )
 
     # ---- BF16 reference for L1 SwiGLU output (per token×topk) ----
@@ -323,9 +346,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # ---- Run FP4 path (separate buffer, laid out for packed E2M1) ----
     buffer = make_buffer(use_fp4_acts=True)
-    _ = run_once(buffer, x_fp4)
+    _ = run_once(buffer, x_fp4, use_fp4_acts=True)
     torch.cuda.synchronize()
-    y_fp4, recv_stats_fp4 = run_once(buffer, x_fp4)
+    y_fp4, recv_stats_fp4 = run_once(buffer, x_fp4, use_fp4_acts=True)
     torch.cuda.synchronize()
     l2_acts_fp4 = buffer.l2_acts.clone()
     l2_acts_sf_fp4 = buffer.l2_acts_sf.clone()
@@ -417,7 +440,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     fp4_dec = _dequant_l1_acts_fp4(
         l2_acts_fp4, l2_acts_sf_fp4,
         intermediate_hidden, num_padded_sf_pool_tokens,
-        total_local)
+        total_local, gran_k=fp4_gran_k, use_ue4m3=fp4_is_nvfp4)
 
     # Sanity: dump a few raw bytes from each path so we can compare visually
     # if the harness misaligns.
@@ -488,6 +511,9 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=2)
     parser.add_argument('--activation-clamp', type=float, default=10.0)
     parser.add_argument('--fast-math', type=int, default=1)
+    parser.add_argument('--fp4-mma-type', type=str, default='nvfp4xnvfp4',
+                        choices=('nvfp4xnvfp4', 'mxf4xmxf4'),
+                        help='MMA type for the FP4-acts arm')
     args = parser.parse_args()
 
     num_processes = args.num_processes

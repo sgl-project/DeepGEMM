@@ -38,7 +38,8 @@ import torch
 import torch.distributed as dist
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp8, per_token_cast_to_fp4
+from deep_gemm.utils import (per_token_cast_to_fp8, per_token_cast_to_fp4,
+                             per_token_cast_to_nvfp4, transform_ue4m3_sf_into_required_layout)
 from deep_gemm.utils.dist import dist_print, init_dist
 
 
@@ -88,36 +89,49 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     cumulative = torch.zeros((num_experts_per_rank,), dtype=torch.int, device='cuda')
-    x_fp8 = per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-    x_fp4 = per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    x_src_by_type = {
+        'fp8xfp4': per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True),
+        'nvfp4xnvfp4': per_token_cast_to_nvfp4(x_bf16, gran_k=16, use_packed_ue4m3=True),
+        'mxf4xmxf4': per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True),
+    }
 
-    def cast_grouped_weights_to_fp4(bf16_weights):
+    def cast_grouped_weights_to_fp4(bf16_weights, mma_type: str):
+        use_nvfp4 = mma_type == 'nvfp4xnvfp4'
+        gran_k = 16 if use_nvfp4 else 32
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        w_sf = torch.empty((num_groups, n, k // gran_k), device='cuda', dtype=torch.float)
         for i in range(num_groups):
-            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
-        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+            if use_nvfp4:
+                w[i], w_sf[i] = per_token_cast_to_nvfp4(bf16_weights[i], gran_k=gran_k)
+            else:
+                w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=gran_k)
+        w_sf = transform_ue4m3_sf_into_required_layout(w_sf, n) if use_nvfp4 else \
+            deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, gran_k), num_groups)
         return w, w_sf
 
-    l1_weights_fp4 = cast_grouped_weights_to_fp4(l1_weights_bf16)
-    l2_weights_fp4 = cast_grouped_weights_to_fp4(l2_weights_bf16)
-    transformed_l1_weights, transformed_l2_weights = \
-        deep_gemm.transform_weights_for_mega_moe(l1_weights_fp4, l2_weights_fp4)
+    # Each arm quantizes weights to its own SF granularity: per-32 UE8M0 for
+    # `fp8xfp4`/`mxf4xmxf4`, per-16 UE4M3 for `nvfp4xnvfp4`.
+    def transform_weights(mma_type: str):
+        return deep_gemm.transform_weights_for_mega_moe(
+            cast_grouped_weights_to_fp4(l1_weights_bf16, mma_type),
+            cast_grouped_weights_to_fp4(l2_weights_bf16, mma_type),
+            'swiglu', mma_type)
 
-    # Stream A0.0b: under `DG_USE_FP4_ACTS=1`, the symm buffer's `x` slot is
-    # sized for packed E2M1 (`hidden/2` bytes/token) — different from FP8.
-    # Allocate the buffer separately for each path and feed it the matching
-    # source tensor.
-    def make_buffer_and_run(use_fp4_acts: bool):
-        os.environ['DG_USE_FP4_ACTS'] = '1' if use_fp4_acts else '0'
+    # FP4-acts kinds make the symm buffer's `x` slot packed E2M1 (`hidden/2`
+    # bytes/token), while `fp8xfp4` retains FP8 activations.
+    # Allocate the buffer separately for each path and feed it the matching source tensor.
+    def make_buffer_and_run(mma_type: str):
         os.environ['DG_COMM_KERNEL_DEBUG'] = '0'
         buf = deep_gemm.get_symm_buffer_for_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden
+            hidden, intermediate_hidden,
+            mma_type=mma_type
         )
-        x_src = x_fp4 if use_fp4_acts else x_fp8
+        x_src = x_src_by_type[mma_type]
+        transformed_l1_weights, transformed_l2_weights = transform_weights(mma_type)
+        recipe = (1, 1, 16) if mma_type == 'nvfp4xnvfp4' else (1, 1, 32)
 
         def run_once():
             buf.x[:num_tokens].copy_(x_src[0])
@@ -129,6 +143,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.fp8_fp4_mega_moe(
                 y, transformed_l1_weights, transformed_l2_weights, buf,
                 cumulative_local_expert_recv_stats=cumulative,
+                recipe=recipe,
                 activation_clamp=activation_clamp,
                 fast_math=bool(args.fast_math)
             )
@@ -141,47 +156,48 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buf.destroy()
         return y_out
 
-    # Run FP8-acts first (warmup + measurement).
-    y_fp8 = make_buffer_and_run(use_fp4_acts=False)
-    # Run FP4-acts (separate buffer because the `x` slot footprint changes).
-    y_fp4 = make_buffer_and_run(use_fp4_acts=True)
-
-    # End-to-end y comparison: this is the source of truth (no slot
-    # permutation ambiguity since y is indexed by global (token, hidden)).
-    y_diff = (y_fp4.float() - y_fp8.float()).abs()
-    y_rmse = y_diff.pow(2).mean().sqrt().item()
+    # Run FP8-acts first (warmup + measurement), then each FP4-acts kind
+    # (separate buffers because the `x` slot footprint changes).
+    y_fp8 = make_buffer_and_run('fp8xfp4')
     y_fp8_rms = y_fp8.float().pow(2).mean().sqrt().item()
-    rel_rmse = y_rmse / max(y_fp8_rms, 1e-12)
-
-    dist_print(f'=== A0.2.1 sentinel — y rel-RMSE (FP4 vs FP8 acts) ===',
-               once_in_node=True)
-    dist_print(f'  y_fp8 RMS:        {y_fp8_rms:.4f}', once_in_node=True)
-    dist_print(f'  y_rmse:           {y_rmse:.4f}', once_in_node=True)
-    dist_print(f'  rel-RMSE:         {rel_rmse:.4f}', once_in_node=True)
-    max_rel_rmse = args.max_rel_rmse
     y_fp8_mag = y_fp8.float().abs().mean().item()
-    y_fp4_mag = y_fp4.float().abs().mean().item()
+    max_rel_rmse = args.max_rel_rmse
 
-    dist_print(f'  y_fp8 mean|.|:    {y_fp8_mag:.4f}', once_in_node=True)
-    dist_print(f'  y_fp4 mean|.|:    {y_fp4_mag:.4f}', once_in_node=True)
-    dist_print(f'  target:           <= {max_rel_rmse:.2f} (layout sentinel)',
-               once_in_node=True)
-    dist_print(f'  verdict:          {"PASS" if rel_rmse <= max_rel_rmse else "FAIL"}',
-               once_in_node=True)
+    for mma_type in ('nvfp4xnvfp4', 'mxf4xmxf4'):
+        y_fp4 = make_buffer_and_run(mma_type)
 
-    # Spot-check first row to make the failure mode legible if it ever
-    # comes back: matched values at low N indices = layout correct;
-    # garbage = layout broken.
-    dist_print(f'\n  y_fp8 [0, :8]:  {y_fp8[0, :8].cpu().tolist()}',
-               once_in_node=True)
-    dist_print(f'  y_fp4 [0, :8]:  {y_fp4[0, :8].cpu().tolist()}',
-               once_in_node=True)
+        # End-to-end y comparison: this is the source of truth (no slot
+        # permutation ambiguity since y is indexed by global (token, hidden)).
+        y_diff = (y_fp4.float() - y_fp8.float()).abs()
+        y_rmse = y_diff.pow(2).mean().sqrt().item()
+        rel_rmse = y_rmse / max(y_fp8_rms, 1e-12)
+        y_fp4_mag = y_fp4.float().abs().mean().item()
 
-    assert torch.isfinite(y_fp4).all(), 'FP4 output contains NaN/Inf'
-    assert y_fp8_mag * 0.5 < y_fp4_mag < y_fp8_mag * 2.0, \
-        f'FP4 magnitude miscalibrated: |y_fp4|={y_fp4_mag} vs |y_fp8|={y_fp8_mag}'
-    assert rel_rmse <= max_rel_rmse, \
-        f'A0.2.1 layout regression: y rel-RMSE {rel_rmse:.4f} > {max_rel_rmse:.2f}'
+        dist_print(f'=== A0.2.1 sentinel — y rel-RMSE ({mma_type} vs FP8 acts) ===',
+                   once_in_node=True)
+        dist_print(f'  y_fp8 RMS:        {y_fp8_rms:.4f}', once_in_node=True)
+        dist_print(f'  y_rmse:           {y_rmse:.4f}', once_in_node=True)
+        dist_print(f'  rel-RMSE:         {rel_rmse:.4f}', once_in_node=True)
+        dist_print(f'  y_fp8 mean|.|:    {y_fp8_mag:.4f}', once_in_node=True)
+        dist_print(f'  y_fp4 mean|.|:    {y_fp4_mag:.4f}', once_in_node=True)
+        dist_print(f'  target:           <= {max_rel_rmse:.2f} (layout sentinel)',
+                   once_in_node=True)
+        dist_print(f'  verdict:          {"PASS" if rel_rmse <= max_rel_rmse else "FAIL"}',
+                   once_in_node=True)
+
+        # Spot-check first row to make the failure mode legible if it ever
+        # comes back: matched values at low N indices = layout correct;
+        # garbage = layout broken.
+        dist_print(f'\n  y_fp8 [0, :8]:  {y_fp8[0, :8].cpu().tolist()}',
+                   once_in_node=True)
+        dist_print(f'  y_fp4 [0, :8]:  {y_fp4[0, :8].cpu().tolist()}',
+                   once_in_node=True)
+
+        assert torch.isfinite(y_fp4).all(), f'{mma_type} output contains NaN/Inf'
+        assert y_fp8_mag * 0.5 < y_fp4_mag < y_fp8_mag * 2.0, \
+            f'{mma_type} magnitude miscalibrated: |y_fp4|={y_fp4_mag} vs |y_fp8|={y_fp8_mag}'
+        assert rel_rmse <= max_rel_rmse, \
+            f'A0.2.1 layout regression ({mma_type}): y rel-RMSE {rel_rmse:.4f} > {max_rel_rmse:.2f}'
 
     dist.barrier()
     dist.destroy_process_group()

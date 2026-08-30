@@ -7,7 +7,8 @@ import torch.distributed as dist
 from typing import Tuple
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import (per_token_cast_to_fp4, per_token_cast_to_fp8, per_token_cast_to_nvfp4,
+                             transform_ue4m3_sf_into_required_layout)
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto
 
@@ -18,6 +19,7 @@ def import_baseline():
     # noinspection PyBroadException
     try:
         import deep_ep
+        assert hasattr(deep_ep, 'ElasticBuffer'), 'deep_ep has no ElasticBuffer (DeepEP v2 required)'
         import importlib.util
         from tilelang.profiler.bench import do_bench
         spec = importlib.util.spec_from_file_location(
@@ -42,6 +44,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    use_nvfp4 = args.mma_type == 'nvfp4xnvfp4'
+    gran_k = 16 if use_nvfp4 else 32
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -55,17 +59,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        activation=args.activation
     )
 
     # Cast weights into FP4
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        w_sf = torch.empty((num_groups, n, k // gran_k), device='cuda', dtype=torch.float)
         for i in range(num_groups):
-            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
-        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+            if use_nvfp4:
+                w[i], w_sf[i] = per_token_cast_to_nvfp4(bf16_weights[i], gran_k=gran_k)
+            else:
+                w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=gran_k)
+        w_sf = transform_ue4m3_sf_into_required_layout(w_sf, n) if use_nvfp4 else \
+            deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, gran_k), num_groups)
         return w, w_sf
 
     # Create inputs
@@ -96,7 +105,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Stream A0.0b: when the flag is on, the symm buffer's `x` slot is sized
             # for packed E2M1 (`hidden/2` bytes/token), so we must quantize at the
             # source to match.
-            if os.environ.get('DG_USE_FP4_ACTS', '0') != '0':
+            if use_nvfp4:
+                x = per_token_cast_to_nvfp4(x, gran_k=gran_k, use_packed_ue4m3=True)
+            elif args.mma_type == 'mxf4xmxf4':
                 x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
             else:
                 x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
@@ -105,7 +116,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l2_weights = _cast_weights_to_fp4(l2_weights)
 
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights, args.activation, args.mma_type))
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -123,8 +134,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
-            activation_clamp=args.activation_clamp,
+            activation=args.activation,
+            activation_clamp=args.activation_clamp if args.activation != 'situ' else None,
             fast_math=bool(args.fast_math))
+        if not is_bf16xbf16:
+            kernel_kwargs['recipe'] = (1, 1, gran_k)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
@@ -209,10 +223,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Combine
             return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
 
-    # Check correctness (must be bitwise identical)
+    # Check correctness (must be bitwise identical).
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
+    can_compare_bitwise = is_bf16xbf16 or args.mma_type == 'fp8xfp4'
+    if is_legacy_loaded and num_correctness_tests > 0 and not can_compare_bitwise:
+        dist_print(f'Skipping bitwise correctness vs legacy baseline (FP8-acts only, '
+                   f'undefined for `{args.mma_type}`)', once_in_node=True)
     # noinspection PyBroadException
-    if is_legacy_loaded and num_correctness_tests > 0:
+    if is_legacy_loaded and num_correctness_tests > 0 and can_compare_bitwise:
         dist_print('Running correctness tests:', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
@@ -299,7 +317,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4',
+                        choices=('fp8xfp4', 'mxf4xmxf4', 'nvfp4xnvfp4', 'bf16xbf16'), help='MMA type')
+    parser.add_argument('--activation', type=str, default='swiglu', choices=('swiglu', 'situ', 'swigluoai'),
+                        help='Activation: swiglu, situ, or swigluoai')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

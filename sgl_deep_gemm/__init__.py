@@ -269,9 +269,11 @@ from .mega import (
     SymmBuffer,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    nvfp4_mega_moe,
     bf16_mega_moe,
     mega_moe_pre_dispatch,
     mega_moe_pre_dispatch_sm90,
+    get_block_m_for_mega_moe,
 )
 
 

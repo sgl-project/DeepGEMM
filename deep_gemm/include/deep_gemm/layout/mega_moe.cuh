@@ -4,6 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 
 namespace deep_gemm::layout {
 
@@ -474,6 +475,11 @@ struct MegaMoEBuffer {
            combine_token_buffer,
            combine_sf_buffer;
 
+    // Optional per-token FP32 outer scales for the L1 (fc13) input, applied on
+    // the L1 accumulator before activation.
+    Buffer input_x_scales_buffer,
+           l1_x_scales_buffer;
+
     CUTLASS_HOST_DEVICE
     MegaMoEBuffer(void* base,
                   const uint32_t& hidden,
@@ -484,10 +490,10 @@ struct MegaMoEBuffer {
                   const uint32_t& num_topk,
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
-                  const bool& with_sf,
+                  const MmaKind& mma_kind,
                   const uint32_t& num_shared_experts = 0,
-                  const bool& use_fp4_acts = false,
                   const bool& use_fp8_combine = false) {
+        const bool with_sf = get_sf_gran_k(mma_kind) != 0;
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -497,21 +503,25 @@ struct MegaMoEBuffer {
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // Layouts
-        const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(
-            use_fp4_acts ? hidden / 2 : hidden * num_mma_elem_bytes);
+        const uint32_t elem_bits = get_element_bits(mma_kind);
+        // NOTE: multiply before dividing — `elem_bits / 8` truncates to 0 for the
+        // 4-bit kinds (NVFP4/MXFP4), which would zero-size every activation slot.
+        const auto num_token_bytes = [=](const uint32_t& num_elems) { return num_elems * elem_bits / 8; };
+        const uint32_t gran_k = with_sf ? get_sf_gran_k(mma_kind) : 1;
+        const auto input_token_layout = layout::Data(num_token_bytes(hidden));
         const auto combine_token_layout = layout::Data(
             use_fp8_combine ? hidden : hidden * 2);
         const auto combine_sf_layout = layout::Data(
             use_fp8_combine ? hidden / 128 : 0, false);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0);
+        const auto intermediate_token_layout = layout::Data(num_token_bytes(intermediate_hidden));
+        const auto shared_intermediate_token_layout = layout::Data(num_token_bytes(shared_intermediate_hidden));
+        const auto input_sf_layout = layout::Data(with_sf ? hidden / gran_k : 0);
+        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / gran_k : 0);
+        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / gran_k : 0);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+        const auto x_scale_layout = layout::Data(sizeof(float), false);
 
         // Input buffers
         input_token_buffer = Buffer(
@@ -566,11 +576,18 @@ struct MegaMoEBuffer {
         combine_sf_buffer = Buffer(
             combine_sf_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             combine_token_buffer.get_end_ptr());
+
+        input_x_scales_buffer = Buffer(
+            x_scale_layout, 1, num_max_tokens_per_rank,
+            combine_sf_buffer.get_end_ptr());
+        l1_x_scales_buffer = Buffer(
+            x_scale_layout, 1, num_ring_tokens,
+            input_x_scales_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_sf_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(l1_x_scales_buffer.get_end_ptr())
                - static_cast<uint8_t*>(workspace.base);
     }
 };

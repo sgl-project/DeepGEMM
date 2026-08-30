@@ -145,7 +145,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Cast inputs to FP8/FP4 with per-32 UE8M0 SF. FP4 activations
             # remain routed-expert-only; shared experts retain upstream FP8.
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
-            use_fp4_acts = (os.environ.get('DG_USE_FP4_ACTS', '0') != '0'
+            # FP4 activations are selected by the buffer's `mma_type`
+            # (`mxf4xmxf4` / `nvfp4xnvfp4`), not by an env var, and remain a
+            # routed-expert-only path.
+            use_fp4_acts = (args.mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4')
                             and num_shared_experts == 0)
             if use_fp4_acts:
                 x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
@@ -165,8 +168,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
 
+        # NOTES: the routed weights must be interleaved for the buffer's own MMA kind
+        # (the FP4 kinds need the packed gate/up interleave); the shared-expert weights
+        # stay FP8 and therefore keep the default `fp8xfp4` interleave.
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights,
+                                                     mma_type=args.mma_type))
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
                 deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))

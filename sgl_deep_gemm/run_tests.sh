@@ -156,6 +156,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_situ.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
+  test_mega_moe_nvfp4_alphas.py
   test_mega_moe_pre_dispatch.py
 )
 MEGA_MOE_HOPPER=(

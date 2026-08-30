@@ -135,13 +135,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert len(kernel_sources) == 2
     assert any(
         re.search(
-            r"cute::numeric_limits<float>::infinity\(\),\s+true,\s+true,",
+            r"cute::numeric_limits<float>::infinity\(\),\s+0x0p[+-]\d+f,\s+true,\s+true",
             source,
         )
         for source in kernel_sources
     ), "explicit SiTU did not instantiate kUseSitu=true"
     assert any(
-        re.search(r"0x1p-5f,\s+false,\s+true,", source) for source in kernel_sources
+        re.search(r"0x1p-5f,\s+0x0p[+-]\d+f,\s+false,\s+true", source) for source in kernel_sources
     ), "activation_clamp=0.03125 still instantiated kUseSitu=true"
 
     try:
