@@ -57,7 +57,8 @@ def _run_one(use_fp4_acts: bool, args: argparse.Namespace) -> None:
     deep_gemm.mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
-        num_tokens=M, group_size=G, use_fp4_acts=use_fp4_acts,
+        num_tokens=M, group_size=G,
+        mma_type='mxf4xmxf4' if use_fp4_acts else 'fp8xfp4',
     )
     torch.cuda.synchronize()
 

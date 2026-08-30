@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda/std/cstdint>
+#include <cuda_fp8.h>
 #include <deep_gemm/common/compile.cuh>
 #include <deep_gemm/common/exception.cuh>
 
@@ -110,6 +111,31 @@ CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv, uint2& sf_bits) {
+    constexpr float kInvMax = 1.0f / 6.0f;
+    const __nv_fp8_e4m3 qx(amax.x * kInvMax), qy(amax.y * kInvMax);
+    sf_bits = {qx.__x, qy.__x};
+    sf = {static_cast<float>(qx), static_cast<float>(qy)};
+    sf_inv.x = sf.x > 0.0f ? __frcp_rn(sf.x) : 0.0f;
+    sf_inv.y = sf.y > 0.0f ? __frcp_rn(sf.y) : 0.0f;
+}
+
+
+CUTLASS_DEVICE uint32_t cast_into_e2m1x2_pairs(const float2& lower, const float2& upper) {
+    uint32_t packed;
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        ".reg .b8 byte1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, %3, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %2;\n\t"
+        "mov.b32 %0, {byte0, byte1, byte0, byte1};\n\t"
+        "}\n"
+        : "=r"(packed)
+        : "f"(lower.x), "f"(lower.y), "f"(upper.x), "f"(upper.y));
+    return packed;
 }
 
 // Pack two FP32 values into one FP4 (E2M1) byte: lower nibble = a, upper = b.
