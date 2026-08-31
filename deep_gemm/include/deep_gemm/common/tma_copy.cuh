@@ -19,7 +19,8 @@ template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
 CUTLASS_DEVICE void
 copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
      dtype_t* smem_ptr, const uint32_t& inner_idx, const uint32_t& outer_idx,
-     const uint32_t& num_tma_multicast = 1, const uint32_t& batch_idx = 0) {
+     const uint32_t& num_tma_multicast = 1, const uint32_t& batch_idx = 0,
+     const uint64_t& cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)) {
     DG_STATIC_ASSERT(static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL) ==
                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL), "Invalid cache hint");
     constexpr uint32_t BLOCK_INNER_ATOM = get_inner_block_atom_size<BLOCK_INNER, kSwizzleMode, dtype_t>();
@@ -29,7 +30,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
             #pragma unroll
             for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                 cute::SM90_TMA_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
-                                             static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                             cache_hint,
                                              smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
                                              inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
             }
@@ -39,7 +40,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                 #pragma unroll
                 for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                     cute::SM100_TMA_2SM_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
-                                                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                                      cache_hint,
                                                       smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
                                                       inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
                 }
