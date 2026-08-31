@@ -484,23 +484,10 @@ sm90_fp8_mega_moe_impl(void* y,
     // =====================================================================
     // Scheduler (cluster=1)
     // =====================================================================
-    constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
-    constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
     constexpr uint32_t kNumSharedL1BlockNs = SHARED_L1_SHAPE_N / BLOCK_N;
-    constexpr uint32_t kNumSharedL1BlockKs = SHARED_L1_SHAPE_K / BLOCK_K;
-    constexpr uint32_t kNumSharedL2BlockKs = SHARED_L2_SHAPE_K / BLOCK_K;
     // The shared L2 N shape equals the routed one, which the scheduler already checks
     DG_STATIC_ASSERT(not kHasSharedExperts or kNumSharedL1BlockNs > 0,
                      "BLOCK_N is too large for the shared-expert L1 shape");
-    // Number of K blocks for a task of the given phase
-    const auto get_num_k_blocks = [](const sched::BlockPhase& block_phase) -> uint32_t {
-        switch (block_phase) {
-            case sched::BlockPhase::Linear1:       return kNumL1BlockKs;
-            case sched::BlockPhase::Linear2:       return kNumL2BlockKs;
-            case sched::BlockPhase::SharedLinear1: return kNumSharedL1BlockKs;
-            default:                               return kNumSharedL2BlockKs;
-        }
-    };
     SchedulerT scheduler(workspace, task_info_full_barriers, task_info_empty_barriers, task_infos);
 
     // Pipeline state shared by TMA loaders and math warpgroups
@@ -864,13 +851,13 @@ sm90_fp8_mega_moe_impl(void* y,
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        auto process_a_sfa_block = [&](const auto& block_phase,
-                                       const uint32_t& local_expert_idx,
-                                       const uint32_t& num_k_blocks,
-                                       const uint32_t& m_block_idx, const uint32_t& n_block_idx,
-                                       const uint32_t& valid_m, const uint32_t& pool_block_idx) {
-            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
-            const bool is_l1 = sched::is_l1_phase(block_phase);
+        auto process_a_sfa_block = [&](const auto& task_info) {
+            const auto block_phase = task_info.block_phase;
+            const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+            const auto valid_m = task_info.valid_m;
+            const auto pool_block_idx = task_info.pool_block_idx;
+            const bool is_shared = task_info.is_shared();
+            const bool is_l1 = task_info.is_l1();
             // Shared L1 reads the local `x` directly; shared L2 reads the post-SwiGLU
             // shared pool written by the L1 epilogue. Shared activation SF is read from
             // global memory by the math warps, so no SFA descriptor is needed for it.
@@ -993,23 +980,20 @@ sm90_fp8_mega_moe_impl(void* y,
 
         typename SchedulerT::task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            process_a_sfa_block(task_info.block_phase, task_info.local_expert_idx,
-                                get_num_k_blocks(task_info.block_phase),
-                                task_info.m_block_idx, task_info.n_cluster_idx,
-                                task_info.valid_m, task_info.pool_block_idx);
+            process_a_sfa_block(task_info);
         }
     
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
-        auto process_b_block = [&](const sched::BlockPhase& block_phase,
-                                   const uint32_t& local_expert_idx,
-                                   const uint32_t& num_k_blocks,
-                                   const uint32_t& n_block_idx,
-                                   const uint32_t& shape_n) {
-            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
-            const bool is_l1 = sched::is_l1_phase(block_phase);
+        auto process_b_block = [&](const auto& task_info) {
+            const auto local_expert_idx = task_info.local_expert_idx;
+            const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+            const auto n_block_idx = task_info.n_cluster_idx;
+            const auto shape_n = task_info.shape_n;
+            const bool is_shared = task_info.is_shared();
+            const bool is_l1 = task_info.is_l1();
             const auto tensor_map_b_ptr = is_shared
                 ? (is_l1 ? &tensor_map_shared_l1_weights : &tensor_map_shared_l2_weights)
                 : (is_l1 ? &tensor_map_l1_weights : &tensor_map_l2_weights);
@@ -1048,9 +1032,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
         typename SchedulerT::task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            process_b_block(task_info.block_phase, task_info.local_expert_idx,
-                            get_num_k_blocks(task_info.block_phase),
-                            task_info.n_cluster_idx, task_info.shape_n);
+            process_b_block(task_info);
         }
     
 
@@ -1097,11 +1079,14 @@ sm90_fp8_mega_moe_impl(void* y,
         // Sync with dispatch in the full communication path.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        auto process_math_block = [&](const auto& block_phase,
-                                      const uint32_t& local_expert_idx,
-                                      const uint32_t& num_k_blocks,
-                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
-                                      const uint32_t& valid_m, const uint32_t& pool_block_idx) {
+        auto process_math_block = [&](const auto& task_info) {
+            const auto local_expert_idx = task_info.local_expert_idx;
+            const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+            const auto n_block_idx = task_info.n_cluster_idx;
+            const auto valid_m = task_info.valid_m;
+            const auto pool_block_idx = task_info.pool_block_idx;
+            const bool is_shared = task_info.is_shared();
+            const bool is_l1 = task_info.is_l1();
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             const uint32_t n_idx = n_block_idx * BLOCK_N;
             const uint32_t epilogue_wg_m_idx = epilogue_wg_idx / kWarpgroupSplitN;
@@ -1125,11 +1110,10 @@ sm90_fp8_mega_moe_impl(void* y,
             const bool valid_r1 = row_offset_r1 < valid_m;
 
             // Fused shared expert: a single dense MLP over this rank's own tokens.
-            // `is_shared` folds to a compile-time false when the feature is off.
-            const bool is_shared = kHasSharedExperts and sched::is_shared_phase(block_phase);
-            const bool is_l1 = sched::is_l1_phase(block_phase);
-            // Shared tiles always publish their L1 arrivals through a counter and never
-            // need the CTA-wide L2 epilogue sync; the routed modes are compile-time.
+            // `is_shared`/`is_l1` are derived from `task_info` at the top; `is_shared`
+            // folds to a compile-time false when the feature is off. Shared tiles
+            // always publish their L1 arrivals through a counter and never need the
+            // CTA-wide L2 epilogue sync; the routed modes are compile-time.
             const bool use_arrival_counter = kL2ArrivalCounter or is_shared;
             const bool needs_l2_full_sync = kL2EpilogueRequiresFullSync and not is_shared;
 
@@ -2368,10 +2352,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
         typename SchedulerT::task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            process_math_block(task_info.block_phase, task_info.local_expert_idx,
-                               get_num_k_blocks(task_info.block_phase),
-                               task_info.m_block_idx, task_info.n_cluster_idx,
-                               task_info.valid_m, task_info.pool_block_idx);
+            process_math_block(task_info);
         }
     
 

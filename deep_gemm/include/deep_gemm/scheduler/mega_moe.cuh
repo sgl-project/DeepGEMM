@@ -88,18 +88,11 @@ enum class BlockPhase : uint32_t {
     SharedLinear2 = 4
 };
 
-// The L1-like phases read per-128-K activation SF and run the SwiGLU + FP8-quantize
-// epilogue; the L2-like phases read per-64-K SF and scatter BF16 into the combine
-// buffer. Both helpers also accept the `std::integral_constant<BlockPhase, ...>`
-// form used by the compile-time split-phase hot path.
-CUTLASS_HOST_DEVICE constexpr bool is_l1_phase(const BlockPhase& block_phase) {
-    return block_phase == BlockPhase::Linear1 or block_phase == BlockPhase::SharedLinear1;
-}
-
-CUTLASS_HOST_DEVICE constexpr bool is_shared_phase(const BlockPhase& block_phase) {
-    return block_phase == BlockPhase::SharedLinear1 or block_phase == BlockPhase::SharedLinear2;
-}
-
+// The L1-like phases (Linear1 / SharedLinear1) read per-128-K activation SF and
+// run the SwiGLU + FP8-quantize epilogue; the L2-like phases (Linear2 /
+// SharedLinear2) read per-64-K SF and scatter BF16 into the combine buffer. The
+// Shared* variants are the fused shared-expert counterparts of Linear1/Linear2.
+// Phase membership is queried through `TaskInfo::is_l1()` / `TaskInfo::is_shared()`.
 template <bool kHasSharedExperts>
 struct alignas(16) TaskInfo {
     BlockPhase block_phase;
@@ -142,6 +135,11 @@ struct alignas(16) TaskInfo {
 
     CUTLASS_DEVICE uint32_t is_shared() const {
         return kHasSharedExperts ? (block_phase > BlockPhase::Linear2) : false;
+    }
+
+    // True for both routed and shared L1 phases (SwiGLU + FP8-quantize epilogue).
+    CUTLASS_DEVICE uint32_t is_l1() const {
+        return (block_phase == BlockPhase::Linear1) or (block_phase == BlockPhase::SharedLinear1);
     }
 };
 
