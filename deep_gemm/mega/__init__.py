@@ -216,20 +216,14 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
-                     use_x_scales: Optional[bool] = None,
+                     use_x_scales: bool = False,
                      l1_alphas: Optional[torch.Tensor] = None,
                      l2_alphas: Optional[torch.Tensor] = None,
                      l2_act_scales: Optional[torch.Tensor] = None):
-    # NVFP4 activations always have a per-token FP32 outer scale.  Derive the
-    # only valid setting from the buffer type so a default call cannot silently
-    # discard that scale (or read an uninitialized scale buffer for other MMAs).
-    uses_nvfp4 = sym_buffer.mma_type == 'nvfp4xnvfp4'
-    if use_x_scales is None:
-        use_x_scales = uses_nvfp4
-    elif use_x_scales != uses_nvfp4:
+    if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
-            '`use_x_scales` must be enabled exactly for `nvfp4xnvfp4`; '
-            f'got {use_x_scales=} with mma_type={sym_buffer.mma_type!r}'
+            '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
+            f'got mma_type={sym_buffer.mma_type!r}'
         )
 
     (l1_weights_data, l1_weights_sf) = l1_weights
@@ -262,7 +256,7 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    activation: str = 'swiglu',
                    activation_clamp: Optional[float] = None,
                    fast_math: bool = True,
-                   use_x_scales: Optional[bool] = None,
+                   use_x_scales: bool = False,
                    l1_alphas: Optional[torch.Tensor] = None,
                    l2_alphas: Optional[torch.Tensor] = None,
                    l2_act_scales: Optional[torch.Tensor] = None):

@@ -221,7 +221,7 @@ static void fp8_fp4_mega_moe(
         DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(rk) + " does not match `" +
                             mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
-    DG_HOST_ASSERT(use_x_scales == (mma_kind == MmaKind::NVFP4));
+    DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
                    (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());

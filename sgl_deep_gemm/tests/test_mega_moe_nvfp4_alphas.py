@@ -145,8 +145,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         deep_gemm.fp8_fp4_mega_moe(
             y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
             recipe=(1, 1, GRAN_K), activation='swiglu', fast_math=bool(args.fast_math),
-            # The NVFP4 wrapper must select per-token x scales by default.
-            l1_alphas=l1_alphas, l2_alphas=l2_alphas,
+            use_x_scales=True, l1_alphas=l1_alphas, l2_alphas=l2_alphas,
             l2_act_scales=l2_act_scales)
         dist.barrier()
         torch.cuda.synchronize()

@@ -227,6 +227,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
+    constexpr uint64_t kActsCacheHint = static_cast<uint64_t>(BLOCK_M <= 128 ?
+        cute::TMA::CacheHintSm100::EVICT_LAST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
+
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
@@ -836,7 +839,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                        tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2, 0, kActsCacheHint);
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
