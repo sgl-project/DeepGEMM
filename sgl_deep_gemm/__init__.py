@@ -291,7 +291,8 @@ class SM90SymmBuffer:
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 num_shared_experts: int = 0):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group
@@ -300,12 +301,17 @@ class SM90SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        # Fused shared expert (SM90 only). 0 disables it and keeps
+        # the symmetric-buffer layout byte-identical to the routed-only path.
+        self.num_shared_experts = num_shared_experts
+        self.shared_intermediate_hidden = intermediate_hidden * num_shared_experts
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            use_fp8_dispatch, activation
+            use_fp8_dispatch, activation,
+            num_shared_experts
         )
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
@@ -314,7 +320,8 @@ class SM90SymmBuffer:
         torch.cuda.synchronize()
 
         (x, x_sf, topk_idx, topk_weights,
-         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = slice_input_buffers(self.buffer)
+         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+         shared_l2_acts, shared_l2_acts_sf) = slice_input_buffers(self.buffer)
         self.x = _from_dlpack_if_needed(x, torch.float8_e4m3fn)
         self.x_sf = _from_dlpack_if_needed(x_sf)
         self.topk_idx = _from_dlpack_if_needed(topk_idx)
@@ -323,6 +330,15 @@ class SM90SymmBuffer:
         self.l1_acts_sf = _from_dlpack_if_needed(l1_acts_sf)
         self.l2_acts = _from_dlpack_if_needed(l2_acts, torch.float8_e4m3fn)
         self.l2_acts_sf = _from_dlpack_if_needed(l2_acts_sf)
+        # The fused shared expert reads its L1 activations from the same `x` region;
+        # only the post-SwiGLU pool and its SF are extra buffers (zero-sized when the
+        # shared expert is disabled).
+        self.shared_l1_acts = self.x
+        self.shared_l1_acts_sf = self.x_sf
+        shared_l2_acts = _from_dlpack_if_needed(shared_l2_acts, torch.float8_e4m3fn)
+        shared_l2_acts_sf = _from_dlpack_if_needed(shared_l2_acts_sf)
+        self.shared_l2_acts = shared_l2_acts if num_shared_experts > 0 else None
+        self.shared_l2_acts_sf = shared_l2_acts_sf if num_shared_experts > 0 else None
 
     def destroy(self):
         self.handle = None
@@ -330,6 +346,10 @@ class SM90SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.shared_l1_acts = None
+        self.shared_l1_acts_sf = None
+        self.shared_l2_acts = None
+        self.shared_l2_acts_sf = None
 
 
 def get_symm_buffer_for_sm90_mega_moe(group,
@@ -337,7 +357,8 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
-                                      activation: str = 'swiglu') -> SM90SymmBuffer:
+                                      activation: str = 'swiglu',
+                                      num_shared_experts: int = 0) -> SM90SymmBuffer:
     from .utils.math import align
 
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
@@ -345,7 +366,8 @@ def get_symm_buffer_for_sm90_mega_moe(group,
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
+        use_fp8_dispatch, activation,
+        num_shared_experts
     )
 
 
@@ -356,7 +378,8 @@ def get_symm_buffer_for_mega_moe(group,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu'):
+                                 activation: str = 'swiglu',
+                                 num_shared_experts: int = 0):
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
@@ -365,8 +388,10 @@ def get_symm_buffer_for_mega_moe(group,
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            True, activation
+            True, activation,
+            num_shared_experts
         )
+    assert num_shared_experts == 0, 'Shared experts are only wired through the SM90 buffer'
     return mega.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -378,20 +403,39 @@ def get_symm_buffer_for_mega_moe(group,
     )
 
 
+def _interleave_gate_up_sm90(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Interleave the gate/up halves of an L1 weight (or its SF) along N.
+
+    Handles the routed `(G, 2*N, ...)` layout and the shared expert's dense
+    `(2*N, ...)` one, which the kernel's weight-SF indexing assumes for both.
+    """
+    if t.dim() == 2:
+        return _interleave_gate_up_sm90(t.unsqueeze(0), gran).squeeze(0)
+    g, n, *rest = t.shape
+    half = n // 2
+    gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+    up = t[:, half:].reshape(g, half // gran, gran, *rest)
+    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+
+
 def transform_weights_for_mega_moe_sm90(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor]
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     l1_fp8, l1_sf = l1_weights
+    return (_interleave_gate_up_sm90(l1_fp8), l1_sf), l2_weights
 
-    def _interleave_one(t, gran: int = 8) -> torch.Tensor:
-        g, n, *rest = t.shape
-        half = n // 2
-        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
-        up = t[:, half:].reshape(g, half // gran, gran, *rest)
-        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
 
-    return (_interleave_one(l1_fp8), l1_sf), l2_weights
+def transform_shared_weights_for_mega_moe_sm90(
+    shared_l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    shared_l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Same gate/up interleave as the routed L1, on the dense shared-expert weights.
+
+    Shapes: L1 `(2 * shared_intermediate_hidden, hidden)`, L2 `(hidden, shared_intermediate_hidden)`.
+    """
+    shared_l1_fp8, shared_l1_sf = shared_l1_weights
+    return (_interleave_gate_up_sm90(shared_l1_fp8), shared_l1_sf), shared_l2_weights
 
 
 def fp8_mega_moe(y: torch.Tensor,
@@ -402,13 +446,23 @@ def fp8_mega_moe(y: torch.Tensor,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                 shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
+    # Fused shared expert: needs a symmetric buffer allocated with
+    # `num_shared_experts > 0` (see `get_symm_buffer_for_mega_moe`).
+    assert (shared_l1_weights is None) == (shared_l2_weights is None), \
+        'Shared-expert L1 and L2 weights must be passed together'
+    shared_l1_weights_data, shared_l1_weights_sf = shared_l1_weights or (None, None)
+    shared_l2_weights_data, shared_l2_weights_sf = shared_l2_weights or (None, None)
     _C.fp8_mega_moe(
         y,
         l1_weights_data, l1_weights_sf,
         l2_weights_data, l2_weights_sf,
+        shared_l1_weights_data, shared_l1_weights_sf,
+        shared_l2_weights_data, shared_l2_weights_sf,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
