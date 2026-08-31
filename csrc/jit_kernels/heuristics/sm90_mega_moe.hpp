@@ -129,7 +129,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
                                smem_sfa_per_stage + smem_sfb_per_stage;
 
     // The scheduler adds 2 task-info full/empty barrier pairs and two 32-byte
-    // task-info slots (see `sm90_fp8_mega_moe.cuh`). `SM90MegaMoETaskInfo` is
+    // task-info slots (see `sm90_fp8_mega_moe.cuh`). The scheduler `TaskInfo` is
     // alignas(16)/32 B while a barrier slot is only 8 B, so the kernel pads one
     // extra barrier when the preceding barrier count is odd
     // (`kTaskInfoBarrierPad = kTaskInfoBaseBarriers & 1u`). Only

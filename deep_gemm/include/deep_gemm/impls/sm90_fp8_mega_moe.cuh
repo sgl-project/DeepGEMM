@@ -414,18 +414,32 @@ sm90_fp8_mega_moe_impl(void* y,
     // Interleaved-scheduler task ring: 2-stage task-info slots with dedicated
     // full/empty barriers, placed right after the combine barriers (the host
     // SMEM accounting reserves the same bytes, see `sm90_mega_moe.hpp`).
-    // `SM90MegaMoETaskInfo` is alignas(16) / 32 B, but barrier slots are 8 B,
-    // so the barrier count preceding the ring must be even for the 32 B slots
-    // to land 16-byte aligned. Pad one unused barrier slot when it is odd --
-    // this fires on the 1-dispatch-warp topology (parity is set by
-    // kNumDispatchWarps alone; 2*kNumStages and 2*kNumCombineWarps are even).
+    // SM90 reuses the unified interleaved `MegaMoEScheduler` in single-CTA mode
+    // (`kClusterSize = 1`): one task covers one CTA tile and the producer warp
+    // publishes tasks to local SMEM (no 2-CTA cluster, no ring bookkeeping --
+    // `kNumRingBlocks` is assert-only on this path, so it is fed the pool block
+    // count). `TaskInfo` is alignas(16) / 32 B, but barrier slots are 8 B, so
+    // the barrier count preceding the ring must be even for the 32 B slots to
+    // land 16-byte aligned. Pad one unused barrier slot when it is odd -- this
+    // fires on the 1-dispatch-warp topology (parity is set by kNumDispatchWarps
+    // alone; 2*kNumStages and 2*kNumCombineWarps are even).
     constexpr uint32_t kTaskInfoBaseBarriers =
         kNumDispatchWarps + kNumStages * 2 + kNumCombineWarps * 2;
     constexpr uint32_t kTaskInfoBarrierPad = kTaskInfoBaseBarriers & 1u;
+    using SchedulerT = sched::MegaMoEScheduler<
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        L1_SHAPE_N, L1_SHAPE_K,
+        L2_SHAPE_N, L2_SHAPE_K,
+        kNumExpertsPerRank,
+        kNumSMs, kNumRanks,
+        kNumPoolBlocks,
+        kNumSharedExperts,
+        /*kClusterSize=*/1,
+        layout::SM90Workspace>;
     auto task_info_full_barriers  = barrier_start_ptr + kTaskInfoBaseBarriers + kTaskInfoBarrierPad;
-    auto task_info_empty_barriers = task_info_full_barriers + sched::kNumSM90TaskInfoStages;
-    auto task_infos = reinterpret_cast<sched::SM90MegaMoETaskInfo*>(
-        task_info_empty_barriers + sched::kNumSM90TaskInfoStages);
+    auto task_info_empty_barriers = task_info_full_barriers + SchedulerT::kNumScheduleStages;
+    auto task_infos = reinterpret_cast<typename SchedulerT::task_info_t*>(
+        task_info_empty_barriers + SchedulerT::kNumScheduleStages);
 
     // =====================================================================
     // Initialization
@@ -456,7 +470,7 @@ sm90_fp8_mega_moe_impl(void* y,
             for (uint32_t i = 0; i < kNumCombineWarps * 2; ++ i)
                 combine_barriers[i]->init(1);
             #pragma unroll
-            for (uint32_t i = 0; i < sched::kNumSM90TaskInfoStages; ++ i) {
+            for (uint32_t i = 0; i < SchedulerT::kNumScheduleStages; ++ i) {
                 // The producer warp publishes one task per slot
                 task_info_full_barriers[i].init(1);
                 // TMA-A + TMA-B warps and every math warp release each slot once
@@ -487,14 +501,6 @@ sm90_fp8_mega_moe_impl(void* y,
             default:                               return kNumSharedL2BlockKs;
         }
     };
-    using SchedulerT = sched::MegaMoEInterleavedScheduler<
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        L1_SHAPE_N, L1_SHAPE_K,
-        L2_SHAPE_N, L2_SHAPE_K,
-        kNumExpertsPerRank,
-        kNumSMs, kNumRanks,
-        kNumSharedExperts,
-        layout::SM90Workspace>;
     SchedulerT scheduler(workspace, task_info_full_barriers, task_info_empty_barriers, task_infos);
 
     // Pipeline state shared by TMA loaders and math warpgroups
@@ -989,7 +995,7 @@ sm90_fp8_mega_moe_impl(void* y,
         while (scheduler.get_next_task(task_info)) {
             process_a_sfa_block(task_info.block_phase, task_info.local_expert_idx,
                                 get_num_k_blocks(task_info.block_phase),
-                                task_info.m_block_idx, task_info.n_block_idx,
+                                task_info.m_block_idx, task_info.n_cluster_idx,
                                 task_info.valid_m, task_info.pool_block_idx);
         }
     
@@ -1044,7 +1050,7 @@ sm90_fp8_mega_moe_impl(void* y,
         while (scheduler.get_next_task(task_info)) {
             process_b_block(task_info.block_phase, task_info.local_expert_idx,
                             get_num_k_blocks(task_info.block_phase),
-                            task_info.n_block_idx, task_info.shape_n);
+                            task_info.n_cluster_idx, task_info.shape_n);
         }
     
 
@@ -2364,7 +2370,7 @@ sm90_fp8_mega_moe_impl(void* y,
         while (scheduler.get_next_task(task_info)) {
             process_math_block(task_info.block_phase, task_info.local_expert_idx,
                                get_num_k_blocks(task_info.block_phase),
-                               task_info.m_block_idx, task_info.n_block_idx,
+                               task_info.m_block_idx, task_info.n_cluster_idx,
                                task_info.valid_m, task_info.pool_block_idx);
         }
     
