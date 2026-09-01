@@ -22,7 +22,6 @@ struct MegaMoESM90Config {
     int num_max_pool_tokens;
     int num_padded_sf_pool_tokens;
     int swizzle_acts_mode, swizzle_weights_mode;
-    int num_experts_per_wave;
     int num_stages, smem_size;
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
@@ -33,7 +32,6 @@ struct MegaMoESM90Config {
            << ", num_max_pool_tokens=" << config.num_max_pool_tokens
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
-           << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -44,10 +42,32 @@ struct MegaMoESM90Config {
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
-    const int& num_topk, const int& num_tokens) {
+    const int& num_topk, const int& num_tokens, const int &intermediate_hidden) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
+    // The relaxed 2-WG threshold enables the block_m=128 / 4-WG path only
+    // above a higher tokens/expert bar (instead of the original >= 64),
+    // trading two extra warpgroups for fewer register spills. On H20 the
+    // smaller SM count (78 vs 132 on H100/H200) makes the extra warpgroups
+    // costly, so the relaxation applies in two intermediate_hidden regimes:
+    //   * pro   (>= 3072): 4-WG only when expected_tokens_per_expert > 512
+    //   * flash (<= 2048): 4-WG only when expected_tokens_per_expert > 576,
+    //     because 2-WG + BLOCK_N=256 outperforms 4-WG in part of the flash
+    //     batch range -- 4-WG is reserved for the heaviest flash batches.
+    // On H200/H100 the larger SM count makes the extra warpgroups always win,
+    // so the original 4-WG-first (>= 64) threshold is kept for every shape,
+    // as well as for the H20 mid-range (2048 < intermediate_hidden < 3072).
+    const int num_sms = device_runtime->get_num_sms();
+    const bool is_h20 = num_sms <= 84;
+    const bool apply_h20_pro_relaxation   = is_h20 and intermediate_hidden >= 3072;
+    const bool apply_h20_flash_relaxation = is_h20 and intermediate_hidden <= 2048;
+    bool auto_split_mn;
+    if (apply_h20_pro_relaxation)
+        auto_split_mn = expected_tokens_per_expert > 512.0f;
+    else if (apply_h20_flash_relaxation)
+        auto_split_mn = expected_tokens_per_expert > 576.0f;
+    else
+        auto_split_mn = expected_tokens_per_expert >= 64.0f;
     if (auto_split_mn)
         return {128, 512};
 
@@ -61,99 +81,14 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-// SM90 retains the original wave scheduler and its ring-capacity heuristic.
-// Keep these helpers local to the Hopper path: upstream's SM100 scheduler now
-// sizes live task pools directly and no longer exposes the legacy helpers.
-static int get_num_wave_pool_tokens_for_mega_moe_sm90(
-    const int& num_ranks, const int& num_topk, const int& num_max_tokens_per_rank,
-    const int& num_experts_per_wave, const int& block_m) {
-    DG_HOST_ASSERT(num_max_tokens_per_rank % block_m == 0);
-    const auto num_tokens_from_all_ranks = num_max_tokens_per_rank * num_ranks;
-    if (num_experts_per_wave == 1)
-        return num_tokens_from_all_ranks;
-
-    return std::min(
-        num_tokens_from_all_ranks * num_experts_per_wave,
-        math::align(
-            num_tokens_from_all_ranks * num_topk + num_experts_per_wave * (block_m - 1),
-            block_m));
-}
-
-static int get_num_experts_per_wave_for_mega_moe_sm90_legacy(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
-    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    int num_max_experts_per_wave = num_experts_per_rank;
-    while (num_max_experts_per_wave > 0 and
-           get_num_wave_pool_tokens_for_mega_moe_sm90(
-               num_ranks, num_topk, num_max_tokens_per_rank,
-               num_max_experts_per_wave, block_m) > num_ring_tokens)
-        --num_max_experts_per_wave;
-    DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
-
-    constexpr int kImbalanceFactor = 2;
-    const float num_expected_tokens_per_expert =
-        static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
-    const int num_expected_m_blocks = std::max(
-        ceil_div(static_cast<int>(std::ceil(num_expected_tokens_per_expert)), block_m), 1);
-    const int num_l1_n_blocks = (2 * intermediate_hidden) / block_n;
-    const int num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks;
-    int num_min_expected_experts_to_fill_sms =
-        ceil_div(kImbalanceFactor * num_sms, num_expected_l1_blocks_per_expert);
-
-    if (num_expected_tokens_per_expert < 1)
-        num_min_expected_experts_to_fill_sms = num_experts_per_rank;
-    if (num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave)
-        return num_max_experts_per_wave;
-    if (num_expected_l1_blocks_per_expert >= num_sms)
-        return num_min_expected_experts_to_fill_sms;
-
-    const int num_sweep_max_experts_per_wave = std::min(
-        num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2);
-    int best_num_experts_per_wave = num_min_expected_experts_to_fill_sms;
-    float best_tail_ratio = -1.0f;
-    for (int num_experts_per_wave = num_min_expected_experts_to_fill_sms;
-         num_experts_per_wave <= num_sweep_max_experts_per_wave;
-         ++num_experts_per_wave) {
-        const int remainder = num_experts_per_rank % num_experts_per_wave;
-        const float tail_ratio = remainder == 0 ?
-            1.0f : static_cast<float>(remainder) / num_experts_per_wave;
-        if (tail_ratio > best_tail_ratio) {
-            best_tail_ratio = tail_ratio;
-            best_num_experts_per_wave = num_experts_per_wave;
-        }
-    }
-    return best_num_experts_per_wave;
-}
-
-static int get_num_experts_per_wave_for_mega_moe_sm90(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
-    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    const float expected_tokens_per_expert =
-        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)
-        return num_experts_per_rank;
-
-    if (block_m == 64 and intermediate_hidden >= 3072) {
-        const int num_n_blocks_per_expert = (2 * intermediate_hidden) / block_n;
-        const int single_wave_blocks =
-            num_experts_per_rank * num_n_blocks_per_expert;
-        if (single_wave_blocks >= 4 * num_sms)
-            return num_experts_per_rank;
-    }
-    return get_num_experts_per_wave_for_mega_moe_sm90_legacy(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms,
-        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
-}
-
 static bool should_use_swap_ab_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& block_m, const int& num_epilogue_threads) {
     // swapAB is ENABLED by default (the L1 SF-pool stride bug that corrupted
     // pool blocks >= 1 was fixed: BLOCK_M -> SF_BLOCK_M in the swapAB L1 epilogue).
     // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
+    // swapAB composes with the fused shared expert (shared's token-axis output
+    // matches swapAB's reduced M-axis), so no special-casing is needed here.
     if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
         return false;
     const float expected_tokens_per_expert =
@@ -193,15 +128,37 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_per_stage = block_m * block_k + block_n * block_k +
                                smem_sfa_per_stage + smem_sfb_per_stage;
 
-    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
+    // The scheduler adds 2 task-info full/empty barrier pairs and two 32-byte
+    // task-info slots (see `sm90_fp8_mega_moe.cuh`). The scheduler `TaskInfo` is
+    // alignas(16)/32 B while a barrier slot is only 8 B, so the kernel pads one
+    // extra barrier when the preceding barrier count is odd
+    // (`kTaskInfoBarrierPad = kTaskInfoBaseBarriers & 1u`). Only
+    // `num_dispatch_warps` affects that parity (2*num_stages, 2*num_epilogue_warps
+    // and the 4 task-info barriers are all even), so mirror the same pad here.
+    const int smem_task_info_barriers = 4;  // 2 full + 2 empty
+    const int smem_task_info_pad = (num_dispatch_warps & 1) * 8;
+    const int smem_barriers_fixed =
+        (num_dispatch_warps + 2 * num_epilogue_warps + smem_task_info_barriers) * 8 +
+        smem_task_info_pad;
+    const int smem_task_infos = 2 * 32;
     const int smem_barriers_per_stage = 2 * 8;
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed + smem_task_infos;
 
     const int num_stages = (smem_capacity - smem_fixed) /
                            (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(num_stages >= 2);
     const int smem_size = smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(smem_size <= smem_capacity);
+
+    // Cross-check against the kernel's exact barrier/task-info layout: the
+    // task-info ring (including the alignment pad) must end inside the
+    // allocated dynamic shared memory.
+    const int smem_task_info_end =
+        smem_dispatch_size + smem_cd + num_stages * smem_per_stage +
+        (num_dispatch_warps + 2 * num_stages + 2 * num_epilogue_warps +
+         smem_task_info_barriers + smem_task_info_pad / 8) * 8 +
+        smem_task_infos;
+    DG_HOST_ASSERT(smem_task_info_end <= smem_size);
     return {num_stages, smem_size};
 }
 
@@ -211,7 +168,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
-        num_ranks, num_experts, num_topk, num_tokens);
+        num_ranks, num_experts, num_topk, num_tokens, intermediate_hidden);
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn =
@@ -219,13 +176,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
     const bool decode_use_block_n_256 =
-        decode_split_n_path and intermediate_hidden >= 3072 and
+        decode_split_n_path and
         expected_tokens_per_expert >= 0.25f and
         (2 * intermediate_hidden) % 256 == 0 and hidden % 256 == 0;
     const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         block_m, num_epilogue_threads);
-    int block_n = use_swap_ab ? 128
+    int block_n = use_swap_ab ? 256
                               : (auto_split_mn ? 256 :
                                  (decode_use_block_n_256 ? 256 : 128));
     const int block_k = 128;
@@ -235,22 +192,18 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
 
-    const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms,
-        num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
-
-    const bool reduce_decode_threads = num_epilogue_threads == 128;
-    const bool decode_split_n =
-        block_m == 64 and num_epilogue_threads == 256;
-    const bool shrink_non_epilogue = reduce_decode_threads or decode_split_n;
-    const int num_dispatch_threads =
-        (num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128;
-    const bool split_sfa_loader_warp = false;
-    const int num_non_epilogue_threads =
-        split_sfa_loader_warp ? 128 :
-            ((num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128);
+    // The scheduler needs a dedicated producer warp, so the non-epilogue section
+    // is exactly 3 warps (TMA-A, TMA-B, producer) and dispatch is a single warp:
+    // dispatch + non-epilogue = 32 + 96 = 128, a whole warpgroup that keeps the
+    // math warpgroups 128-thread aligned. This is the minimal aligned topology for
+    // every epilogue width:
+    //   * 2-WG (epilogue=256): 32 + 96 + 256 = 384 threads, ceiling
+    //     65536/384 = 170 >= 168, so the epilogue accumulators do not spill.
+    //   * 4-WG (epilogue=512): 32 + 96 + 512 = 640 threads. Halving dispatch to one
+    //     warp is the cost of fitting the producer warp under 128-thread alignment;
+    //     a 2-dispatch-warp variant would pad to 768 threads and spill worse.
+    const int num_dispatch_threads = 32;
+    const int num_non_epilogue_threads = 96;
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
@@ -265,7 +218,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         cluster_size,
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
-        num_experts_per_wave,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };

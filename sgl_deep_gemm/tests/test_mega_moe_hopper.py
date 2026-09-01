@@ -11,6 +11,12 @@ path, with the compute path changed to SM90 FP8:
   per-128-K L2 activation SF, while the fused SM90 MegaMoE L1 epilogue writes
   per-64-K L2 activation SF to avoid cross-CTA synchronization. This is a
   same-pipeline performance reference, not a bitwise correctness oracle.
+* shared expert (optional, ``--num-shared-experts``): DeepSeek-style shared
+  expert, fused into the kernel as the SM100-style ``SharedLinear1`` /
+  ``SharedLinear2`` scheduler phases and reduced through an extra combine slot, so
+  one launch produces routed + shared. Both baselines run the same shared expert
+  serially, matching ``tests/test_mega_moe.py``, which folds it in as a DeepEP
+  combine bias.
 * low-latency baseline (optional, ``--run-low-latency-baseline``): mirrors the
   sglang low-latency MoE pipeline (see
   ``sglang/srt/layers/moe/token_dispatcher/deepep.py::_DeepEPDispatcherImplLowLatency``):
@@ -25,6 +31,8 @@ path, with the compute path changed to SM90 FP8:
 * accuracy mode (optional, ``--accuracy``): runs the former layered SM90
   correctness suite with a PyTorch BF16/FP32 reference. It covers smoke,
   heuristic branches, shape sweeps, edge cases, and optional random stress.
+  Layer 6 adds the fused shared expert (``num_shared_experts >= 1``); the
+  reference is routed + dense shared MLP, compared with the fused kernel output.
 * output: TFLOPS, overlap-adjusted TFLOPS, HBM GB/s, NVLink GB/s, fused time,
   reduction estimate, and ``t_baseline / t_fused``.
 """
@@ -253,6 +261,18 @@ def _quantize_grouped_fp8_block_128_128(
     return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
 
 
+def _quantize_dense_fp8_block_128_128(
+    w: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(N, K) bf16 -> (N, K) fp8_e4m3fn plus (N/128, K/128) FP32 block SF.
+
+    Used for the shared expert, which is a single dense MLP rather than a group
+    of per-rank experts.
+    """
+    w_fp8, sf = _quantize_grouped_fp8_block_128_128(w.unsqueeze(0))
+    return w_fp8.squeeze(0), sf.squeeze(0)
+
+
 # ============================================================================
 # Section 3: layered accuracy reference and scenarios.
 # ============================================================================
@@ -380,6 +400,54 @@ def _reference_fused(
     return y_full_bf16[start:end].contiguous()
 
 
+def _reference_shared(
+    x_fp8_local: torch.Tensor,
+    x_sf_local: torch.Tensor,
+    shared_l1: Tuple[torch.Tensor, torch.Tensor],
+    shared_l2: Tuple[torch.Tensor, torch.Tensor],
+    hidden: int,
+    shared_intermediate_hidden: int,
+    activation_clamp: float,
+) -> torch.Tensor:
+    """PyTorch FP32 reference for the fused shared expert, on this rank's local
+    tokens (the shared expert is node-local — no all_gather, unlike the routed
+    path). Mirrors the kernel's fused-shared arithmetic:
+
+      L1: (M, H) @ (2*SIH, H)^T -> (M, 2*SIH)
+      SwiGLU (gate clamp one-sided, up clamp two-sided), no topk weighting
+      L1 output FP8 round-trip with per-64-K scales (matches FUSED_L2_ACT_SF_GRAN)
+      L2: (M, SIH) @ (H, SIH)^T -> (M, H)   -> bf16
+
+    The fused kernel adds the shared output into the routed output; this returns
+    the shared contribution so the caller can do ``y_ref routed + y_ref shared``.
+    """
+    assert shared_intermediate_hidden % 64 == 0, (
+        "shared_intermediate_hidden must be a multiple of 64 for the per-64-K "
+        "L2 activation SF granularity the fused epilogue uses"
+    )
+    x = _dequant_per_token_per_128_k(x_fp8_local, x_sf_local)  # (M, H) fp32
+
+    # L1 GEMM (dense, the shared expert is a single MLP).
+    l1_w = _dequant_block_128_128(shared_l1[0], shared_l1[1])  # (2*SIH, H) fp32
+    l1_y = x @ l1_w.t()                                        # (M, 2*SIH)
+    l1_y = _swiglu_fp32(l1_y, activation_clamp)                # (M, SIH)
+
+    # L1 output FP8 round-trip with per-64-K scales, matching the fused SM90 L2
+    # activation SF granularity (FUSED_L2_ACT_SF_GRAN = 64).
+    s, ih = l1_y.shape
+    assert ih == shared_intermediate_hidden
+    v = l1_y.view(s, ih // 64, 64)
+    sf2 = v.abs().amax(dim=-1).clamp(1e-4) / FP8_E4M3_MAX
+    l2_in = (
+        (v / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
+        * sf2.unsqueeze(-1)
+    ).view(s, ih)
+
+    # L2 GEMM -> bf16.
+    l2_w = _dequant_block_128_128(shared_l2[0], shared_l2[1])  # (H, SIH) fp32
+    return (l2_in @ l2_w.t()).to(torch.bfloat16)
+
+
 def _run_accuracy_scenario(
     name: str,
     cfg: Dict[str, Any],
@@ -397,6 +465,7 @@ def _run_accuracy_scenario(
     masked_ratio = cfg.get("masked_ratio", 0.0)
     activation_clamp = cfg.get("activation_clamp", 10.0)
     fast_math = cfg.get("fast_math", True)
+    num_shared_experts = cfg.get("num_shared_experts", 0)
 
     assert num_experts % num_ranks == 0, (
         f"{name}: experts {num_experts} not divisible by ranks {num_ranks}"
@@ -404,6 +473,14 @@ def _run_accuracy_scenario(
     num_experts_per_rank = num_experts // num_ranks
     assert num_tokens <= num_max
     assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
+    # Fused shared expert: each adds one routed intermediate size, fused into the
+    # mega kernel via SharedLinear1/2.
+    shared_intermediate_hidden = intermediate_hidden * num_shared_experts
+    if num_shared_experts > 0:
+        assert shared_intermediate_hidden % 64 == 0, (
+            f"{name}: shared_intermediate_hidden={shared_intermediate_hidden} must be "
+            f"a multiple of 64 (fused L2 activation SF granularity)"
+        )
 
     verbose = bool(int(os.environ.get("DG_TEST_VERBOSE", "0")))
 
@@ -445,6 +522,31 @@ def _run_accuracy_scenario(
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_weights, l2_weights
     )
+    # Shared expert weights (dense MLP, block-(128,128) FP8 like the routed
+    # weights) and the matching interleave the kernel's weight-SF indexing assumes.
+    if num_shared_experts > 0:
+        shared_l1_weights = _quantize_dense_fp8_block_128_128(
+            torch.randn(
+                (shared_intermediate_hidden * 2, hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+        shared_l2_weights = _quantize_dense_fp8_block_128_128(
+            torch.randn(
+                (hidden, shared_intermediate_hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+        transformed_shared_l1, transformed_shared_l2 = (
+            deep_gemm.transform_shared_weights_for_mega_moe_sm90(
+                shared_l1_weights, shared_l2_weights
+            )
+        )
+    else:
+        shared_l1_weights = shared_l2_weights = None
+        transformed_shared_l1 = transformed_shared_l2 = None
 
     trace("alloc_symm_buffer")
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -454,6 +556,7 @@ def _run_accuracy_scenario(
         num_topk,
         hidden,
         intermediate_hidden,
+        num_shared_experts=num_shared_experts,
     )
     cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
 
@@ -475,6 +578,8 @@ def _run_accuracy_scenario(
         activation="swiglu",
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
+        shared_l1_weights=transformed_shared_l1,
+        shared_l2_weights=transformed_shared_l2,
     )
     torch.cuda.synchronize()
 
@@ -497,6 +602,17 @@ def _run_accuracy_scenario(
         intermediate_hidden,
         activation_clamp,
     )
+    # Add the shared-expert reference contribution: fused-out = routed + shared.
+    if num_shared_experts > 0:
+        y_ref = y_ref + _reference_shared(
+            x_fp8[0],
+            x_fp8[1],
+            shared_l1_weights,
+            shared_l2_weights,
+            hidden,
+            shared_intermediate_hidden,
+            activation_clamp,
+        )
 
     diff = calc_diff(y_fused, y_ref)
     ok = diff < diff_tol
@@ -614,6 +730,54 @@ def _accuracy_layer5_stress(num_ranks: int, num_tests: int) -> List[Tuple[str, D
     return out
 
 
+def _accuracy_layer6_shared_expert(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    """Fused shared-expert correctness (fused-out = routed + shared).
+
+    Each scenario sets num_shared_experts >= 1, which routes through the
+    fused-shared path and compares against routed reference + dense shared MLP.
+    shared_intermediate_hidden must be a multiple of 64, so intermediate_hidden is
+    picked from {512, 1024, 2048}.
+    """
+    base = dict(
+        num_max_tokens_per_rank=128,
+        hidden=512,
+        intermediate_hidden=512,   # * num_shared_experts stays a multiple of 64
+        num_experts=8 * num_ranks,
+        num_topk=2,
+        num_shared_experts=1,
+    )
+    out = []
+    # Smoke: 1 shared expert, default clamp/fast_math/shape.
+    out.append(("L6.sh1.smoke", dict(base)))
+    # Two shared experts (shared_intermediate_hidden = 2*ih).
+    cfg = dict(base)
+    cfg.update(num_shared_experts=2)
+    out.append(("L6.sh2", cfg))
+    # Larger hidden / intermediate with the shared expert on.
+    for hidden, ih in [(2048, 1024), (2048, 2048)]:
+        cfg = dict(base)
+        cfg.update(hidden=hidden, intermediate_hidden=ih)
+        out.append((f"L6.h{hidden}_ih{ih}", cfg))
+    # Shared expert under masking (shared acts on local tokens regardless of routing).
+    for masked_ratio in (0.3, 0.7):
+        cfg = dict(base)
+        cfg.update(masked_ratio=masked_ratio)
+        out.append((f"L6.mask{masked_ratio:.1f}", cfg))
+    # Shared expert with clamp variations.
+    for clamp in (1.0, math.inf):
+        cfg = dict(base)
+        cfg.update(activation_clamp=clamp)
+        out.append((f"L6.clamp{clamp}", cfg))
+    # Shared expert with fewer/more routed experts selected.
+    for topk in (1, 4):
+        if topk > base["num_experts"]:
+            continue
+        cfg = dict(base)
+        cfg.update(num_topk=topk)
+        out.append((f"L6.topk{topk}", cfg))
+    return out
+
+
 def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
@@ -636,6 +800,8 @@ def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Na
         layers += _accuracy_layer4_edges(num_ranks)
     if 5 in args.layers:
         layers += _accuracy_layer5_stress(num_ranks, args.num_correctness_tests or 8)
+    if 6 in args.layers:
+        layers += _accuracy_layer6_shared_expert(num_ranks)
     if args.filter:
         layers = [(name, cfg) for name, cfg in layers if args.filter in name]
 
@@ -644,6 +810,8 @@ def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Na
         f"layers {sorted(args.layers)} on {num_ranks} ranks",
         once_in_node=True,
     )
+    # --num-shared-experts is a config for the benchmark mode; in accuracy mode
+    # each scenario carries its own num_shared_experts (layer 6 turns it on).
 
     failures: List[str] = []
     for name, cfg in layers:
@@ -1115,6 +1283,12 @@ def _run_fused_only_sweep(local_rank: int, num_local_ranks: int, args: argparse.
         f"masked_ratio={args.masked_ratio} fast_math={bool(args.fast_math)}",
         once_in_node=True,
     )
+    if args.num_shared_experts > 0:
+        dist_print(
+            " > note: --num-shared-experts is ignored here; this mode measures the "
+            "routed kernel alone",
+            once_in_node=True,
+        )
 
     num_max_tokens_per_rank = max(batches)
     for num_tokens in batches:
@@ -1192,6 +1366,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f"SM90 fused kernel requires intermediate_hidden <= 4096, got {intermediate_hidden}"
     )
 
+    # Shared-expert shape, following tests/test_mega_moe.py: one routed
+    # intermediate size per shared expert. When enabled it is fused into the mega
+    # kernel as the SharedLinear1/SharedLinear2 phases; 0 disables it.
+    num_shared_experts = args.num_shared_experts
+    shared_intermediate_hidden = intermediate_hidden * num_shared_experts
+    assert shared_intermediate_hidden % 128 == 0
+    fused_shared = num_shared_experts > 0
+
     # ---- Create BF16 token and weight inputs ----
     # x: local tokens for this rank.
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -1241,6 +1423,38 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l1_weights, l2_weights
     )
 
+    # Shared-expert weights: one dense MLP (not per-expert), quantized with the
+    # same block-(128, 128) FP8 recipe as the routed weights. The fused and
+    # baseline paths share them so the comparison stays apples-to-apples.
+    if num_shared_experts > 0:
+        shared_l1_weights = _quantize_dense_fp8_block_128_128(
+            torch.randn(
+                (shared_intermediate_hidden * 2, hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+        shared_l2_weights = _quantize_dense_fp8_block_128_128(
+            torch.randn(
+                (hidden, shared_intermediate_hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+    else:
+        shared_l1_weights = shared_l2_weights = None
+
+    # The fused kernel consumes the same shared weights with the gate/up gran-8
+    # interleave applied to L1 (identical to the routed weight transform).
+    if fused_shared:
+        transformed_shared_l1, transformed_shared_l2 = (
+            deep_gemm.transform_shared_weights_for_mega_moe_sm90(
+                shared_l1_weights, shared_l2_weights
+            )
+        )
+    else:
+        transformed_shared_l1 = transformed_shared_l2 = None
+
     # SwiGLU clamp: finite values enable clamp; inf maps to None and disables it.
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
     run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
@@ -1251,6 +1465,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
 
     # ---- Allocate fused SymmBuffer and output buffer ----
+    # The fused shared expert needs two extra symmetric-buffer regions (its
+    # post-SwiGLU pool and SF) plus one more combine slot.
     sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
         num_experts,
@@ -1258,10 +1474,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk,
         hidden,
         intermediate_hidden,
+        num_shared_experts=num_shared_experts if fused_shared else 0,
     )
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
-    def run_fused():
+    # Output of the reference dense shared MLP (`run_shared`), used by the baselines
+    # and by `--check-output-diff`. Reused across calls: those paths never overlap.
+    y_shared = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+
+    def run_fused(with_shared: bool = True):
         # Match the SM100 test: DG_COMM_KERNEL_DEBUG=1 zeros the whole
         # sym_buffer at kernel exit, so inputs must be re-copied every call.
         sym_buffer.x[:num_tokens].copy_(x_fp8[0])
@@ -1269,6 +1490,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
+        fuse_now = fused_shared and with_shared
         deep_gemm.fp8_mega_moe(
             y_fused,
             transformed_l1,
@@ -1279,8 +1501,50 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation="swiglu",
             activation_clamp=clamp_arg,
             fast_math=bool(args.fast_math),
+            shared_l1_weights=transformed_shared_l1 if fuse_now else None,
+            shared_l2_weights=transformed_shared_l2 if fuse_now else None,
         )
         return y_fused
+
+    def run_shared():
+        """Dense FP8 shared-expert MLP writing into ``y_shared``.
+
+        L1 GEMM -> SwiGLU + FP8 quantization -> L2 GEMM. There is no topk
+        weighting: every token passes through the shared expert with weight 1.0.
+        The activation SF stays row-major FP32; ``fp8_gemm_nt`` transposes it into
+        the MN-major TMA layout internally (see
+        ``layout::transform_sf_into_required_layout``).
+        """
+        if num_tokens == 0:
+            return y_shared
+
+        l1_out = torch.empty(
+            (num_tokens, shared_intermediate_hidden * 2),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        deep_gemm.fp8_gemm_nt(
+            x_fp8,
+            shared_l1_weights,
+            l1_out,
+            recipe=(1, 128, 128),
+            disable_ue8m0_cast=True,
+        )
+        l2_in = swiglu_apply_weight_to_fp8_triton(
+            x=l1_out,
+            topk_weights=None,
+            clamp_value=clamp_arg,
+            num_per_channels=BASELINE_L2_ACT_SF_GRAN,
+            use_ue8m0_scale=False,
+        )
+        deep_gemm.fp8_gemm_nt(
+            l2_in,
+            shared_l2_weights,
+            y_shared,
+            recipe=(1, 128, 128),
+            disable_ue8m0_cast=True,
+        )
+        return y_shared
 
     # ---- Print config ----
     dist_print("Config (SM90 fused MegaMoE):", once_in_node=True)
@@ -1293,6 +1557,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         once_in_node=True,
     )
     dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
+    dist_print(
+        f" > Shared experts: {num_shared_experts}"
+        + (
+            f" (intermediate: {shared_intermediate_hidden}, fused into the mega "
+            f"kernel via SharedLinear1/2)"
+            if fused_shared
+            else " (disabled)"
+        ),
+        once_in_node=True,
+    )
     dist_print(
         f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} FP32 pow2, "
         f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} FP32 pow2 "
@@ -1415,7 +1689,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
         # DeepEP combine: gather each token's topk expert outputs back to source rank.
-        return ep_buffer.combine(l2_y, handle=handle)[0]
+        combined = ep_buffer.combine(l2_y, handle=handle)[0]
+        # Non-overlapped baseline: the shared expert runs serially on the same
+        # stream. tests/test_mega_moe.py folds it into combine as a bias; the
+        # SM90 DeepEP shim here has no bias argument, so add it afterwards.
+        if num_shared_experts > 0:
+            combined.add_(run_shared())
+        return combined
 
     # ----------------------------------------------------------------
     # Low-latency baseline body. Mirrors the sglang
@@ -1517,6 +1797,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             return_recv_hook=False,
             out=ll_combined,
         )
+        # 6) Same serial shared expert as the normal-mode baseline.
+        if num_shared_experts > 0:
+            combined_x.add_(run_shared())
         return combined_x
 
     # ---- Run once to check fused and optional baseline paths ----
@@ -1524,6 +1807,27 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
         f"unexpected fused output shape/dtype: shape={y.shape}, dtype={y.dtype}"
     )
+    if fused_shared and args.check_output_diff:
+        # Reference for the fused shared expert: the routed-only kernel output plus
+        # the Python dense shared MLP (the same weights, before the interleave).
+        y_fused_shared = y.clone()
+        y_ref = run_fused(with_shared=False).clone()
+        y_ref += run_shared()
+        diff = (y_fused_shared.float() - y_ref.float()).abs()
+        denom = y_ref.float().abs().mean().clamp_min(1e-12)
+        dist_print(
+            "Output diff (fused shared expert vs routed + two-stream shared):",
+            once_in_node=True,
+        )
+        dist_print(
+            f" > max_abs={diff.max().item():.6e}, "
+            f"mean_abs={diff.mean().item():.6e}, "
+            f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
+            once_in_node=True,
+        )
+        dist_print(once_in_node=True)
+        # Leave `y_fused` holding the fused output for the baseline diffs below
+        y = run_fused()
     if ep_buffer is not None:
         out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
@@ -1574,7 +1878,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_touched_experts = int(torch.unique(local_expert_ids).numel())
 
     # ---- benchmark ----
-    # Fused: bench_kineto selects the sm90_fp8_mega_moe_impl GPU region only.
+    # Fused: bench_kineto selects the sm90_fp8_mega_moe_impl GPU region only, so
+    # this stays the pure routed-kernel time even with a shared expert running
+    # concurrently on the main stream.
     t_fused = bench_kineto(
         run_fused,
         SM90_KERNEL_NAME,
@@ -1657,26 +1963,63 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nvlink_bytes = num_recv_tokens * (hidden + hidden // 32 + 4 + hidden * 2)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
+    # ---- Shared-expert FLOPs / HBM ----
+    # Same three matmuls as a routed expert (L1 gate, L1 up, L2), but every local
+    # token goes through it, and the weights are streamed once (not per expert).
+    # The shared MLP is node-local, so it adds no NVLink traffic, and the fused
+    # epilogue keeps the SwiGLU input in registers (no BF16 staging round-trip).
+    num_shared_flops = 2 * num_tokens * hidden * shared_intermediate_hidden * 3
+    num_shared_hbm_bytes = (
+        0
+        if num_shared_experts == 0
+        else (
+            shared_intermediate_hidden * 2 * hidden  # shared L1 weights (FP8)
+            + hidden * shared_intermediate_hidden  # shared L2 weights (FP8)
+            + (shared_intermediate_hidden * 2 // WEIGHT_SF_GRAN_MN)
+            * (hidden // WEIGHT_SF_GRAN_K)
+            * 4  # shared L1 weight SF
+            + (hidden // WEIGHT_SF_GRAN_MN)
+            * (shared_intermediate_hidden // WEIGHT_SF_GRAN_K)
+            * 4  # shared L2 weight SF
+            + num_tokens * hidden
+            + num_tokens * (hidden // L1_ACT_SF_GRAN) * 4  # L1 input read (FP8 + SF)
+            + num_tokens * shared_intermediate_hidden
+            + num_tokens
+            * (shared_intermediate_hidden // BASELINE_L2_ACT_SF_GRAN)
+            * 4  # SwiGLU output write (FP8 + SF)
+            + num_tokens * shared_intermediate_hidden
+            + num_tokens
+            * (shared_intermediate_hidden // BASELINE_L2_ACT_SF_GRAN)
+            * 4  # L2 input read (FP8 + SF)
+            + num_tokens * hidden * 2  # L2 output write (BF16)
+        )
+    )
+    # Routed + shared: one launch produces both, so they share `t_fused`.
+    num_total_flops = (
+        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) + num_shared_flops
+    )
+    num_total_hbm_bytes = num_hbm_bytes + num_shared_hbm_bytes
+    tflops_total = safe_div(num_total_flops / 1e12, t_fused)
+    hbm_gbs_total = safe_div(num_total_hbm_bytes / 1e9, t_fused)
+
     # Serial lower bound for combine reduction, using 6.5e12 B/s as an estimate.
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
 
     # Overlap adjustment: remove the non-overlapped serial reduction estimate.
     approx_factor = t_fused / max(t_fused - t_reduction, 1e-12)
 
-    # Baseline uses the same FLOPs and HBM byte estimate, with t_baseline.
-    tflops_baseline = safe_div(
-        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_baseline
-    )
-    hbm_gbs_baseline = safe_div(num_hbm_bytes / 1e9, t_baseline)
+    # Baselines run routed + shared serially, so they use the combined FLOPs and
+    # HBM byte estimate (identical to the routed-only one when shared is off).
+    tflops_baseline = safe_div(num_total_flops / 1e12, t_baseline)
+    hbm_gbs_baseline = safe_div(num_total_hbm_bytes / 1e9, t_baseline)
     nvlink_gbs_baseline = safe_div(num_nvlink_bytes / 1e9, t_baseline)
     # Low-latency baseline pads each expert's activation to ``M_max_ll``, so
     # the weights are streamed once per expert regardless of routing. NVLink
     # bytes match the normal-mode baseline (same per-routed-token volume).
-    tflops_baseline_ll = safe_div(
-        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_baseline_ll
-    )
-    hbm_gbs_baseline_ll = safe_div(num_hbm_bytes / 1e9, t_baseline_ll)
+    tflops_baseline_ll = safe_div(num_total_flops / 1e12, t_baseline_ll)
+    hbm_gbs_baseline_ll = safe_div(num_total_hbm_bytes / 1e9, t_baseline_ll)
     nvlink_gbs_baseline_ll = safe_div(num_nvlink_bytes / 1e9, t_baseline_ll)
+
 
     def fmt_perf_line(
         name: str,
@@ -1713,10 +2056,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(
         fmt_perf_line(
-            "[fused]",
+            "[fused+sh]" if fused_shared else "[fused]",
             t_fused,
-            tflops * approx_factor,
-            hbm_gbs * approx_factor,
+            (tflops_total if fused_shared else tflops) * approx_factor,
+            (hbm_gbs_total if fused_shared else hbm_gbs) * approx_factor,
             nvlink_gbs * approx_factor,
             reduction_us=t_reduction * 1e6,
         )
@@ -1835,6 +2178,17 @@ if __name__ == "__main__":
         default=10.0,
         help="Clamp threshold for gate/up before SwiGLU; pass inf to disable",
     )
+    parser.add_argument(
+        "--num-shared-experts",
+        type=int,
+        default=0,
+        help=(
+            "DeepSeek-style shared experts, each adding one routed intermediate "
+            "size, fused into the mega kernel as the SharedLinear1/2 phases (both "
+            "baselines run them serially as a dense FP8 MLP). 0 disables it; only "
+            "the default comparison mode uses this"
+        ),
+    )
     parser.add_argument("--num-experts", type=int, default=384)
     parser.add_argument("--num-topk", type=int, default=6)
     parser.add_argument(
@@ -1904,8 +2258,9 @@ if __name__ == "__main__":
         "--layers",
         type=int,
         nargs="+",
-        default=[1, 2, 3, 4],
-        help="Accuracy layers to run with --accuracy (1..5); default: 1 2 3 4",
+        default=[1, 2, 3, 4, 6],
+        help="Accuracy layers to run with --accuracy (1..6); default: 1 2 3 4 6. "
+        "Layer 6 covers the fused shared expert (fused-out = routed + shared).",
     )
     parser.add_argument(
         "--num-correctness-tests",
