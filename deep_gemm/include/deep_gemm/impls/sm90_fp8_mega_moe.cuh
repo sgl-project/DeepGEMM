@@ -27,34 +27,6 @@
 
 namespace deep_gemm {
 
-template <float kActivationClamp>
-__forceinline__ __device__ float sm90_fp8_mega_moe_clamp_gate(float x) {
-    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-        x = cute::min(x, kActivationClamp);
-    return x;
-}
-
-template <float kActivationClamp>
-__forceinline__ __device__ float sm90_fp8_mega_moe_clamp_up(float x) {
-    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity())
-        x = cute::min(cute::max(x, -kActivationClamp), kActivationClamp);
-    return x;
-}
-
-template <bool kFastMath>
-__forceinline__ __device__ float sm90_fp8_mega_moe_silu(float x) {
-    const float e = kFastMath ? __expf(-x) : expf(-x);
-    const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
-    return x * sig;
-}
-
-template <bool kFastMath, float kActivationClamp>
-__forceinline__ __device__ float sm90_fp8_mega_moe_swiglu(float g, float u) {
-    g = sm90_fp8_mega_moe_clamp_gate<kActivationClamp>(g);
-    u = sm90_fp8_mega_moe_clamp_up<kActivationClamp>(u);
-    return sm90_fp8_mega_moe_silu<kFastMath>(g) * u;
-}
-
 // Continuous FP32 activation scale. SM90 WGMMA has no hardware block-scale operand (the SF
 // is a plain FFMA in the epilogue), so the previous UE8M0 (power-of-two) scale bought nothing
 // on SM90 and only cost precision; the SF pool is already fp32, so this is byte/layout neutral.
