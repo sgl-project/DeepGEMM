@@ -749,7 +749,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N;
     constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
     constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
-    auto scheduler = sched::MegaMoEScheduler<
+    auto scheduler = sched::LegacyMegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
