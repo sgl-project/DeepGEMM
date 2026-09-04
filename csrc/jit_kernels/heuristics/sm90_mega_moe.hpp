@@ -9,11 +9,12 @@ namespace deep_gemm {
 // ----------------------------------------------------------------------------
 // SM90 differs from SM100 in:
 //   - No tensor memory (TMEM): WGMMA accumulators live in registers.
-//   - No FP4: weights are FP8 e4m3 with per-128 channel float scales.
+//   - FP4 weights have no native WGMMA path and are software-decoded to FP8.
 //   - No 2-CTA cluster MMA: TMA multicast cluster=2 may still be used.
 //   - Activation SF is float, not UE8M0 int: L1 input uses per-128 K and the
 //     fused L1 epilogue writes L2 activation SF at per-64 K granularity.
-// The kernel implementation is in `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
+// The FP8 and FP8xFP4 implementations live in the corresponding SM90 kernel
+// headers under `deep_gemm/impls`.
 // ============================================================================
 
 struct MegaMoESM90Config {
@@ -210,17 +211,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
 // SiTU use the same fixed recipe on SM90.
 static constexpr int kSM90FP4L1ActSFGranK = 128;
 static constexpr int kSM90FP4L2ActSFGranK = 64;
-
-static float get_fp4_sm90_swiglu_prefill_threshold() {
-    return static_cast<float>(get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
-}
+static constexpr float kSM90FP4SwiGLUPrefillThreshold = 80.0f;
+static constexpr float kSM90FP4SwiGLUSwapABMaxE = 20.0f;
 
 // ---- Analytic config cost model (SiTU) ----
-// Replaces the hand-tuned swapAB/decode/prefill boundaries with a per-expert
-// expected-cost comparison. Fitted 2026-07-30 on 21 same-shape A/B
-// measurements (docs 15.12-15.15); all 21 classify correctly, and the
-// model's two out-of-sample predictions (prefill wins inside the former
-// decode band at e=220/350) were confirmed at +3.8%/+2.8% (doc 15.16).
+// Compare swapAB, decode, and prefill using the expected amount of padded
+// compute and the number of FP4 weight-decode passes per expert.
 // With X ~ Poisson(e) tokens per expert (uniform-routing approximation),
 // in units of one regular-mainloop BLOCK_M row:
 //   R(M) = E[ceil(X/M)]*M                    expected processed rows
@@ -228,12 +224,9 @@ static float get_fp4_sm90_swiglu_prefill_threshold() {
 //   cost_decode  = R(64) + kBDecodeRows*T(64)
 //   cost_prefill = (1-kPrefillRowGain)*R(128) + kBDecodeRows*T(128)
 //   cost_swap    = kSwapRowCost*R(8) + kSwapExpertRows*P(X>0)
-// The row/decode ratio is shape-independent to first order (both scale with
-// N*K), so the constants transfer across expert shapes; refit via
-// scratchpad fit_cost_model.py if the architecture changes.
+// The coefficients below are calibration constants for this SM90 kernel.
 static float fp4_expected_num_tiles(const float& e, const int& m) {
-    // E[ceil(X/m)] via a normal approximation with continuity correction;
-    // matches the offline fitting script exactly.
+    // E[ceil(X/m)] via a normal approximation with continuity correction.
     const float sigma = std::sqrt(e);
     float total = 0.0f;
     for (int k = 0; ; ++ k) {
@@ -266,8 +259,7 @@ static FP4SM90ConfigKind get_fp4_sm90_situ_config_kind(
                                kBDecodeRows * t128;
     const float cost_swap = kSwapRowCost * t8 * 8.0f +
                             kSwapExpertRows * p_active;
-    const bool swap_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
-    if (swap_enabled and cost_swap <= cost_decode and cost_swap <= cost_prefill)
+    if (cost_swap <= cost_decode and cost_swap <= cost_prefill)
         return FP4SM90ConfigKind::kSwapAB;
     return cost_prefill < cost_decode ? FP4SM90ConfigKind::kPrefill
                                       : FP4SM90ConfigKind::kDecode;
@@ -281,8 +273,7 @@ static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
     if (use_situ)
         return get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
                FP4SM90ConfigKind::kPrefill;
-    return expected_tokens_per_expert >=
-           get_fp4_sm90_swiglu_prefill_threshold();
+    return expected_tokens_per_expert >= kSM90FP4SwiGLUPrefillThreshold;
 }
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
@@ -309,19 +300,6 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
         [=](const auto& candidate) { return candidate == block_m; })
     );
     return {block_m, num_epilogue_warpgroups * 128};
-}
-
-static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
-    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
-    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    // Simplified: schedule FP4 expert waves exactly like the FP8 path. The
-    // historical flash/pro wave tables (9 + 12 first-match rules) were tuned
-    // point-by-point on benchmark batches and are retired.
-    return get_num_experts_per_wave_for_mega_moe_sm90(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms,
-        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
@@ -390,8 +368,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_fixed =
         smem_dispatch_size + smem_cd + smem_amax_scratch + smem_barriers_fixed;
 
-    // No FP4 stage cap (FP8 parity): always use as many pipeline stages as
-    // SMEM allows. The historical 11-rule cap table is retired.
+    // Match the FP8 policy and use as many pipeline stages as SMEM permits.
     const int num_stages = (smem_capacity - smem_fixed) /
                            (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(num_stages >= 2);
@@ -442,7 +419,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int swizzle_weights_mode = 0;
 
     const int num_sms = device_runtime->get_num_sms();
-    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
+    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
@@ -459,15 +436,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_2wg_decode_offload_kernel_band or
         (fp4_small_block_n_kernel and
          expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f);
-    const int default_num_dispatch_threads =
+    const int num_dispatch_threads =
         (fp4_split_n_decode_thread_kernel_band or
          fp4_decode_assist_thread_kernel_band) ? 64 : 128;
-    const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
-    const int default_num_non_epilogue_threads =
+    const int num_non_epilogue_threads =
         fp4_split_n_decode_thread_kernel_band ? 320 :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
-    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);

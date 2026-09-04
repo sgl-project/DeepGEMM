@@ -73,11 +73,8 @@ struct FP4SM90APIDefaults {
 static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const bool& use_situ) {
-    // Simplified, shape-agnostic defaults, mirroring the FP8 path's style
-    // (`should_use_swap_ab_for_mega_moe_sm90`): one decode/prefill split plus a
-    // single swapAB threshold. The historical per-(shape x e-band) table was
-    // tuned point-by-point on benchmark batches; on the shapes that matter it
-    // collapsed to constants plus a few sliver bands, so it is retired.
+    // Select the decode, prefill, and swapAB features from the same routing
+    // density so the generated kernel uses a coherent configuration bundle.
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     // SiTU uses the analytic cost model while SwiGLU keeps its scalar boundary;
@@ -87,23 +84,14 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         expected_tokens_per_expert, use_situ);
     const bool decode_band =
         expected_tokens_per_expert > 0.0f and !prefill_band;
-    // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
-    // the non-swap path for A/B accuracy comparison.
-    const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
-    // Measured crossover on H20: swapAB wins at e=18.3 (+3.1% on Kimi
-    // 128/64) and loses from e~23 on (-6..-18%), so the fallback bound is 20
-    // (FP8 uses 30; the FP4 kernel pays extra decode work on the swapped
-    // path, and larger e also lands wider WGMMA-N buckets). The original
-    // swiglu tuning had 16; doc 15.15. DG_SM90_FP4_SWAP_AB_MAX_E overrides.
-    // With the SiTU cost model active, the swapAB decision comes from
-    // the same argmin as the prefill band so all three kinds stay coherent.
-    const float swap_ab_max_e = static_cast<float>(
-        get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 20));
-    const bool swap_ab = swap_ab_env_enabled and
-        (use_situ
+    // SwiGLU uses a fixed low-density swapAB boundary. SiTU derives swapAB
+    // from the same cost comparison as its decode/prefill decision.
+    const bool swap_ab =
+        use_situ
             ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
                FP4SM90ConfigKind::kSwapAB)
-            : (decode_band and expected_tokens_per_expert < swap_ab_max_e));
+            : (decode_band and
+               expected_tokens_per_expert < kSM90FP4SwiGLUSwapABMaxE);
     return {
         /*wide_load_decode=*/ decode_band,
         /*early_b_decode=*/ prefill_band,

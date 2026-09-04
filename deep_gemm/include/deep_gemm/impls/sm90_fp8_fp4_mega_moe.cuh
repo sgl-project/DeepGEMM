@@ -26,7 +26,7 @@
 
 namespace deep_gemm {
 
-// Continuous FP32 activation scale, mirroring the FP8 path (#63). SM90 WGMMA has no hardware
+// Continuous FP32 activation scale, matching the FP8 path. SM90 WGMMA has no hardware
 // block-scale operand (the SF is a plain FFMA in the epilogue), so the previous UE8M0
 // (power-of-two) scale bought nothing on SM90 and only cost precision; the L2 SF pool is
 // already fp32 (`l2_acts_sf` is kFloat32), so this is byte/layout neutral.
@@ -1384,7 +1384,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             // n_swap dispatch chain) used to run on every K-stage of the math
             // warp's critical path, which sets the whole pipeline's steady
             // beat; hoisting them to one dispatch per tile also lets the
-            // compiler specialize each loop body (doc 15.18).
+            // compiler specialize each loop body.
             auto run_k_stages = [&]<bool kIsL1, uint32_t kNSwap>() {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
@@ -2156,8 +2156,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         // (WG_L1_OUT_BLOCK_N, l1_output_box_m=WG_BLOCK_M), so each
                         // WG advances column by `wg_l1_out_n_offset` (split-N) and
                         // row by `wg_m_offset` (split-M). In default single-WG
-                        // mode both offsets are zero and this reduces to the
-                        // historical `(n_block_idx * L1_OUT_BLOCK_N, m_idx)`.
+                        // mode both offsets are zero and this reduces to
+                        // `(n_block_idx * L1_OUT_BLOCK_N, m_idx)`.
                         const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_offset;
                         cute::tma_store_fence();
                         cute::SM90_TMA_STORE_2D::copy(

@@ -654,10 +654,6 @@ int64_t dg_get_block_m_for_mega_moe(int64_t num_ranks, int64_t num_experts,
 using MegaSliceResult = Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
                               Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
 
-int64_t dg_get_token_alignment_for_sm90_mega_moe() {
-    return (int64_t)mega::get_token_alignment_for_sm90_mega_moe();
-}
-
 Tuple<int64_t, TypedFunction<MegaSliceResult(TensorView)>>
 dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
                                     int64_t intermediate_hidden, std::string mma_type, std::string activation,
@@ -912,7 +908,6 @@ void dg_mega_moe_pre_dispatch_sm90(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_block_m_for_mega_moe, dg_get_block_m_for_mega_moe);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_sm90_mega_moe, dg_get_token_alignment_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);
