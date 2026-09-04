@@ -150,8 +150,10 @@ get_symm_buffer_size_for_sm90_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
+    constexpr int kMinSM90MegaMoEBlockM = 64;
     const auto num_max_padded_sf_pool_tokens = static_cast<int>(
-        layout::get_num_sm90_compute_sf_ring_tokens(num_max_pool_tokens));
+        layout::get_num_sf_ring_tokens(
+            num_max_pool_tokens, kMinSM90MegaMoEBlockM));
 
     const auto l1_token_buffer = layout::Buffer(
         fp8_token_layout, 1, num_max_pool_tokens,
