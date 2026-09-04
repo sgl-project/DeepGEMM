@@ -17,10 +17,6 @@
 
 namespace deep_gemm::mega {
 
-static int get_token_alignment_for_sm90_mega_moe() {
-    return layout::kLCMCandidateBlockM;
-}
-
 static void mega_moe_pre_dispatch_sm90(
     const torch::Tensor& x,
     const torch::Tensor& topk_idx,
@@ -319,6 +315,7 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     const bool use_situ = activation == "situ";
+    DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value());
 
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
@@ -395,15 +392,6 @@ static void fp8_fp4_mega_moe_sm90(
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
-}
-
-static void register_sm90_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
-    m.def("get_token_alignment_for_sm90_mega_moe", &get_token_alignment_for_sm90_mega_moe);
-    m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
-    m.def("fp8_fp4_mega_moe_sm90", &fp8_fp4_mega_moe_sm90);
-    m.def("fp8_mega_moe", &fp8_mega_moe);
-#endif
 }
 
 } // namespace deep_gemm::mega

@@ -450,6 +450,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      *,
                      activation_alpha: Optional[float] = None,
                      activation_linear_beta: Optional[float] = None):
+    if activation == 'situ' and activation_clamp is not None:
+        raise ValueError('activation_clamp is not supported with SiTU')
+
     if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
         if activation_alpha is not None or activation_linear_beta is not None:
             raise ValueError(
