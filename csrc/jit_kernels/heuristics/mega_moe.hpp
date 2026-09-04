@@ -219,6 +219,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
+    const int& num_shared_experts,
     const MmaKind& mma_kind) {
 
     // Block config
@@ -239,10 +240,21 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
 
-    // Pull: divide token bytes by 2 until <= kPullThreshold
+    // The MXFP8FP4 full-pool path issues one-shot TMA transfers for an entire
+    // token. Its per-warp scratch slice must therefore hold the complete token.
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    const bool use_full_pool_fp8_fp4_path =
+        mma_kind == MmaKind::MXFP8FP4 and
+        num_ring_tokens >= num_max_pool_tokens and
+        num_shared_experts == 0 and
+        block_k == block_n and
+        intermediate_hidden / block_k <= 32;
+
+    // Reusable-ring paths can split a token into smaller pull chunks.
     constexpr int kPullThreshold = 4096;
     int num_bytes_per_pull = hidden * get_element_bits(mma_kind) / 8;
-    while (num_bytes_per_pull > kPullThreshold) {
+    while (not use_full_pool_fp8_fp4_path and num_bytes_per_pull > kPullThreshold) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }

@@ -582,6 +582,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Hidden bytes are divided into chunks
             constexpr uint32_t kNumHiddenTokenBytes = kHidden * kNumElemBits / 8;
+            DG_STATIC_ASSERT(
+                not kUseFullPoolFP8FP4Path or kNumBytesPerPull == kNumHiddenTokenBytes,
+                "The full-pool MXFP8FP4 path requires a complete-token pull buffer");
             constexpr uint32_t kNumChunks = kNumHiddenTokenBytes / kNumBytesPerPull;
             DG_STATIC_ASSERT(kNumChunks * kNumBytesPerPull == kNumHiddenTokenBytes, "kNumBytesPerPull must divide the token bytes");
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;

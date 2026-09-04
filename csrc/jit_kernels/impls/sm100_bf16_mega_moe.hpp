@@ -133,7 +133,7 @@ static void sm100_bf16_mega_moe(
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
-        num_ring_tokens, 0, MmaKind::BF16);
+        num_ring_tokens, 0, num_shared_experts, MmaKind::BF16);
 
     // Make tensormap
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,

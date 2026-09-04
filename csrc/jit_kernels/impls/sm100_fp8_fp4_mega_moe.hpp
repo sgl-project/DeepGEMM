@@ -191,6 +191,7 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
+        num_shared_experts,
         mma_kind);
 
     // Make tensormap
