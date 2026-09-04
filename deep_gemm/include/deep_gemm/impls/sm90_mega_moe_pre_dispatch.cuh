@@ -25,8 +25,7 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
     const uint32_t num_groups,
     const uint32_t top_k,
     const float routed_scaling_factor) {
-    static_assert(kGroupSize == 32 or kGroupSize == 128,
-                  "SM90 mega-moe pre-dispatch requires per-32 or per-128 SF");
+    static_assert(kGroupSize == 128, "SM90 mega-moe pre-dispatch requires per-128 SF");
     constexpr uint32_t kVecElems = 8;  // 16-byte BF16 load per thread
     static_assert(kGroupSize % kVecElems == 0, "kGroupSize must be a multiple of 8");
     constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;

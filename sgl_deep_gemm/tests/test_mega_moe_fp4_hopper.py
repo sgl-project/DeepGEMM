@@ -608,8 +608,24 @@ _SMOKE = dict(
 )
 
 
-def _layer1_smoke() -> List[Tuple[str, Dict[str, Any]]]:
-    return [('L1.smoke', dict(_SMOKE))]
+def _layer1_smoke(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    return [
+        ('L1.smoke', dict(_SMOKE)),
+        ('L1.kimi_k3_situ_smoke', dict(
+            num_max_tokens_per_rank=8,
+            num_tokens=8,
+            hidden=3584,
+            intermediate_hidden=3072,
+            num_experts=max(16, 8 * num_ranks),
+            num_topk=16,
+            activation='situ',
+            activation_alpha=4.0,
+            activation_linear_beta=25.0,
+            activation_clamp=math.inf,
+            routing_pattern='round_robin',
+            reference_chunk=4,
+        )),
+    ]
 
 
 def _layer3_shape_sweep(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
@@ -758,12 +774,6 @@ def _layer10_kimi_k3(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
         reference_chunk=4,
     )
     return [
-        ('L10.kimi_k3_smoke', dict(
-            common,
-            num_max_tokens_per_rank=8,
-            num_tokens=8,
-            num_experts=8 * num_ranks,
-        )),
         ('L10.kimi_k3_prefill_2wg', dict(
             common,
             num_max_tokens_per_rank=64,
@@ -1540,7 +1550,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     diff_tol = args.diff_tol
     layers: List[Tuple[str, Dict[str, Any]]] = []
     if 1 in args.layers:
-        layers += _layer1_smoke()
+        layers += _layer1_smoke(num_ranks)
     if 3 in args.layers:
         layers += _layer3_shape_sweep(num_ranks)
     if 4 in args.layers:
@@ -1598,7 +1608,8 @@ if __name__ == '__main__':
     parser.add_argument('--local-rank-idx', type=int, default=None)
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 3, 4],
                         help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8, 9, 10). '
-                             'Default: 1 3 4. Layer 8 is the Pro smoke shape; '
+                             'Default: 1 3 4; layer 1 includes a Kimi-K3 SiTU smoke. '
+                             'Layer 8 is the Pro smoke shape; '
                              'layer 9 is the Flash/Pro swapAB small-batch guard; '
                              'layer 10 is Kimi-K3 SiTU/MXFP4 with per-32 weight scales.')
     parser.add_argument('--pro-smoke', action='store_true',
