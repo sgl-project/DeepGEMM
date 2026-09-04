@@ -25,6 +25,15 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
         static_cast<T>(kLCMCandidateBlockM));
 }
 
+// SM90 FP8 and FP4 MegaMoE only select BLOCK_M={64,128}. Scale-factor rows
+// are padded to 128 rows per M block, so BLOCK_M=64 is the exact worst case:
+// two SF rows per payload row. Do not inherit the common BLOCK_M=8 candidate,
+// which would over-allocate each SM90 SF pool by 8x.
+template <typename T>
+CUTLASS_HOST_DEVICE constexpr T get_num_sm90_compute_sf_ring_tokens(T num_ring_tokens) {
+    return num_ring_tokens * static_cast<T>(2);
+}
+
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T block_m) {

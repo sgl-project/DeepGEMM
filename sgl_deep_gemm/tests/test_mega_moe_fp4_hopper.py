@@ -26,352 +26,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-
-# ----------------------------------------------------------------------------
-# CPU-only SM90 FP4 heuristic equivalence guard
-# ----------------------------------------------------------------------------
-
-GENERIC_FALLBACK = "generic"
-
-# Decode -> prefill boundary (expected tokens per expert). Mirrors the C++
-# default of DG_SM90_FP4_PREFILL_E (the CPU mirror assumes the env is unset).
-# 80 = measured: BLOCK_M=64 decode wins for e in [64, 80) (full first m-block),
-# BLOCK_M=128 prefill wins from e=80 up (decode's second m-block mostly empty).
-PREFILL_E = 80.0
-
-
-def act_sf_groups(activation: str) -> Tuple[int, int]:
-    """(input, intermediate) activation-scale group sizes.
-
-    Mirror of C++ ``get_act_sf_grans_for_mega_moe_sm90_fp4``: SiTU defaults
-    to the legacy 128/64 recipe; DG_SM90_FP4_SITU_ACT_GRAN_128_64=0 switches
-    back to the official Kimi-K3 per-32 recipe for accuracy comparison.
-    """
-    if activation == 'situ' and os.environ.get(
-            'DG_SM90_FP4_SITU_ACT_GRAN_128_64', '1') == '0':
-        return 32, 32
-    return 128, 64
-
-
-def table_wave(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-):
-    """Mirror of the simplified FP4 wave heuristic: identical to the FP8 path
-    (``get_num_experts_per_wave_for_mega_moe_sm90``). For 1 <= e <= 4 the
-    result is device-dependent (FP8 pro early-out needs num_sms, else the
-    common fallback), which this CPU mirror models as GENERIC_FALLBACK."""
-    del intermediate_hidden, block_m, block_n
-    e = expected_tokens_per_expert
-    if e < 1.0 or e > 4.0:
-        return num_experts_per_rank
-    return GENERIC_FALLBACK
-
-
-legacy_wave = table_wave
-
-
-def legacy_threads(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    small_block_n = block_m == 64 and block_n == 128
-    e = expected_tokens_per_expert
-    decode_heavy_small_batch = small_block_n and 0.0 < e <= 24.0
-    pro_large_decode_assist_batch = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < PREFILL_E
-    pro_split_n_decode_threads = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < PREFILL_E
-    flash_split_n_decode_threads = small_block_n and intermediate_hidden <= 2048 and 0.0 < e < PREFILL_E
-    two_wg_decode_offload = (
-        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= PREFILL_E
-    )
-    dispatch = (
-        64
-        if decode_heavy_small_batch
-        or flash_split_n_decode_threads
-        or pro_large_decode_assist_batch
-        or two_wg_decode_offload
-        else 128
-    )
-    non_epilogue = (
-        320
-        if pro_split_n_decode_threads or flash_split_n_decode_threads
-        else (
-            192
-            if decode_heavy_small_batch or pro_large_decode_assist_batch or two_wg_decode_offload
-            else 128
-        )
-    )
-    return dispatch, non_epilogue
-
-
-def legacy_epilogue_threads(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    e = expected_tokens_per_expert
-    epilogue_warpgroups = num_epilogue_threads // 128
-    split_n_eligible = block_m == 64 and block_n % 128 == 0
-    split_n_band = 32.0 <= e < PREFILL_E
-    pro_split_n_band = intermediate_hidden >= 3072 and 0.0 < e < PREFILL_E
-    flash_split_n_band = intermediate_hidden <= 2048 and 0.0 < e < PREFILL_E
-    small_split_n_band = flash_split_n_band or pro_split_n_band
-    default_split_n = (
-        split_n_eligible
-        and (split_n_band or small_split_n_band)
-        and (intermediate_hidden <= 2048 or intermediate_hidden >= 3072)
-    )
-    if split_n_eligible and default_split_n:
-        epilogue_warpgroups = 2
-    return epilogue_warpgroups * 128
-
-
-def table_epilogue_threads(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    e = expected_tokens_per_expert
-    epilogue_warpgroups = num_epilogue_threads // 128
-    split_n_eligible = block_m == 64 and block_n % 128 == 0
-    split_n_shape_band = (
-        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < PREFILL_E
-    )
-    if split_n_eligible and split_n_shape_band:
-        epilogue_warpgroups = 2
-    return epilogue_warpgroups * 128
-
-
-def table_threads(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    small_block_n_kernel = block_m == 64 and block_n == 128
-    e = expected_tokens_per_expert
-    split_n_shape_band = (
-        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < PREFILL_E
-    )
-    split_n_decode_thread_kernel_band = small_block_n_kernel and split_n_shape_band
-    two_wg_decode_offload_kernel_band = (
-        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= PREFILL_E
-    )
-    decode_assist_thread_kernel_band = two_wg_decode_offload_kernel_band or (
-        small_block_n_kernel and 0.0 < e <= 24.0
-    )
-    dispatch = 64 if split_n_decode_thread_kernel_band or decode_assist_thread_kernel_band else 128
-    non_epilogue = (
-        320
-        if split_n_decode_thread_kernel_band
-        else (192 if decode_assist_thread_kernel_band else 128)
-    )
-    return dispatch, non_epilogue
-
-
-def table_stage_cap(
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-):
-    """Mirror of the simplified pipeline config: no FP4 stage cap (FP8 parity;
-    the pipeline always uses as many stages as SMEM allows)."""
-    del expected_tokens_per_expert, intermediate_hidden, block_m, block_n
-    return 0
-
-
-legacy_stage_cap = table_stage_cap
-
-
-def legacy_config(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    epilogue_threads = legacy_epilogue_threads(
-        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    dispatch_threads, non_epilogue_threads = legacy_threads(
-        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, epilogue_threads
-    )
-    return {
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": 128,
-        "num_experts_per_wave": legacy_wave(
-            num_experts_per_rank, expected_tokens_per_expert, intermediate_hidden, block_m, block_n
-        ),
-        "num_dispatch_threads": dispatch_threads,
-        "num_non_epilogue_threads": non_epilogue_threads,
-        "num_epilogue_threads": epilogue_threads,
-        "default_num_stages_cap": legacy_stage_cap(
-            expected_tokens_per_expert, intermediate_hidden, block_m, block_n
-        ),
-    }
-
-
-def table_config(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-    block_m: int,
-    block_n: int,
-    num_epilogue_threads: int,
-):
-    epilogue_threads = table_epilogue_threads(
-        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    dispatch_threads, non_epilogue_threads = table_threads(
-        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, epilogue_threads
-    )
-    return {
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": 128,
-        "num_experts_per_wave": table_wave(
-            num_experts_per_rank, expected_tokens_per_expert, intermediate_hidden, block_m, block_n
-        ),
-        "num_dispatch_threads": dispatch_threads,
-        "num_non_epilogue_threads": non_epilogue_threads,
-        "num_epilogue_threads": epilogue_threads,
-        "default_num_stages_cap": table_stage_cap(
-            expected_tokens_per_expert, intermediate_hidden, block_m, block_n
-        ),
-    }
-
-
-def table_api_features(
-    num_experts_per_rank: int,
-    expected_tokens_per_expert: float,
-    intermediate_hidden: int,
-):
-    """CPU mirror of the simplified ``get_fp4_sm90_api_defaults``
-    (csrc/apis/sm90_mega.hpp): one decode/prefill split plus a single swapAB
-    threshold, shape-agnostic (no per-(shape x e-band) table)."""
-    del num_experts_per_rank, intermediate_hidden
-    e = expected_tokens_per_expert
-    prefill = e >= PREFILL_E
-    decode = 0.0 < e < PREFILL_E
-    return {
-        "math_wg_participates": False,
-        "first_decode_assist_warp": 2,
-        "wide_load_decode": decode,
-        "early_b_decode": prefill,
-        "decode_done_mbarrier": e > 0.0,
-        "l2_arrival_counter": False,
-        "ss_nsplit": prefill,
-        "swap_ab": decode and e < 16.0,
-        "swap_ab_fast_amax": False,
-    }
-
-
-# The legacy/table split originally guarded a like-for-like band-table
-# refactor. The simplified defaults are a single closed form shared by both
-# names, so the `check_case` equivalence assert stays trivially green while
-# still exercising the wave/thread/stage-cap guards above.
-legacy_api_features = table_api_features
-
-
-def check_case(num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads):
-    old = legacy_wave(num_experts_per_rank, e, intermediate_hidden, block_m, block_n)
-    new = table_wave(num_experts_per_rank, e, intermediate_hidden, block_m, block_n)
-    assert old == new, (
-        f"wave mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
-        f"block=({block_m},{block_n}) old={old} new={new}"
-    )
-    old_threads = legacy_threads(e, intermediate_hidden, block_m, block_n, num_epilogue_threads)
-    new_threads = table_threads(e, intermediate_hidden, block_m, block_n, num_epilogue_threads)
-    assert old_threads == new_threads, (
-        f"thread mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
-        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
-        f"old={old_threads} new={new_threads}"
-    )
-    old_epilogue = legacy_epilogue_threads(
-        e, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    new_epilogue = table_epilogue_threads(
-        e, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    assert old_epilogue == new_epilogue, (
-        f"epilogue mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
-        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
-        f"old={old_epilogue} new={new_epilogue}"
-    )
-    old_stage_cap = legacy_stage_cap(e, intermediate_hidden, block_m, block_n)
-    new_stage_cap = table_stage_cap(e, intermediate_hidden, block_m, block_n)
-    assert old_stage_cap == new_stage_cap, (
-        f"stage cap mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
-        f"block=({block_m},{block_n}) old={old_stage_cap} new={new_stage_cap}"
-    )
-    old_config = legacy_config(
-        num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    new_config = table_config(
-        num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads
-    )
-    assert old_config == new_config, (
-        f"config mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
-        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
-        f"old={old_config} new={new_config}"
-    )
-    old_features = legacy_api_features(num_experts_per_rank, e, intermediate_hidden)
-    new_features = table_api_features(num_experts_per_rank, e, intermediate_hidden)
-    assert old_features == new_features, (
-        f"API feature mismatch n={num_experts_per_rank} e={e} "
-        f"ih={intermediate_hidden} old={old_features} new={new_features}"
-    )
-
-
-def _run_sm90_fp4_heuristic_checks():
-    e_values = {
-        0.0, 0.125, 0.249, 0.25, 0.374, 0.375, 0.499, 0.5,
-        0.749, 0.75, 0.999, 1.0, 1.499, 1.5, 1.999, 2.0,
-        2.999, 3.0, 3.001, 4.0, 5.999, 6.0, 6.001, 11.999,
-        12.0, 12.001, 23.999, 24.0, 24.001, 31.999, 32.0,
-        47.999, 48.0, 63.999, 64.0, 64.001,
-    }
-    num_experts_per_rank_values = (1, 7, 8, 15, 16, 23, 24, 31, 32, 47, 48, 64, 96)
-    intermediate_hidden_values = (1024, 2048, 2500, 3072, 4096)
-    block_values = ((64, 128), (64, 256), (128, 128), (64, 64))
-    epilogue_thread_values = (128, 256, 512)
-
-    checked = 0
-    for n in num_experts_per_rank_values:
-        for e in sorted(e_values):
-            for ih in intermediate_hidden_values:
-                for block_m, block_n in block_values:
-                    for num_epilogue_threads in epilogue_thread_values:
-                        check_case(n, e, ih, block_m, block_n, num_epilogue_threads)
-                        checked += 1
-
-    for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256):
-        check_case(32, batch * 6 / 32, 2048, 64, 128, 256)
-        check_case(48, batch * 6 / 48, 3072, 64, 128, 256)
-        checked += 2
-
-    print(f"SM90 FP4 heuristic equivalence passed: {checked} cases")
-
-
-
-if __name__ == '__main__' and '--check-heuristics-only' in sys.argv:
-    _run_sm90_fp4_heuristic_checks()
-    sys.exit(0)
-
 import torch
 import torch.distributed as dist
 
@@ -395,6 +49,8 @@ from test_mega_moe_hopper import (
 )
 
 
+INPUT_ACT_SF_GROUP = 128
+INTERMEDIATE_ACT_SF_GROUP = 64
 SM90_FP4_KERNEL_NAME = "sm90_fp8_fp4_mega_moe_impl"
 
 
@@ -702,7 +358,8 @@ def _reference_fused(
     combine_buf = torch.zeros(
         mg, num_topk, hidden, dtype=torch.float32, device='cuda')
 
-    input_sf_group, intermediate_sf_group = act_sf_groups(activation)
+    input_sf_group = INPUT_ACT_SF_GROUP
+    intermediate_sf_group = INTERMEDIATE_ACT_SF_GROUP
     x_fp32 = _dequant_per_token_grouped(
         x_fp8_g, x_sf_g, input_sf_group)  # (Mg, H)
 
@@ -783,7 +440,7 @@ def _run_scenario(
     activation_alpha = float(cfg.get('activation_alpha', 4.0))
     activation_linear_beta = float(
         cfg.get('activation_linear_beta', 25.0))
-    input_sf_group = act_sf_groups(activation)[0]
+    input_sf_group = INPUT_ACT_SF_GROUP
     fast_math = cfg.get('fast_math', True)
     input_pattern = cfg.get('input_pattern', 'random')
     routing_pattern = cfg.get('routing_pattern', 'random')
@@ -1013,16 +670,9 @@ def _layer6_dsv4_checkpoint(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _layer7_dsv4_2wg(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    # 2-WG split-MN accuracy guard. num_tokens=512 drives
-    # expected_tokens_per_expert = 512 * num_topk / experts_per_rank
-    #                            = 512 * 6 / (256 / 8) = 96 >= 64,
-    # so get_block_config_for_mega_moe_sm90 takes the auto_split_mn branch:
-    # block_m=128 with TWO epilogue warpgroups. This is the only accuracy
-    # scenario that exercises the 2-WG path; L1/L3/L4/L5 are all 1-WG
-    # (num_tokens<=128 -> expected<64). It guards the default that turns the
-    # math warpgroup's FP4 decode OFF on the 2-WG path (decode is offloaded
-    # to the assist warps and written to the shared decoded-B smem tile, so the
-    # numerics must be identical to the math-on path).
+    # 2-WG split-MN accuracy guard. num_tokens=512 gives 96 expected tokens per
+    # expert, above the SwiGLU prefill boundary, and therefore exercises the
+    # BLOCK_M=128 path with two epilogue warpgroups and assist-only FP4 decode.
     assert num_ranks == 8, 'DSV4 2-WG shape test expects 8 ranks'
     return [('L7.dsv4_2wg_nt512_h4096_ih2048_e256_k6', dict(
         num_max_tokens_per_rank=512, num_tokens=512,
@@ -1073,7 +723,7 @@ def _layer9_swapab_small_batch(num_ranks: int) -> List[Tuple[str, Dict[str, Any]
     flash = dict(common, hidden=4096, intermediate_hidden=2048, num_experts=256)
     pro = dict(common, hidden=7168, intermediate_hidden=3072, num_experts=384,
                reference_chunk=16)
-    pro_fast_amax = dict(common, hidden=1024, intermediate_hidden=3072,
+    pro_threshold = dict(common, hidden=1024, intermediate_hidden=3072,
                          num_experts=384, reference_chunk=16)
 
     return [
@@ -1089,8 +739,8 @@ def _layer9_swapab_small_batch(num_ranks: int) -> List[Tuple[str, Dict[str, Any]
         )),
         ('L9.pro_swapab_b4', dict(pro, num_tokens=4)),
         ('L9.pro_swapab_b16', dict(pro, num_tokens=16)),
-        ('L9.pro_swapab_b128_fast_amax', dict(
-            pro_fast_amax, num_tokens=128, num_launch_repeats=2,
+        ('L9.pro_swapab_b128_threshold', dict(
+            pro_threshold, num_tokens=128, num_launch_repeats=2,
         )),
     ]
 
@@ -1156,7 +806,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     activation = args.activation
     activation_alpha = args.activation_alpha
     activation_linear_beta = args.activation_linear_beta
-    fused_input_sf_group = act_sf_groups(activation)[0]
+    fused_input_sf_group = INPUT_ACT_SF_GROUP
     num_experts_per_rank = num_experts // num_ranks
     run_fp4_runtime_enabled = args.fp4_mode == "runtime"
     run_fp4_predecode_enabled = args.fp4_mode == "predecode"
@@ -1940,8 +1590,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Hopper FP4 MegaMoE tests and benchmark')
-    parser.add_argument('--check-heuristics-only', action='store_true',
-                        help='Run CPU-only SM90 FP4 heuristic equivalence checks and exit')
     parser.add_argument('--bench', action='store_true',
                         help='Run FP4 fused vs FP8 low-latency benchmark mode')
     parser.add_argument('--ncu-profile-only', action='store_true',
@@ -1952,7 +1600,7 @@ if __name__ == '__main__':
                         help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8, 9, 10). '
                              'Default: 1 3 4. Layer 8 is the Pro smoke shape; '
                              'layer 9 is the Flash/Pro swapAB small-batch guard; '
-                             'layer 10 is Kimi-K3 SiTU/MXFP8 group-32.')
+                             'layer 10 is Kimi-K3 SiTU/MXFP4 with per-32 weight scales.')
     parser.add_argument('--pro-smoke', action='store_true',
                         help='Also run DeepSeek-V4-Pro smoke scenarios')
     parser.add_argument('--swapab-smoke', action='store_true',

@@ -206,47 +206,16 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     return {num_stages, smem_size};
 }
 
-// Decode -> prefill boundary for the FP4 MegaMoE path, in expected tokens per
-// expert. At the boundary the kernel flips from the decode config (BLOCK_M=64,
-// split-N epilogue) to the prefill config (BLOCK_M=128, 2-WG decode offload).
-//
-// SwiGLU 128/64 keeps the existing H20-tuned boundary at e=80. Kimi's SiTU
-// 32/32 path pays four FP32 activation-scale promotes per K128 and performs
-// materially better with the deeper BLOCK_M=64 decode pipeline throughout the
-// measured batch/rank range 1..8192 (e<=1171 for Kimi's 896 experts/top-k 16).
-// Keep its boundary independent so changing Kimi does not regress DSV4.
-// Activation-scale granularities (L1 input, L2 intermediate). SiTU defaults to
-// the legacy 128/64 recipe (decided 2026-07-29: the per-32 promotion loop costs
-// ~15% at large batch and cannot be pipelined on SM90, see doc sections
-// 15.7-15.11). DG_SM90_FP4_SITU_ACT_GRAN_128_64=0 switches back to the
-// official Kimi-K3 per-32 recipe for accuracy comparison.
-static std::pair<int, int> get_act_sf_grans_for_mega_moe_sm90_fp4(
-    const bool& use_situ) {
-    if (use_situ and get_env<int>("DG_SM90_FP4_SITU_ACT_GRAN_128_64", 1) == 0)
-        return {32, 32};
-    return {128, 64};
+// Activation-scale granularities (L1 input, L2 intermediate). Both SwiGLU and
+// SiTU use the same fixed recipe on SM90.
+static constexpr int kSM90FP4L1ActSFGranK = 128;
+static constexpr int kSM90FP4L2ActSFGranK = 64;
+
+static float get_fp4_sm90_swiglu_prefill_threshold() {
+    return static_cast<float>(get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
 }
 
-static float get_fp4_sm90_prefill_threshold(const bool& use_situ) {
-    // The high SiTU decode threshold only applies to the per-32 recipe, whose
-    // promotion drain gets amplified by the BLOCK_M=128 prefill bundle (docs
-    // 13/15.7). With the default 128/64 recipe the prefill bundle itself is
-    // healthy again, but Kimi's routing density (e = batch/7 for 896 experts,
-    // top-k 16) lands e=146/293 at batch 1024/2048 where a BLOCK_M=128 tile
-    // wastes 43%/24% of its rows; measured decode-config wins there are
-    // 20%/10%, while e=585 (batch 4096) already favors prefill. Hence the
-    // e=512 boundary, distinct from swiglu's e=80 (doc 15.12).
-    const bool situ_per32 = use_situ and
-        get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 32;
-    if (situ_per32)
-        return static_cast<float>(get_env<int>("DG_SM90_FP4_SITU_PREFILL_E", 2048));
-    return static_cast<float>(
-        use_situ
-            ? get_env<int>("DG_SM90_FP4_SITU_PREFILL_E", 512)
-            : get_env<int>("DG_SM90_FP4_PREFILL_E", 80));
-}
-
-// ---- Analytic config cost model (SiTU 128/64 recipe) ----
+// ---- Analytic config cost model (SiTU) ----
 // Replaces the hand-tuned swapAB/decode/prefill boundaries with a per-expert
 // expected-cost comparison. Fitted 2026-07-30 on 21 same-shape A/B
 // measurements (docs 15.12-15.15); all 21 classify correctly, and the
@@ -304,36 +273,16 @@ static FP4SM90ConfigKind get_fp4_sm90_situ_config_kind(
                                       : FP4SM90ConfigKind::kDecode;
 }
 
-static bool use_fp4_sm90_situ_cost_model(const bool& use_situ) {
-    return use_situ and
-           get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128 and
-           get_env<int>("DG_SM90_FP4_COST_MODEL", 1) != 0;
-}
-
 // Whether `e` should run the prefill bundle (BLOCK_M=128 + early_b_decode +
-// ss_nsplit). SiTU 128/64 defaults to the analytic cost model above
-// (DG_SM90_FP4_COST_MODEL=0 falls back to the hand-tuned bands, where the
-// (76, 112] mid band halves per-expert B decodes at equal M padding --
-// measured +2.6..+4.7% at batch 544..768 -- while near e~128 routing spread
-// overflows single 128-tiles so BLOCK_M=64 wins big again; doc 15.14).
+// ss_nsplit). SiTU always uses the analytic cost model above; SwiGLU keeps its
+// measured scalar boundary.
 static bool is_fp4_sm90_prefill_band(const float& expected_tokens_per_expert,
                                      const bool& use_situ) {
-    if (use_fp4_sm90_situ_cost_model(use_situ))
+    if (use_situ)
         return get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
                FP4SM90ConfigKind::kPrefill;
-    const bool situ_12864 = use_situ and
-        get_act_sf_grans_for_mega_moe_sm90_fp4(true).first == 128;
-    if (situ_12864) {
-        const auto lo = static_cast<float>(
-            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_LO", 76));
-        const auto hi = static_cast<float>(
-            get_env<int>("DG_SM90_FP4_SITU_MIDBAND_HI", 112));
-        if (expected_tokens_per_expert > lo and
-            expected_tokens_per_expert <= hi)
-            return true;
-    }
     return expected_tokens_per_expert >=
-           get_fp4_sm90_prefill_threshold(use_situ);
+           get_fp4_sm90_swiglu_prefill_threshold();
 }
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
@@ -380,12 +329,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const int& l1_act_sf_gran_k,
-    const int& l2_act_sf_gran_k,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false) {
+    const bool& use_swap_ab = false) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -400,9 +346,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd_swap_l1 = use_swap_ab
         ? block_m * (block_n / 2) *
-              (use_swap_ab_fast_amax
-                   ? static_cast<int>(sizeof(uint8_t))
-                   : static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(uint8_t)))
+              (static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(uint8_t)))
         : 0;
     const int smem_cd_base = std::max(smem_cd_l1, smem_cd_l2);
     const int smem_cd = align(std::max(smem_cd_base, smem_cd_swap_l1), kSmemAlignment);
@@ -415,14 +359,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
         ? (block_n / num_epilogue_warpgroups) / 2
         : 0;
     const bool split_n_shares_sf =
-        fp4_split_n_eligible and wg_l1_out_block_n < l2_act_sf_gran_k;
+        fp4_split_n_eligible and wg_l1_out_block_n < kSM90FP4L2ActSFGranK;
     const int fp4_split_n_amax_scratch_slots = 32 * 2 * 2;
     const int smem_amax_scratch = split_n_shares_sf
         ? align(fp4_split_n_amax_scratch_slots * static_cast<int>(sizeof(uint32_t)),
                 kSmemAlignment)
         : 0;
-    const int l1_sfa_groups_per_block_k = block_k / l1_act_sf_gran_k;
-    const int l2_sfa_groups_per_block_k = block_k / l2_act_sf_gran_k;
+    const int l1_sfa_groups_per_block_k = block_k / kSM90FP4L1ActSFGranK;
+    const int l2_sfa_groups_per_block_k = block_k / kSM90FP4L2ActSFGranK;
     const int smem_sfa_per_stage =
         align(std::max(l1_sfa_groups_per_block_k, l2_sfa_groups_per_block_k) *
                   block_m * static_cast<int>(sizeof(float)),
@@ -460,20 +404,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
-    const int& l1_act_sf_gran_k,
-    const int& l2_act_sf_gran_k,
     const bool& use_situ,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false) {
-    DG_HOST_ASSERT(l1_act_sf_gran_k == 32 or l1_act_sf_gran_k == 128);
-    DG_HOST_ASSERT(l2_act_sf_gran_k == 32 or l2_act_sf_gran_k == 64);
-    DG_HOST_ASSERT(128 % l1_act_sf_gran_k == 0);
-    DG_HOST_ASSERT(128 % l2_act_sf_gran_k == 0);
-    DG_HOST_ASSERT(not use_situ or
-                   (l1_act_sf_gran_k == 32 and l2_act_sf_gran_k == 32) or
-                   (l1_act_sf_gran_k == 128 and l2_act_sf_gran_k == 64));
+    const bool& use_swap_ab = false) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
         use_situ);
@@ -543,9 +477,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
-        l1_act_sf_gran_k, l2_act_sf_gran_k,
         use_early_b_decode, use_decode_done_mbarrier,
-        use_swap_ab, use_swap_ab_fast_amax);
+        use_swap_ab);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -559,11 +492,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, use_situ={}, prefill_threshold={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
+            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, use_situ={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
-            use_situ, get_fp4_sm90_prefill_threshold(use_situ),
-            use_early_b_decode, use_decode_done_mbarrier,
-            use_swap_ab, use_swap_ab_fast_amax);
+            use_situ, use_early_b_decode, use_decode_done_mbarrier, use_swap_ab);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -64,33 +63,26 @@ static void check_sm90_fp4_sfb_layout(const torch::Tensor& sf,
 }
 
 struct FP4SM90APIDefaults {
-    bool math_wg_participates_in_decode;
-    int num_math_wg_decode_warps;
-    int first_decode_assist_warp;
     bool wide_load_decode;
     bool early_b_decode;
     bool decode_done_mbarrier;
-    bool l2_arrival_counter;
     bool ss_nsplit;
     bool swap_ab;
-    bool swap_ab_fast_amax;
 };
 
 static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const bool& use_situ) {
+    const bool& use_situ) {
     // Simplified, shape-agnostic defaults, mirroring the FP8 path's style
     // (`should_use_swap_ab_for_mega_moe_sm90`): one decode/prefill split plus a
     // single swapAB threshold. The historical per-(shape x e-band) table was
     // tuned point-by-point on benchmark batches; on the shapes that matter it
     // collapsed to constants plus a few sliver bands, so it is retired.
-    (void)intermediate_hidden;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    // Decode -> prefill boundary is activation-specific (Kimi/SiTU keeps its
-    // own tuning so DSV4/SwiGLU stays on e=80), and the SiTU 128/64 recipe
-    // additionally has a non-monotonic prefill mid band; share the predicate
-    // with the block-config heuristics so the feature bundle never mixes.
+    // SiTU uses the analytic cost model while SwiGLU keeps its scalar boundary;
+    // share the predicate with the block-config heuristics so the feature
+    // bundle never mixes.
     const bool prefill_band = is_fp4_sm90_prefill_band(
         expected_tokens_per_expert, use_situ);
     const bool decode_band =
@@ -103,26 +95,21 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // (FP8 uses 30; the FP4 kernel pays extra decode work on the swapped
     // path, and larger e also lands wider WGMMA-N buckets). The original
     // swiglu tuning had 16; doc 15.15. DG_SM90_FP4_SWAP_AB_MAX_E overrides.
-    // With the SiTU 128/64 cost model active, the swapAB decision comes from
+    // With the SiTU cost model active, the swapAB decision comes from
     // the same argmin as the prefill band so all three kinds stay coherent.
     const float swap_ab_max_e = static_cast<float>(
         get_env<int>("DG_SM90_FP4_SWAP_AB_MAX_E", 20));
-    const bool swap_ab = use_fp4_sm90_situ_cost_model(use_situ)
-        ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
-           FP4SM90ConfigKind::kSwapAB)
-        : (swap_ab_env_enabled and decode_band and
-           expected_tokens_per_expert < swap_ab_max_e);
+    const bool swap_ab = swap_ab_env_enabled and
+        (use_situ
+            ? (get_fp4_sm90_situ_config_kind(expected_tokens_per_expert) ==
+               FP4SM90ConfigKind::kSwapAB)
+            : (decode_band and expected_tokens_per_expert < swap_ab_max_e));
     return {
-        /*math_wg_participates_in_decode=*/ false,
-        /*num_math_wg_decode_warps=*/ 0,
-        /*first_decode_assist_warp=*/ 2,
         /*wide_load_decode=*/ decode_band,
         /*early_b_decode=*/ prefill_band,
         /*decode_done_mbarrier=*/ expected_tokens_per_expert > 0.0f,
-        /*l2_arrival_counter=*/ false,
         /*ss_nsplit=*/ prefill_band,
-        /*swap_ab=*/ swap_ab,
-        /*swap_ab_fast_amax=*/ false
+        /*swap_ab=*/ swap_ab
     };
 }
 
@@ -135,10 +122,6 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
-    const bool use_situ = activation == "situ";
-    const auto [sm90_l1_act_sf_gran_k, sm90_l2_act_sf_gran_k] =
-        get_act_sf_grans_for_mega_moe_sm90_fp4(use_situ);
-
     const auto workspace = layout::SM90Workspace(
         nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
@@ -146,9 +129,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout =
-        layout::Data(hidden * static_cast<int>(sizeof(float)) / sm90_l1_act_sf_gran_k);
+        layout::Data(hidden * static_cast<int>(sizeof(float)) / kSM90FP4L1ActSFGranK);
     const auto fp8_intermediate_sf_layout =
-        layout::Data(intermediate_hidden * static_cast<int>(sizeof(float)) / sm90_l2_act_sf_gran_k);
+        layout::Data(intermediate_hidden * static_cast<int>(sizeof(float)) / kSM90FP4L2ActSFGranK);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
     const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -167,13 +150,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
-    int num_max_padded_sf_pool_tokens = 0;
-    for (int block_m: layout::kCandidateBlockM) {
-        num_max_padded_sf_pool_tokens = std::max(
-            num_max_padded_sf_pool_tokens,
-            layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m)
-        );
-    }
+    const auto num_max_padded_sf_pool_tokens = static_cast<int>(
+        layout::get_num_sm90_compute_sf_ring_tokens(num_max_pool_tokens));
 
     const auto l1_token_buffer = layout::Buffer(
         fp8_token_layout, 1, num_max_pool_tokens,
@@ -197,8 +175,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
         l2_sf_buffer.get_end_ptr());
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
-    DG_HOST_ASSERT(hidden % sm90_l1_act_sf_gran_k == 0);
-    DG_HOST_ASSERT(intermediate_hidden % sm90_l2_act_sf_gran_k == 0);
+    DG_HOST_ASSERT(hidden % kSM90FP4L1ActSFGranK == 0);
+    DG_HOST_ASSERT(intermediate_hidden % kSM90FP4L2ActSFGranK == 0);
 
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
         auto x = torch::from_blob(
@@ -207,7 +185,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto x_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(input_sf_buffer.base)),
-            {num_max_tokens_per_rank, hidden / sm90_l1_act_sf_gran_k},
+            {num_max_tokens_per_rank, hidden / kSM90FP4L1ActSFGranK},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto topk_idx = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(input_topk_idx_buffer.base)),
@@ -223,7 +201,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, hidden / sm90_l1_act_sf_gran_k},
+            {num_max_padded_sf_pool_tokens, hidden / kSM90FP4L1ActSFGranK},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l2_acts = torch::from_blob(
@@ -232,7 +210,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, intermediate_hidden / sm90_l2_act_sf_gran_k},
+            {num_max_padded_sf_pool_tokens, intermediate_hidden / kSM90FP4L2ActSFGranK},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
@@ -403,8 +381,7 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
     const auto fp4_defaults = get_fp4_sm90_api_defaults(
-        num_experts_per_rank, num_tokens, num_topk, intermediate_hidden,
-        use_situ);
+        num_experts_per_rank, num_tokens, num_topk, use_situ);
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
@@ -420,16 +397,11 @@ static void fp8_fp4_mega_moe_sm90(
                           activation_alpha,
                           activation_linear_beta,
                           activation_clamp, fast_math,
-                          fp4_defaults.math_wg_participates_in_decode,
-                          fp4_defaults.num_math_wg_decode_warps,
-                          fp4_defaults.first_decode_assist_warp,
                           fp4_defaults.wide_load_decode,
                           fp4_defaults.early_b_decode,
                           fp4_defaults.decode_done_mbarrier,
-                          fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
-                          fp4_defaults.swap_ab,
-                          fp4_defaults.swap_ab_fast_amax);
+                          fp4_defaults.swap_ab);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
