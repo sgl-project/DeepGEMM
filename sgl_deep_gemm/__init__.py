@@ -300,6 +300,7 @@ class SM90SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.activation = activation
 
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
             group.size(), num_experts,
@@ -392,6 +393,118 @@ def transform_weights_for_mega_moe_sm90(
         return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
 
     return (_interleave_one(l1_fp8), l1_sf), l2_weights
+
+
+def transform_weights_for_mega_moe_sm90_fp4(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Pack SM90 FP4 MegaMoE weights without changing the generic mega module."""
+    def _interleave_one(t, gran: int = 8) -> torch.Tensor:
+        g, n, *rest = t.shape
+        half = n // 2
+        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+        up = t[:, half:].reshape(g, half // gran, gran, *rest)
+        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+
+    def _pack_fp32_sf_to_ue8m0_kmajor(sf_fp32: torch.Tensor) -> torch.Tensor:
+        assert sf_fp32.dtype == torch.float32, f"unexpected SF dtype {sf_fp32.dtype}"
+        e, n, k_groups = sf_fp32.shape
+        assert k_groups % 4 == 0, f"K/32={k_groups} must be a multiple of 4"
+        bits = sf_fp32.view(torch.int32)
+        ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xff)).to(torch.uint8)
+        ue8m0 = ue8m0.contiguous().view(e, n, k_groups // 4, 4)
+        return ue8m0.view(torch.int32).reshape(e, n, k_groups // 4).contiguous()
+
+    def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
+        assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
+        return fp4.contiguous().view(torch.int8)
+
+    l1_fp4, l1_sf_fp32 = l1_weights
+    l2_fp4, l2_sf_fp32 = l2_weights
+    l1_fp4 = _as_packed_fp4_storage(l1_fp4)
+    l2_fp4 = _as_packed_fp4_storage(l2_fp4)
+    l1_fp4 = _interleave_one(l1_fp4)
+    l1_sf_fp32 = _interleave_one(l1_sf_fp32)
+    return (
+        (l1_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l1_sf_fp32)),
+        (l2_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l2_sf_fp32)),
+    )
+
+
+def fp8_fp4_mega_moe(y: torch.Tensor,
+                     l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                     l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                     sym_buffer,
+                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                     recipe: Tuple[int, int, int] = (1, 1, 32),
+                     activation: str = 'swiglu',
+                     activation_clamp: Optional[float] = None,
+                     fast_math: bool = True,
+                     use_x_scales: bool = False,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     *,
+                     activation_alpha: Optional[float] = None,
+                     activation_linear_beta: Optional[float] = None):
+    if activation == 'situ' and activation_clamp is not None:
+        raise ValueError('activation_clamp is not supported with SiTU')
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
+        if activation_alpha is not None or activation_linear_beta is not None:
+            raise ValueError(
+                'activation_alpha and activation_linear_beta are only supported '
+                'by the SM90 FP8xFP4 MegaMoE implementation'
+            )
+        return mega.fp8_fp4_mega_moe(
+            y,
+            l1_weights,
+            l2_weights,
+            sym_buffer,
+            shared_l1_weights=shared_l1_weights,
+            shared_l2_weights=shared_l2_weights,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            recipe=recipe,
+            activation=activation,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+            use_x_scales=use_x_scales,
+            l1_alphas=l1_alphas,
+            l2_alphas=l2_alphas,
+            l2_act_scales=l2_act_scales,
+        )
+
+    if shared_l1_weights is not None or shared_l2_weights is not None:
+        raise ValueError('SM90 FP8xFP4 MegaMoE does not support shared expert weights')
+    if use_x_scales or any(t is not None for t in (l1_alphas, l2_alphas, l2_act_scales)):
+        raise ValueError(
+            'SM90 FP8xFP4 MegaMoE does not support use_x_scales, l1_alphas, '
+            'l2_alphas, or l2_act_scales'
+        )
+    assert activation in ('swiglu', 'situ')
+    assert getattr(sym_buffer, 'activation', activation) == activation, (
+        f'symmetric buffer activation={getattr(sym_buffer, "activation", None)!r} '
+        f'does not match kernel activation={activation!r}'
+    )
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
+    _C.fp8_fp4_mega_moe_sm90(
+        y,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        activation_alpha, activation_linear_beta,
+        fast_math
+    )
 
 
 def fp8_mega_moe(y: torch.Tensor,

@@ -187,7 +187,8 @@ sm90_fp8_mega_moe_impl(void* y,
                      "Math warpgroup start must be 128-thread aligned");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-    DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
+    DG_STATIC_ASSERT(BLOCK_M == 64 or BLOCK_M == 128,
+                     "SM90 MegaMoE SF sizing assumes BLOCK_M is 64 or 128");
     DG_STATIC_ASSERT(BLOCK_N == 128 or BLOCK_N == 256 or BLOCK_N == 512,
                      "SM90 MegaMoE supports CTA BLOCK_N=128/256/512");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
