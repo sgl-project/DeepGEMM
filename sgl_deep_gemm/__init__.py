@@ -436,26 +436,51 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer,
+                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
+                     fast_math: bool = True,
+                     use_x_scales: bool = False,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     *,
                      activation_alpha: Optional[float] = None,
-                     activation_linear_beta: Optional[float] = None,
-                     fast_math: bool = True):
+                     activation_linear_beta: Optional[float] = None):
     if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9):
+        if activation_alpha is not None or activation_linear_beta is not None:
+            raise ValueError(
+                'activation_alpha and activation_linear_beta are only supported '
+                'by the SM90 FP8xFP4 MegaMoE implementation'
+            )
         return mega.fp8_fp4_mega_moe(
             y,
             l1_weights,
             l2_weights,
             sym_buffer,
-            cumulative_local_expert_recv_stats,
-            recipe,
-            activation,
-            activation_clamp,
-            fast_math,
+            shared_l1_weights=shared_l1_weights,
+            shared_l2_weights=shared_l2_weights,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            recipe=recipe,
+            activation=activation,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+            use_x_scales=use_x_scales,
+            l1_alphas=l1_alphas,
+            l2_alphas=l2_alphas,
+            l2_act_scales=l2_act_scales,
         )
 
+    if shared_l1_weights is not None or shared_l2_weights is not None:
+        raise ValueError('SM90 FP8xFP4 MegaMoE does not support shared expert weights')
+    if use_x_scales or any(t is not None for t in (l1_alphas, l2_alphas, l2_act_scales)):
+        raise ValueError(
+            'SM90 FP8xFP4 MegaMoE does not support use_x_scales, l1_alphas, '
+            'l2_alphas, or l2_act_scales'
+        )
     assert activation in ('swiglu', 'situ')
     assert getattr(sym_buffer, 'activation', activation) == activation, (
         f'symmetric buffer activation={getattr(sym_buffer, "activation", None)!r} '

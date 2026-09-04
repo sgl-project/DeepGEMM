@@ -67,7 +67,7 @@ static void sm90_mega_moe_pre_dispatch(
     const int& num_tokens,
     const int& group_size,
     const float& routed_scaling_factor) {
-    DG_HOST_ASSERT(group_size == 32 or group_size == 128);
+    DG_HOST_ASSERT(group_size == 128);
     DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(x.is_contiguous());
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt32);
