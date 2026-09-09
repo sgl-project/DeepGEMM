@@ -30,24 +30,29 @@ static void mega_moe_pre_dispatch_sm90(
         num_tokens, group_size, routed_scaling_factor);
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool& use_fp8_dispatch, const std::string& activation,
+    const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(num_shared_experts >= 0);
 
     const auto workspace = layout::SM90Workspace(
         nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
+    const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
     const auto fp8_token_layout = layout::Data(hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 16);
+    const auto fp8_shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden);
+    const auto fp8_shared_intermediate_sf_layout = layout::Data(shared_intermediate_hidden / 16);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
     const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -91,9 +96,21 @@ get_symm_buffer_size_for_sm90_mega_moe(
         fp8_intermediate_sf_layout, 1, num_max_padded_sf_pool_tokens,
         l2_token_buffer.get_end_ptr());
 
+    // The fused shared expert reduces through one extra combine slot on the local rank
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, num_topk, num_max_tokens_per_rank,
+        bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1 : 0), num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
+
+    // Fused shared-expert area, appended after the combine buffer so the routed
+    // regions keep their relative order and are zero-sized when the shared expert is
+    // disabled. Both are indexed by the local token and the SF buffer is K-major
+    // (per-64 K groups), so no SF-pool padding is needed.
+    const auto shared_l2_token_buffer = layout::Buffer(
+        fp8_shared_intermediate_token_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+        combine_token_buffer.get_end_ptr());
+    const auto shared_l2_sf_buffer = layout::Buffer(
+        fp8_shared_intermediate_sf_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+        shared_l2_token_buffer.get_end_ptr());
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
 
@@ -132,15 +149,34 @@ get_symm_buffer_size_for_sm90_mega_moe(
             {num_max_padded_sf_pool_tokens, intermediate_hidden / 64},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
-        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+        // Fused shared expert: post-SwiGLU FP8 pool plus its M-major per-64 float SF
+        // (token-contiguous inner stride so a (BLOCK_M, 1) TMA box is legal; same
+        // layout-class as the routed L2 acts SF pool). Zero-sized when the shared
+        // expert is off (kept defined so the returned tuple type never changes).
+        auto shared_l2_acts = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(shared_l2_token_buffer.base)),
+            {num_shared_experts > 0 ? num_max_tokens_per_rank : 0, shared_intermediate_hidden},
+            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
+        auto shared_l2_acts_sf = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(shared_l2_sf_buffer.base)),
+            {num_shared_experts > 0 ? num_max_tokens_per_rank : 0, shared_intermediate_hidden / 64},
+            {1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0},
+            torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
+        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                               shared_l2_acts, shared_l2_acts_sf);
     };
-    return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(
+                num_shared_experts > 0 ? shared_l2_sf_buffer.get_end_ptr()
+                                       : combine_token_buffer.get_end_ptr()),
+            slice_input_buffers};
 }
 
 static void fp8_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
@@ -186,6 +222,37 @@ static void fp8_mega_moe(
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
                     num_experts_per_rank, false, true, torch::kFloat);
 
+    // Fused shared expert: a single dense MLP (no expert dimension) whose intermediate
+    // size is `num_shared_experts * intermediate_hidden`. Both weight tuples must be
+    // given together; the SF layout matches the routed weights minus the group axis.
+    DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
+    int num_shared_experts = 0;
+    torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
+    if (shared_l1_weights_tuple_opt.has_value()) {
+        std::tie(shared_l1_weights, shared_l1_weights_sf) = shared_l1_weights_tuple_opt.value();
+        std::tie(shared_l2_weights, shared_l2_weights_sf) = shared_l2_weights_tuple_opt.value();
+        const auto shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1));
+        DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
+        num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
+        // The shared L2 activation SF is K-major, so its per-token row (SIH / 64
+        // floats) must stay 16-byte aligned for the TMA loads of the pool it feeds
+        DG_HOST_ASSERT(shared_intermediate_hidden % 256 == 0);
+
+        DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l2_weights.dim() == 2);
+        DG_HOST_ASSERT(shared_l1_weights.size(0) == shared_intermediate_hidden * 2);
+        DG_HOST_ASSERT(shared_l1_weights.size(1) == hidden);
+        DG_HOST_ASSERT(shared_l2_weights.size(0) == hidden);
+        DG_HOST_ASSERT(shared_l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(shared_l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(shared_l1_weights.is_contiguous() and shared_l2_weights.is_contiguous());
+        DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
+        check_sf_layout(shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        std::nullopt, false, true, torch::kFloat);
+        check_sf_layout(shared_l2_weights_sf, hidden, shared_intermediate_hidden, kGranMN, kGranK,
+                        std::nullopt, false, true, torch::kFloat);
+    }
+
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
@@ -198,23 +265,30 @@ static void fp8_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation, num_shared_experts);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
-    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                shared_l2_acts, shared_l2_acts_sf] = slice(sym_buffer);
 
     sm90_fp8_mega_moe(y,
                      l1_acts, l1_acts_sf,
                      l2_acts, l2_acts_sf,
                      l1_weights, l2_weights,
                      l1_weights_sf, l2_weights_sf,
+                     // The shared L1 activations are the local `x` region and its SF
+                     x, x_sf,
+                     shared_l2_acts, shared_l2_acts_sf,
+                     shared_l1_weights, shared_l2_weights,
+                     shared_l1_weights_sf, shared_l2_weights_sf,
                      cumulative_local_expert_recv_stats,
                      sym_buffer_ptrs,
                      rank_idx, num_max_tokens_per_rank,
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
+                     num_shared_experts,
                      activation_clamp, fast_math);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))

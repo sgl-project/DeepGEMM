@@ -262,8 +262,19 @@ struct SM90Workspace {
 
     uint32_t num_max_pool_tokens;
     uint32_t num_max_pool_blocks;
+    // Fused shared expert: one counter per M block of this rank's own tokens.
+    // Always reserved (a few KB) so the host and device layouts agree whether or
+    // not the shared expert is enabled.
+    uint32_t num_max_shared_pool_blocks;
 
-    static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    // [ 0..15]: 4 x `uint32_t` grid sync counters
+    // [16..20]: `uint32_t` NVLink barrier counter
+    // [20..28]: 2 x `int` NVLink barrier signals (phase 0 and 1)
+    // [28..32]: `uint32_t` L1 task counter (interleaved scheduler)
+    // [32..36]: `uint32_t` L2 task counter (interleaved scheduler)
+    // [36..40]: `uint32_t` shared L1 task counter (fused shared expert)
+    // [40..44]: `uint32_t` shared L2 task counter (fused shared expert)
+    static constexpr uint64_t kNumBarrierSignalBytes = 48;
 
     CUTLASS_HOST_DEVICE
     SM90Workspace(void* base,
@@ -279,6 +290,7 @@ struct SM90Workspace {
         num_max_pool_tokens = get_num_max_pool_tokens(
             num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
+        num_max_shared_pool_blocks = math::ceil_div(num_max_tokens_per_rank, static_cast<uint32_t>(kMinCandidateBlockM));
     }
 
     CUTLASS_HOST_DEVICE
@@ -291,6 +303,7 @@ struct SM90Workspace {
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+        num_bytes += math::align(num_max_shared_pool_blocks, 4u) * sizeof(uint32_t);
         return math::align<uint64_t>(num_bytes, 16);
     }
 
@@ -317,6 +330,30 @@ struct SM90Workspace {
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
         return math::advance_ptr<int>(
             base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+    }
+
+    // Interleaved-scheduler global task counters. They are zeroed by the
+    // workspace cleanup path at the end of every kernel launch (and the
+    // workspace allocation is zero-initialized for the first launch).
+    CUTLASS_DEVICE
+    uint32_t* get_l1_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 28u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 32u);
+    }
+
+    // Fused shared-expert task counters, zeroed by the same cleanup path
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l1_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 36u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l2_task_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 40u);
     }
 
     CUTLASS_DEVICE
@@ -360,6 +397,15 @@ struct SM90Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // Fused shared expert: per-M-block count of finished shared L1 tiles. The
+    // shared L2 A/SFA loader spins on it, mirroring `get_l2_arrival_mask_ptr` in
+    // counter mode for the routed path.
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l2_full_count_ptr(const uint32_t& shared_block_idx = 0) const {
+        const auto base = get_token_src_metadata_ptr(num_max_pool_tokens);
+        return reinterpret_cast<uint32_t*>(base) + shared_block_idx;
     }
 };
 

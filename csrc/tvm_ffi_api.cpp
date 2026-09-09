@@ -700,9 +700,10 @@ dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int
         num_bytes, slice_input_buffers);
 }
 
-Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>
+Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>
 dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
-                                         int64_t intermediate_hidden, bool use_fp8_dispatch, std::string activation) {
+                                         int64_t intermediate_hidden, bool use_fp8_dispatch, std::string activation,
+                                         int64_t num_shared_experts) {
     auto [num_bytes, fn] = mega::get_symm_buffer_size_for_sm90_mega_moe(
         static_cast<int>(num_ranks),
         static_cast<int>(num_experts),
@@ -711,12 +712,16 @@ dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts
         static_cast<int>(hidden),
         static_cast<int>(intermediate_hidden),
         use_fp8_dispatch,
-        activation
+        activation,
+        static_cast<int>(num_shared_experts)
     );
 
     auto slice_input_buffers = [=](TensorView buffer) {
-        auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] =  fn(convert_to_torch_tensor(buffer));
-        return Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(
+        // The last two views are the fused shared-expert pool and its SF; they are
+        // zero-sized when the shared expert is disabled.
+        auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+              shared_l2_acts, shared_l2_acts_sf] = fn(convert_to_torch_tensor(buffer));
+        return Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(
             Tensor::FromDLPack(at::toDLPack(x.view(at::kChar))),
             Tensor::FromDLPack(at::toDLPack(x_sf)),
             Tensor::FromDLPack(at::toDLPack(topk_idx)),
@@ -724,10 +729,12 @@ dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts
             Tensor::FromDLPack(at::toDLPack(l1_acts.view(at::kChar))),
             Tensor::FromDLPack(at::toDLPack(l1_acts_sf)),
             Tensor::FromDLPack(at::toDLPack(l2_acts.view(at::kChar))),
-            Tensor::FromDLPack(at::toDLPack(l2_acts_sf))
+            Tensor::FromDLPack(at::toDLPack(l2_acts_sf)),
+            Tensor::FromDLPack(at::toDLPack(shared_l2_acts.view(at::kChar))),
+            Tensor::FromDLPack(at::toDLPack(shared_l2_acts_sf))
         );
     };
-    return Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>(
+    return Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>(
         num_bytes, slice_input_buffers);
 }
 
@@ -805,6 +812,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
 
 
 void dg_fp8_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
+                    Optional<TensorView> shared_l1_weights, Optional<TensorView> shared_l1_weights_sf,
+                    Optional<TensorView> shared_l2_weights, Optional<TensorView> shared_l2_weights_sf,
                     Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                     int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                     Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math) {
@@ -819,10 +828,25 @@ void dg_fp8_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_
     auto [recipe_a, recipe_b, recipe_c] = recipe;
     auto recipe_val = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b), static_cast<int>(recipe_c));
 
+    // Fused shared expert: both weight tuples are optional and must come together
+    std::optional<std::tuple<torch::Tensor, torch::Tensor>> shared_l1_weights_val = std::nullopt;
+    std::optional<std::tuple<torch::Tensor, torch::Tensor>> shared_l2_weights_val = std::nullopt;
+    if (shared_l1_weights.has_value()) {
+        DG_HOST_ASSERT(shared_l1_weights_sf.has_value() and shared_l2_weights.has_value() and
+                       shared_l2_weights_sf.has_value());
+        shared_l1_weights_val = std::make_tuple(
+            convert_to_torch_tensor(shared_l1_weights.value()),
+            convert_to_torch_tensor(shared_l1_weights_sf.value()));
+        shared_l2_weights_val = std::make_tuple(
+            convert_to_torch_tensor(shared_l2_weights.value()),
+            convert_to_torch_tensor(shared_l2_weights_sf.value()));
+    }
+
     mega::fp8_mega_moe(
         convert_to_torch_tensor(y),
         std::make_pair(convert_to_torch_tensor(l1_weights), convert_to_torch_tensor(l1_weights_sf)),
         std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
+        shared_l1_weights_val, shared_l2_weights_val,
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
         static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math
