@@ -34,7 +34,7 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
     os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', get_cuda_arch())
 
     extra_cflags = [
-        '-std=c++17', '-O3', '-fPIC',
+        '-std=c++20', '-O3', '-fPIC',
         '-Wno-psabi', '-Wno-deprecated-declarations',
         f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
     ]

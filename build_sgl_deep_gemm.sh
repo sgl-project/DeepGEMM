@@ -100,7 +100,7 @@ os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', cuda_helpers.get_cuda_arch())
 
 cxx_abi = int(torch.compiled_with_cxx11_abi())
 extra_cflags = [
-    '-std=c++17', '-O3', '-fPIC',
+    '-std=c++20', '-O3', '-fPIC',
     '-Wno-psabi', '-Wno-deprecated-declarations',
     f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
 ]
