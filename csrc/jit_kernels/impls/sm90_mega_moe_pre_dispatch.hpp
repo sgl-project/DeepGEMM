@@ -1,16 +1,13 @@
 #pragma once
 
-#include <torch/python.h>
+#include <torch/torch.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
 
 namespace deep_gemm {
 
-class SM90MegaMoEPreDispatchRuntime final : public LaunchRuntime<SM90MegaMoEPreDispatchRuntime> {
+class SM90MegaMoEPreDispatchRuntime final {
 public:
     struct Args {
         int group_size;
@@ -30,11 +27,11 @@ public:
         uint32_t    top_k;
         float       routed_scaling_factor;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh>
 
 using namespace deep_gemm;
@@ -47,12 +44,12 @@ static void __instantiate_kernel() {{
 )", args.group_size, args.use_pdl ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.x, args.topk_idx, args.topk_weights,
             args.buf_x, args.buf_x_sf, args.buf_topk_idx, args.buf_topk_weights,
             args.num_tokens, args.padded_max, args.hidden, args.num_groups,
-            args.top_k, args.routed_scaling_factor));
+            args.top_k, args.routed_scaling_factor);
     }
 };
 
@@ -113,7 +110,7 @@ static void sm90_mega_moe_pre_dispatch(
     const auto num_total_blocks = num_tokens + num_pad_blocks;
     if (num_total_blocks == 0) return;
 
-    const bool use_pdl = device_runtime->get_pdl();
+    const bool use_pdl = *jit->default_launch_options.enable_pdl;
     SM90MegaMoEPreDispatchRuntime::Args args = {
         .group_size = group_size,
         .use_pdl = use_pdl,
@@ -130,13 +127,13 @@ static void sm90_mega_moe_pre_dispatch(
         .num_groups = static_cast<uint32_t>(num_groups),
         .top_k = static_cast<uint32_t>(top_k),
         .routed_scaling_factor = routed_scaling_factor,
-        .launch_args = LaunchArgs(num_total_blocks, num_threads, /*smem_size=*/0,
+        .launch_args = make_launch_options(num_total_blocks, num_threads, /*smem_size=*/0,
                                   /*cluster_dim=*/1, /*enable_pdl=*/use_pdl)
     };
 
     const auto code = SM90MegaMoEPreDispatchRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_mega_moe_pre_dispatch", code);
-    SM90MegaMoEPreDispatchRuntime::launch(runtime, args);
+    const auto kernel = jit->compile("sm90_mega_moe_pre_dispatch", code);
+    SM90MegaMoEPreDispatchRuntime::launch(kernel, args);
 }
 
 } // namespace deep_gemm

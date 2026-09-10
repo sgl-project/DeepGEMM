@@ -16,6 +16,10 @@ def _get_C():
     return _C
 
 
+def _as_torch_tensor(value):
+    return value if isinstance(value, torch.Tensor) else torch.from_dlpack(value)
+
+
 def get_tma_aligned_size(mn: int, element_size: int) -> int:
     return int(_get_C().get_tma_aligned_size(mn, element_size))
 
@@ -26,8 +30,8 @@ def get_mk_alignment_for_contiguous_layout() -> int:
 def set_mk_alignment_for_contiguous_layout(new_value: int):
     _get_C().set_mk_alignment_for_contiguous_layout(new_value)
 
-def get_theoretical_mk_alignment_for_contiguous_layout(expected_m: Optional[int] = None) -> int:
-    return int(_get_C().get_theoretical_mk_alignment_for_contiguous_layout(expected_m))
+def get_theoretical_mk_alignment_for_contiguous_layout(expected_m: Optional[int] = None, num_groups: Optional[int] = None) -> int:
+    return int(_get_C().get_theoretical_mk_alignment_for_contiguous_layout(expected_m, num_groups))
 
 get_m_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
 get_k_alignment_for_contiguous_layout = get_mk_alignment_for_contiguous_layout
@@ -58,11 +62,11 @@ try:
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
         """Transpose FP32 scaling factors into MN-major TMA-aligned layout."""
-        return _get_C().get_mn_major_tma_aligned_tensor(sf)
+        return _as_torch_tensor(_get_C().get_mn_major_tma_aligned_tensor(sf))
 
-    def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf: torch.Tensor) -> torch.Tensor:
+    def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf: torch.Tensor, psum_layout: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Pack FP32 scaling factors into UE8M0 int32 in MN-major TMA-aligned layout."""
-        return _get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+        return _as_torch_tensor(_get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf, psum_layout))
 
     def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
             sf: torch.Tensor,
@@ -70,12 +74,13 @@ try:
             ks: Optional[list[int]],
             gran_k: int,
             k_alignment: Optional[int] = None,
-            use_psum_layout: bool = False) -> torch.Tensor:
-        """Pack k-grouped FP32 scaling factors into UE8M0 int32 in MN-major TMA-aligned layout."""
+            use_psum_layout: bool = False,
+            use_padded_sf_layout: bool = False) -> torch.Tensor:
+        """Pack grouped SF, preserving compact group offsets unless padded layout is requested."""
         if k_alignment is None:
             k_alignment = get_mk_alignment_for_contiguous_layout()
-        return _get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf, grouped_layout, [] if ks is None else ks, gran_k, k_alignment, use_psum_layout)
+        return _as_torch_tensor(_get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+            sf, grouped_layout, ks, gran_k, k_alignment, use_psum_layout, use_padded_sf_layout))
 
 except AttributeError:
     pass

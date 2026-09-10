@@ -1,10 +1,10 @@
 #pragma once
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
+
 #include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
+#include "../../runtime/launch.hpp"
 
 namespace deep_gemm {
 
@@ -13,7 +13,7 @@ namespace deep_gemm {
 // kernel), SM120 has separate FP8/FP4 kernels, so the launcher routes internally.
 
 // ---- FP8 dense ----
-class SM120FP8MQALogitsRuntime final: public LaunchRuntime<SM120FP8MQALogitsRuntime> {
+class SM120FP8MQALogitsRuntime final {
 public:
     struct Args {
         int seq_len;
@@ -41,12 +41,12 @@ public:
         int num_specialized_threads;
         int num_math_threads;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
+    static std::string generate(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -66,20 +66,20 @@ static void __instantiate_kernel() {{
     args.is_compressed_logits,
     args.block_q, args.block_kv,
     args.num_q_stages, args.num_kv_stages,
-    args.launch_args.grid_dim.first,
+    args.launch_args.grid_dim->x,
     args.num_specialized_threads, args.num_math_threads,
     to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.seq_len, args.seq_len_kv,
             args.max_seqlen_k, args.stride_logits,
             args.cu_seq_len_k_start, args.cu_seq_len_k_end,
             args.logits,
             args.tensor_map_q, args.tensor_map_kv,
             args.tensor_map_kv_scales, args.tensor_map_weights
-        ));
+        );
     }
 };
 
@@ -98,7 +98,7 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
     constexpr int num_q_stages = 2;
     constexpr int num_kv_stages = 3;
     constexpr int num_math_threads = 256;
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = runtime->get_num_sms();
 
     // Split-KV: when fewer q-blocks than SMs, split each q-block's KV range across
     // gridDim.y cooperating blocks to fill idle SMs. logits[q,kv] are independent
@@ -167,17 +167,17 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs({num_sms, kv_splits},
+        .launch_args = make_launch_options({num_sms, kv_splits},
                                   num_specialized_threads + num_math_threads,
                                   smem_size)
     };
     const auto code = SM120FP8MQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_mqa_logits", code);
-    SM120FP8MQALogitsRuntime::launch(runtime, args);
+    const auto kernel = jit->compile("sm120_fp8_mqa_logits", code);
+    SM120FP8MQALogitsRuntime::launch(kernel, args);
 }
 
 // ---- FP4 dense ----
-class SM120FP4MQALogitsRuntime final: public LaunchRuntime<SM120FP4MQALogitsRuntime> {
+class SM120FP4MQALogitsRuntime final {
 public:
     struct Args {
         int seq_len;
@@ -206,13 +206,13 @@ public:
         int num_tma_threads;
         int num_math_threads;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
+    static std::string generate(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
 
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp4_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -232,13 +232,13 @@ static void __instantiate_kernel() {{
     args.is_compressed_logits,
     args.block_q, args.block_kv,
     args.num_q_stages, args.num_kv_stages,
-    args.launch_args.grid_dim.first,
+    args.launch_args.grid_dim->x,
     args.num_tma_threads, args.num_math_threads,
     to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.seq_len, args.seq_len_kv,
             args.max_seqlen_k, args.stride_logits,
             args.cu_seq_len_k_start, args.cu_seq_len_k_end,
@@ -246,7 +246,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_q, args.tensor_map_sf_q,
             args.tensor_map_kv, args.tensor_map_sf_kv,
             args.tensor_map_weights
-        ));
+        );
     }
 };
 
@@ -320,13 +320,13 @@ static void sm120_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor& sf
         .logits_dtype = logits_dtype,
         .num_tma_threads = num_tma_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+        .launch_args = make_launch_options(runtime->get_num_sms(),
                                   num_tma_threads + num_math_threads,
                                   smem_size)
     };
     const auto code = SM120FP4MQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp4_mqa_logits", code);
-    SM120FP4MQALogitsRuntime::launch(runtime, args);
+    const auto kernel = jit->compile("sm120_fp4_mqa_logits", code);
+    SM120FP4MQALogitsRuntime::launch(kernel, args);
 }
 
 // ---- Unified entry (mirrors dev's sm100_mqa_logits(is_fp4, ...)) ----

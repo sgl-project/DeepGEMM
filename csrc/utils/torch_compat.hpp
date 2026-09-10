@@ -101,6 +101,9 @@ inline at::ScalarType dl_dtype_to_torch(DLDataType dtype) {
             if (dtype.bits == 32) return at::kFloat;
             if (dtype.bits == 16) return at::kHalf;
             break;
+        case kDLBool:
+            if (dtype.bits == 1 or dtype.bits == 8) return at::kBool;
+            break;
         case kDLBfloat:
             if (dtype.bits == 16) return at::kBFloat16;
             break;

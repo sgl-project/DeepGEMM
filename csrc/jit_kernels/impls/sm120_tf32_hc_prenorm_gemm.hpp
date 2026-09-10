@@ -1,19 +1,17 @@
 #pragma once
 
-#include <torch/python.h>
+#include <torch/torch.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
+#include "../../runtime/launch.hpp"
 
 namespace deep_gemm {
 
-class SM120TF32HCPrenormGemmRuntime final: public LaunchRuntime<SM120TF32HCPrenormGemmRuntime> {
+class SM120TF32HCPrenormGemmRuntime final {
 public:
     struct Args {
         int m, n, k;
@@ -22,7 +20,7 @@ public:
         int num_stages;
         int num_math_threads, num_tma_threads;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
 
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -30,8 +28,8 @@ public:
         float* sqr_sum;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh>
 
 using namespace deep_gemm;
@@ -53,9 +51,9 @@ static void __instantiate_kernel() {{
         args.num_math_threads, args.num_tma_threads);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.m, args.tensor_map_a, args.tensor_map_b, args.gmem_d, args.sqr_sum));
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
+            args.m, args.tensor_map_a, args.tensor_map_b, args.gmem_d, args.sqr_sum);
     }
 };
 
@@ -112,15 +110,15 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
         .num_splits = num_splits,
         .num_stages = num_stages,
         .num_math_threads = num_math_threads, .num_tma_threads = num_tma_threads,
-        .launch_args = LaunchArgs(grid_size, num_threads, smem_size, 1),
+        .launch_args = make_launch_options(grid_size, num_threads, smem_size, 1),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .gmem_d = reinterpret_cast<float*>(d.data_ptr()),
         .sqr_sum = reinterpret_cast<float*>(sqr_sum.data_ptr()),
     };
     const auto code = SM120TF32HCPrenormGemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_tf32_hc_prenorm_gemm", code);
-    SM120TF32HCPrenormGemmRuntime::launch(runtime, args);
+    const auto kernel = jit->compile("sm120_tf32_hc_prenorm_gemm", code);
+    SM120TF32HCPrenormGemmRuntime::launch(kernel, args);
 }
 
 } // namespace deep_gemm

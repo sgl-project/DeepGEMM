@@ -26,6 +26,8 @@ dependencies = [
 dev = [
     "pytest",
     "ruff",
+    "tilelang==0.1.9",
+    "tile-kernels==1.0.0",
 ]
 
 [project.urls]
@@ -46,6 +48,7 @@ deep_gemm = [
     "VERSION",
     "_C.so",
     "include/deep_gemm/**/*",
+    "include/deep_jit/**/*",
     "include/cute/**/*",
     "include/cutlass/**/*",
 ]

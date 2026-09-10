@@ -1,8 +1,10 @@
+#define DG_USE_TVM_FFI 1
 #include <cstdint>
 #include <optional>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tuple.h>
+#include <tvm/ffi/container/map.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -17,7 +19,9 @@
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
-#include "apis/mega.hpp"
+#include "apis/mega_moe.hpp"
+#include "apis/mega_gate.hpp"
+#include "apis/mega_mhc.hpp"
 #include "apis/sm90_mega.hpp"
 #include "utils/torch_compat.hpp"
 
@@ -35,25 +39,39 @@ static std::optional<std::vector<int>> to_optional_int_vector(Optional<Array<int
     return result;
 }
 
+
+static std::optional<torch::Tensor> to_optional_tensor(Optional<TensorView> value) {
+    return value.has_value() ? std::make_optional(convert_to_torch_tensor(value.value())) : std::nullopt;
+}
+static std::optional<float> to_optional_float(Optional<double> value) {
+    return value.has_value() ? std::make_optional(static_cast<float>(value.value())) : std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------
 void dg_init(std::string library_root_path, std::string cuda_home) {
-#if DG_TENSORMAP_COMPATIBLE
-    Compiler::prepare_init(library_root_path, cuda_home);
-    KernelRuntime::prepare_init(cuda_home);
-    IncludeParser::prepare_init(library_root_path);
-#endif
+    if (not cuda_home.empty())
+        setenv("CUDA_HOME", cuda_home.c_str(), 0);
+    init_jit(library_root_path);
 }
 
-int64_t dg_get_num_sms() { return device_runtime->get_num_sms(); }
-void dg_set_num_sms(int64_t n) { device_runtime->set_num_sms(static_cast<int>(n)); }
-// int64_t dg_get_compile_mode() { return device_runtime->get_compile_mode(); }
-// void dg_set_compile_mode(int64_t n) { device_runtime->set_compile_mode(static_cast<int>(n)); }
-int64_t dg_get_tc_util() { return device_runtime->get_tc_util(); }
-void dg_set_tc_util(int64_t n) { device_runtime->set_tc_util(static_cast<int>(n)); }
-bool dg_get_pdl() { return device_runtime->get_pdl(); }
-void dg_set_pdl(bool v) { device_runtime->set_pdl(v); }
+int64_t dg_get_num_sms() { return runtime->get_num_sms(); }
+void dg_set_num_sms(int64_t n) { runtime->set_num_sms(static_cast<int>(n)); }
+int64_t dg_get_tc_util() { return runtime->get_tc_util(); }
+void dg_set_tc_util(int64_t n) { runtime->set_tc_util(static_cast<int>(n)); }
+bool dg_get_pdl() { return *jit->default_launch_options.enable_pdl; }
+void dg_set_pdl(bool v) { jit->default_launch_options.enable_pdl = v; }
+void dg_use_deterministic_algorithms(bool v) { heuristics_runtime->use_deterministic_algorithms(v); }
+bool dg_get_deterministic_algorithms() { return heuristics_runtime->get_deterministic_algorithms(); }
+void dg_set_ignore_compile_dims(bool v) { heuristics_runtime->set_ignore_compile_dims(v); }
+void dg_set_block_size_multiple_of(int64_t m, int64_t n) {
+    heuristics_runtime->set_block_size_multiple_of(static_cast<int>(m), static_cast<int>(n));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(use_deterministic_algorithms, dg_use_deterministic_algorithms);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_deterministic_algorithms, dg_get_deterministic_algorithms);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_ignore_compile_dims, dg_set_ignore_compile_dims);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_block_size_multiple_of, dg_set_block_size_multiple_of);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, dg_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_num_sms, dg_get_num_sms);
@@ -80,9 +98,10 @@ void dg_set_mk_alignment_for_contiguous_layout(int64_t new_value) {
     heuristics_runtime->set_mk_alignment_for_contiguous_layout(static_cast<int>(new_value));
 }
 
-int64_t dg_get_theoretical_mk_alignment_for_contiguous_layout(Optional<int64_t> expected_m) {
+int64_t dg_get_theoretical_mk_alignment_for_contiguous_layout(Optional<int64_t> expected_m, Optional<int64_t> num_groups) {
     auto val = expected_m.has_value()? std::make_optional(static_cast<int>(expected_m.value())) : std::nullopt;
-    return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(val);
+    return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(
+        val, num_groups.has_value() ? std::make_optional(static_cast<int>(num_groups.value())) : std::nullopt);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_tma_aligned_size, dg_get_tma_aligned_size);
@@ -94,7 +113,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_theoretical_mk_alignment_for_contiguous_layout
 // ---------------------------------------------------------------------------
 // Layout kernels
 // ---------------------------------------------------------------------------
-#if DG_TENSORMAP_COMPATIBLE
 
 tvm::ffi::Array<int64_t> dg_preprocess_sf(TensorView sf) {
     auto sf_v = convert_to_torch_tensor(sf);
@@ -112,15 +130,15 @@ Tensor dg_get_mn_major_tma_aligned_tensor(TensorView sf) {
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
-Tensor dg_get_mn_major_tma_aligned_packed_ue8m0_tensor(TensorView sf) {
+Tensor dg_get_mn_major_tma_aligned_packed_ue8m0_tensor(TensorView sf, Optional<TensorView> psum_layout) {
     auto sf_v = convert_to_torch_tensor(sf);
-    auto result = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf_v);
+    auto result = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf_v, to_optional_tensor(psum_layout));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
 Tensor dg_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
         TensorView sf, TensorView grouped_layout, Optional<Array<int64_t>> ks,
-        int64_t gran_k, int64_t k_alignment, bool use_psum_layout) {
+        int64_t gran_k, int64_t k_alignment, bool use_psum_layout, bool use_padded_sf_layout) {
     auto sf_v = convert_to_torch_tensor(sf);
     auto grouped_layout_v = convert_to_torch_tensor(grouped_layout);
     auto ks_opt = to_optional_int_vector(ks);
@@ -130,7 +148,7 @@ Tensor dg_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
         ks_opt,
         static_cast<int>(gran_k),
         static_cast<int>(k_alignment),
-        use_psum_layout
+        use_psum_layout, use_padded_sf_layout
     );
     return Tensor::FromDLPack(at::toDLPack(result));
 }
@@ -140,7 +158,7 @@ Tensor dg_transform_sf_into_required_layout(
         int64_t recipe_a, int64_t recipe_b, Optional<int64_t> recipe_c,
         Optional<int64_t> num_groups,
         Optional<bool> is_sfa,
-        bool disable_ue8m0_cast) {
+        bool disable_ue8m0_cast, Optional<TensorView> psum_layout) {
     auto sf_v = convert_to_torch_tensor(sf);
     auto is_sfa_val = is_sfa.has_value() ? std::make_optional(is_sfa.value()) : std::nullopt;
     auto ng = num_groups.has_value() ? std::make_optional(static_cast<int>(num_groups.value())) : std::nullopt;
@@ -148,13 +166,13 @@ Tensor dg_transform_sf_into_required_layout(
         auto recipe = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b), static_cast<int>(recipe_c.value()));
         auto result = layout::transform_sf_into_required_layout(
             sf_v, static_cast<int>(mn), static_cast<int>(k),
-            recipe, ng, is_sfa_val, disable_ue8m0_cast);
+            recipe, ng, is_sfa_val, disable_ue8m0_cast, to_optional_tensor(psum_layout));
         return Tensor::FromDLPack(at::toDLPack(result));
     } else {
         auto recipe = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b));
         auto result = layout::transform_sf_into_required_layout(
             sf_v, static_cast<int>(mn), static_cast<int>(k),
-            recipe, ng, is_sfa_val, disable_ue8m0_cast);
+            recipe, ng, is_sfa_val, disable_ue8m0_cast, to_optional_tensor(psum_layout));
         return Tensor::FromDLPack(at::toDLPack(result));
     }
 }
@@ -165,7 +183,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_mn_major_tma_aligned_packed_ue8m0_tensor, dg_g
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor, dg_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transform_sf_into_required_layout, dg_transform_sf_into_required_layout);
 
-#endif  // DG_TENSORMAP_COMPATIBLE
 
 // ---------------------------------------------------------------------------
 // cuBLASLt GEMMs (always available)
@@ -215,7 +232,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cublaslt_gemm_tt, dg_cublaslt_gemm_tt);
 // ---------------------------------------------------------------------------
 // FP8/FP4 GEMMs and BF16 GEMMs
 // ---------------------------------------------------------------------------
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 
 void dg_fp8_fp4_gemm_nt(TensorView a, TensorView a_sf,
                         TensorView b, TensorView b_sf,
@@ -225,7 +241,7 @@ void dg_fp8_fp4_gemm_nt(TensorView a, TensorView a_sf,
                         Optional<Tuple<int64_t, int64_t>> recipe_a,
                         Optional<Tuple<int64_t, int64_t>> recipe_b,
                         std::string compiled_dims,
-                        bool disable_ue8m0_cast) {
+                        bool disable_ue8m0_cast, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
     auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
@@ -234,7 +250,7 @@ void dg_fp8_fp4_gemm_nt(TensorView a, TensorView a_sf,
                            std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
                            recipe_opt, recipe_a_opt, recipe_b_opt,
-                           compiled_dims, disable_ue8m0_cast);
+                           compiled_dims, disable_ue8m0_cast, to_optional_float(alpha));
 }
 
 void dg_fp8_fp4_gemm_nn(TensorView a, TensorView a_sf,
@@ -245,7 +261,7 @@ void dg_fp8_fp4_gemm_nn(TensorView a, TensorView a_sf,
                         Optional<Tuple<int64_t, int64_t>> recipe_a,
                         Optional<Tuple<int64_t, int64_t>> recipe_b,
                         std::string compiled_dims,
-                        bool disable_ue8m0_cast) {
+                        bool disable_ue8m0_cast, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
     auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
@@ -254,7 +270,7 @@ void dg_fp8_fp4_gemm_nn(TensorView a, TensorView a_sf,
                            std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
                            recipe_opt, recipe_a_opt, recipe_b_opt,
-                           compiled_dims, disable_ue8m0_cast);
+                           compiled_dims, disable_ue8m0_cast, to_optional_float(alpha));
 }
 
 void dg_fp8_fp4_gemm_tn(TensorView a, TensorView a_sf,
@@ -265,7 +281,7 @@ void dg_fp8_fp4_gemm_tn(TensorView a, TensorView a_sf,
                         Optional<Tuple<int64_t, int64_t>> recipe_a,
                         Optional<Tuple<int64_t, int64_t>> recipe_b,
                         std::string compiled_dims,
-                        bool disable_ue8m0_cast) {
+                        bool disable_ue8m0_cast, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
     auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
@@ -274,7 +290,7 @@ void dg_fp8_fp4_gemm_tn(TensorView a, TensorView a_sf,
                            std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
                            recipe_opt, recipe_a_opt, recipe_b_opt,
-                           compiled_dims, disable_ue8m0_cast);
+                           compiled_dims, disable_ue8m0_cast, to_optional_float(alpha));
 }
 
 void dg_fp8_fp4_gemm_tt(TensorView a, TensorView a_sf,
@@ -285,7 +301,7 @@ void dg_fp8_fp4_gemm_tt(TensorView a, TensorView a_sf,
                         Optional<Tuple<int64_t, int64_t>> recipe_a,
                         Optional<Tuple<int64_t, int64_t>> recipe_b,
                         std::string compiled_dims,
-                        bool disable_ue8m0_cast) {
+                        bool disable_ue8m0_cast, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_opt = recipe.has_value()? std::make_optional(std::make_tuple((int)recipe.value().get<0>(), (int)recipe.value().get<1>(), (int)recipe.value().get<2>())) : std::nullopt;
     auto recipe_a_opt = recipe_a.has_value() ? std::make_optional(std::make_tuple((int)recipe_a.value().get<0>(), (int)recipe_a.value().get<1>())) : std::nullopt;
@@ -294,7 +310,7 @@ void dg_fp8_fp4_gemm_tt(TensorView a, TensorView a_sf,
                            std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
                            convert_to_torch_tensor(d), c_opt,
                            recipe_opt, recipe_a_opt, recipe_b_opt,
-                           compiled_dims, disable_ue8m0_cast);
+                           compiled_dims, disable_ue8m0_cast, to_optional_float(alpha));
 }
 
 void dg_m_grouped_fp8_fp4_gemm_nt_contiguous(TensorView a, TensorView a_sf,
@@ -371,30 +387,30 @@ void dg_m_grouped_fp8_fp4_gemm_nt_masked(TensorView a, TensorView a_sf,
 
 void dg_bf16_gemm_nt(TensorView a, TensorView b, TensorView d,
                      Optional<TensorView> c,
-                     std::string compiled_dims) {
+                     std::string compiled_dims, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
-    gemm::bf16_gemm_nt(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims);
+    gemm::bf16_gemm_nt(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims, to_optional_float(alpha));
 }
 
 void dg_bf16_gemm_nn(TensorView a, TensorView b, TensorView d,
                      Optional<TensorView> c,
-                     std::string compiled_dims) {
+                     std::string compiled_dims, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
-    gemm::bf16_gemm_nn(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims);
+    gemm::bf16_gemm_nn(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims, to_optional_float(alpha));
 }
 
 void dg_bf16_gemm_tn(TensorView a, TensorView b, TensorView d,
                      Optional<TensorView> c,
-                     std::string compiled_dims) {
+                     std::string compiled_dims, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
-    gemm::bf16_gemm_tn(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims);
+    gemm::bf16_gemm_tn(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims, to_optional_float(alpha));
 }
 
 void dg_bf16_gemm_tt(TensorView a, TensorView b, TensorView d,
                      Optional<TensorView> c,
-                     std::string compiled_dims) {
+                     std::string compiled_dims, Optional<double> alpha) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
-    gemm::bf16_gemm_tt(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims);
+    gemm::bf16_gemm_tt(convert_to_torch_tensor(a), convert_to_torch_tensor(b), convert_to_torch_tensor(d), c_opt, compiled_dims, to_optional_float(alpha));
 }
 
 void dg_m_grouped_bf16_gemm_nt_contiguous(TensorView a, TensorView b, TensorView d,
@@ -456,7 +472,7 @@ void dg_k_grouped_fp8_gemm_tn_contiguous(TensorView a, TensorView a_sf,
                                          Optional<TensorView> c,
                                          Tuple<int64_t, int64_t, int64_t> recipe,
                                          std::string compiled_dims,
-                                         bool use_psum_layout) {
+                                         bool use_psum_layout, bool use_padded_sf_layout) {
     auto ks_val = to_optional_int_vector(ks);
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_val = std::make_tuple(static_cast<int>(recipe.get<0>()),
@@ -466,7 +482,7 @@ void dg_k_grouped_fp8_gemm_tn_contiguous(TensorView a, TensorView a_sf,
         std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
         std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
         convert_to_torch_tensor(d), ks_val, convert_to_torch_tensor(grouped_layout),
-        c_opt, recipe_val, compiled_dims, use_psum_layout
+        c_opt, recipe_val, compiled_dims, use_psum_layout, use_padded_sf_layout
     );
 }
 
@@ -478,7 +494,7 @@ void dg_k_grouped_fp8_gemm_nt_contiguous(TensorView a, TensorView a_sf,
                                          Optional<TensorView> c,
                                          Tuple<int64_t, int64_t, int64_t> recipe,
                                          std::string compiled_dims,
-                                         bool use_psum_layout) {
+                                         bool use_psum_layout, bool use_padded_sf_layout) {
     auto ks_val = to_optional_int_vector(ks);
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_val = std::make_tuple(static_cast<int>(recipe.get<0>()),
@@ -488,7 +504,7 @@ void dg_k_grouped_fp8_gemm_nt_contiguous(TensorView a, TensorView a_sf,
         std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
         std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
         convert_to_torch_tensor(d), ks_val, convert_to_torch_tensor(grouped_layout),
-        c_opt, recipe_val, compiled_dims, use_psum_layout
+        c_opt, recipe_val, compiled_dims, use_psum_layout, use_padded_sf_layout
     );
 }
 
@@ -520,14 +536,17 @@ void dg_einsum(std::string expr, TensorView a, TensorView b, TensorView d,
 void dg_fp8_einsum(std::string expr,
                    TensorView a_data, TensorView a_sf,
                    TensorView b_data, TensorView b_sf,
-                   TensorView d,
+                   TensorView d, Optional<TensorView> d_sf,
                    Optional<TensorView> c,
                    Tuple<int64_t, int64_t, int64_t> recipe) {
     auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
     auto recipe_opt = std::make_tuple((int)recipe.get<0>(), (int)recipe.get<1>(), (int)recipe.get<2>());
+    std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>> output = convert_to_torch_tensor(d);
+    if (d_sf.has_value())
+        output = std::make_pair(convert_to_torch_tensor(d), convert_to_torch_tensor(d_sf.value()));
     einsum::fp8_einsum(expr, std::make_pair(convert_to_torch_tensor(a_data), convert_to_torch_tensor(a_sf)),
                        std::make_pair(convert_to_torch_tensor(b_data), convert_to_torch_tensor(b_sf)),
-                       convert_to_torch_tensor(d), c_opt, recipe_opt);
+                       output, c_opt, recipe_opt);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(einsum, dg_einsum);
@@ -599,14 +618,14 @@ Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
 Tensor dg_fp8_fp4_mqa_logits(TensorView q, Optional<TensorView> q_sf, TensorView kv_data, TensorView kv_sf,
                             TensorView weights, TensorView cu_seq_len_k_start,
                             TensorView cu_seq_len_k_end, bool clean_logits, int64_t max_seqlen_k,
-                            std::string logits_dtype) {
+                            std::string logits_dtype, Optional<TensorView> schedule_meta) {
     auto q_sf_val = q_sf.has_value()? std::make_optional(convert_to_torch_tensor(q_sf.value())) : std::nullopt;
     auto result = attention::fp8_fp4_mqa_logits(
         std::make_pair(convert_to_torch_tensor(q), q_sf_val),
         std::make_pair(convert_to_torch_tensor(kv_data), convert_to_torch_tensor(kv_sf)),
         convert_to_torch_tensor(weights), convert_to_torch_tensor(cu_seq_len_k_start),
         convert_to_torch_tensor(cu_seq_len_k_end), clean_logits, static_cast<int>(max_seqlen_k),
-        string_to_dtype(logits_dtype));
+        string_to_dtype(logits_dtype), to_optional_tensor(schedule_meta));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
@@ -885,4 +904,276 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch, dg_mega_moe_pre_dispatch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch_sm90, dg_mega_moe_pre_dispatch_sm90);
 
 
-#endif  // DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+Tensor dg_get_mqa_logits_metadata(TensorView cu_seq_len_k_start,
+    TensorView cu_seq_len_k_end,
+    int64_t num_kv_tokens,
+    int64_t num_heads) {
+    auto result = attention::get_mqa_logits_metadata(
+        convert_to_torch_tensor(cu_seq_len_k_start),
+        convert_to_torch_tensor(cu_seq_len_k_end),
+        static_cast<int>(num_kv_tokens),
+        static_cast<int>(num_heads));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_mqa_logits_metadata, dg_get_mqa_logits_metadata);
+
+Tensor dg_get_sparse_mqa_logits_metadata(TensorView cu_seq_len_k_start,
+    TensorView cu_seq_len_k_end,
+    int64_t num_kv_tokens,
+    TensorView sparse_kv_block_indices,
+    std::string qk_dtype,
+    int64_t sparse_block_kv,
+    bool use_unaligned_ks) {
+    auto result = attention::get_sparse_mqa_logits_metadata(
+        convert_to_torch_tensor(cu_seq_len_k_start),
+        convert_to_torch_tensor(cu_seq_len_k_end),
+        static_cast<int>(num_kv_tokens),
+        convert_to_torch_tensor(sparse_kv_block_indices),
+        string_to_dtype(qk_dtype),
+        static_cast<int>(sparse_block_kv),
+        use_unaligned_ks);
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_sparse_mqa_logits_metadata, dg_get_sparse_mqa_logits_metadata);
+
+Tensor dg_get_paged_sparse_mqa_logits_metadata(TensorView context_lens,
+    TensorView block_table,
+    TensorView indices,
+    int64_t page_kv,
+    TensorView sparse_kv_block_indices,
+    std::string qk_dtype,
+    int64_t sparse_block_kv) {
+    auto result = attention::get_paged_sparse_mqa_logits_metadata(
+        convert_to_torch_tensor(context_lens),
+        convert_to_torch_tensor(block_table),
+        convert_to_torch_tensor(indices),
+        static_cast<int>(page_kv),
+        convert_to_torch_tensor(sparse_kv_block_indices),
+        string_to_dtype(qk_dtype),
+        static_cast<int>(sparse_block_kv));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_sparse_mqa_logits_metadata, dg_get_paged_sparse_mqa_logits_metadata);
+
+Tensor dg_fp8_fp4_sparse_mqa_logits(TensorView q,
+    Optional<TensorView> q_sf,
+    TensorView kv,
+    TensorView kv_sf,
+    TensorView weights,
+    TensorView metadata,
+    int64_t num_max_sparse_blocks,
+    int64_t sparse_block_kv,
+    bool use_unaligned_ks) {
+    auto result = attention::fp8_fp4_sparse_mqa_logits(
+        std::make_tuple(convert_to_torch_tensor(q), to_optional_tensor(q_sf)),
+        std::make_pair(convert_to_torch_tensor(kv), convert_to_torch_tensor(kv_sf)),
+        convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(metadata),
+        static_cast<int>(num_max_sparse_blocks),
+        static_cast<int>(sparse_block_kv),
+        use_unaligned_ks);
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_sparse_mqa_logits, dg_fp8_fp4_sparse_mqa_logits);
+
+Tensor dg_fp8_fp4_paged_sparse_mqa_logits(TensorView q,
+    Optional<TensorView> q_sf,
+    TensorView fused_kv_cache,
+    TensorView weights,
+    TensorView metadata,
+    int64_t num_max_sparse_blocks,
+    int64_t sparse_block_kv) {
+    auto result = attention::fp8_fp4_paged_sparse_mqa_logits(
+        std::make_tuple(convert_to_torch_tensor(q), to_optional_tensor(q_sf)),
+        convert_to_torch_tensor(fused_kv_cache),
+        convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(metadata),
+        static_cast<int>(num_max_sparse_blocks),
+        static_cast<int>(sparse_block_kv));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_paged_sparse_mqa_logits, dg_fp8_fp4_paged_sparse_mqa_logits);
+
+void dg_mega_mhc(TensorView x,
+    TensorView residual,
+    Optional<TensorView> shifted_prev_mix,
+    TensorView post_mix,
+    TensorView comb_res_mix,
+    TensorView fn,
+    TensorView mix_scales,
+    TensorView mix_bases,
+    int64_t hc_mult,
+    double hc_norm_eps,
+    double hc_pre_eps,
+    double hc_post_scale,
+    double sinkhorn_eps,
+    int64_t num_sinkhorn_iters,
+    TensorView rmsnorm_weight,
+    double rmsnorm_eps,
+    double rmsnorm_scale,
+    TensorView new_residual,
+    Optional<TensorView> new_prev_mix,
+    TensorView new_post_mix,
+    TensorView new_comb_res_mix,
+    Optional<TensorView> y_bf16,
+    Optional<TensorView> y_fp8,
+    Optional<TensorView> y_gemm_sf,
+    Optional<TensorView> y_routed_sf,
+    Optional<TensorView> y_shared_sf,
+    int64_t shared_sf_block_m,
+    Optional<TensorView> y_shared_sf_storage) {
+    DG_HOST_ASSERT(y_shared_sf.has_value() == y_shared_sf_storage.has_value());
+    auto shared_sf = to_optional_tensor(y_shared_sf);
+    if (shared_sf.has_value()) {
+        auto storage = convert_to_torch_tensor(y_shared_sf_storage.value());
+        DG_HOST_ASSERT(storage.dim() == 1 and storage.is_contiguous());
+        DG_HOST_ASSERT(storage.scalar_type() == shared_sf->scalar_type());
+        DG_HOST_ASSERT(storage.device() == shared_sf->device());
+        DG_HOST_ASSERT(storage.data_ptr() == shared_sf->data_ptr() or shared_sf->numel() == 0);
+        // Preserve the actual allocation extent for the host API's padded-row
+        // bounds check; a TensorView alone only carries the logical SF shape.
+        shared_sf = storage.as_strided(shared_sf->sizes(), shared_sf->strides());
+    }
+    mega_mhc::mega_mhc(
+        convert_to_torch_tensor(x),
+        convert_to_torch_tensor(residual),
+        to_optional_tensor(shifted_prev_mix),
+        convert_to_torch_tensor(post_mix),
+        convert_to_torch_tensor(comb_res_mix),
+        convert_to_torch_tensor(fn),
+        convert_to_torch_tensor(mix_scales),
+        convert_to_torch_tensor(mix_bases),
+        static_cast<int>(hc_mult),
+        static_cast<float>(hc_norm_eps),
+        static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_post_scale),
+        static_cast<float>(sinkhorn_eps),
+        static_cast<int>(num_sinkhorn_iters),
+        convert_to_torch_tensor(rmsnorm_weight),
+        static_cast<float>(rmsnorm_eps),
+        static_cast<float>(rmsnorm_scale),
+        convert_to_torch_tensor(new_residual),
+        to_optional_tensor(new_prev_mix),
+        convert_to_torch_tensor(new_post_mix),
+        convert_to_torch_tensor(new_comb_res_mix),
+        to_optional_tensor(y_bf16),
+        to_optional_tensor(y_fp8),
+        to_optional_tensor(y_gemm_sf),
+        to_optional_tensor(y_routed_sf),
+        shared_sf,
+        static_cast<int>(shared_sf_block_m));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_mhc, dg_mega_mhc);
+
+Tuple<Tensor, Tensor> dg_bf16_mega_gate(TensorView x,
+    TensorView weight,
+    int64_t num_topk,
+    bool use_shared_as_routed,
+    int64_t num_shared_experts,
+    double routed_scaling_factor,
+    int64_t ep_rank,
+    std::string scoring_func,
+    Optional<TensorView> mask,
+    Optional<TensorView> bias,
+    Optional<TensorView> image_bias,
+    Optional<TensorView> image_token_mask,
+    Optional<TensorView> fix_routing_mask,
+    Optional<TensorView> to_physical_map,
+    Optional<TensorView> logical_count,
+    Optional<TensorView> unmapped_topk_idx,
+    Optional<TensorView> force_random,
+    Optional<TensorView> out_idx,
+    Optional<TensorView> out_weights) {
+    DG_HOST_ASSERT(out_idx.has_value() == out_weights.has_value());
+    std::optional<std::tuple<torch::Tensor, torch::Tensor>> out_opt;
+    if (out_idx.has_value())
+        out_opt = std::make_tuple(convert_to_torch_tensor(out_idx.value()), convert_to_torch_tensor(out_weights.value()));
+    auto result = mega_gate::bf16_mega_gate(
+        convert_to_torch_tensor(x),
+        convert_to_torch_tensor(weight),
+        static_cast<int>(num_topk),
+        use_shared_as_routed,
+        static_cast<int>(num_shared_experts),
+        static_cast<float>(routed_scaling_factor),
+        static_cast<int>(ep_rank),
+        scoring_func,
+        to_optional_tensor(mask),
+        to_optional_tensor(bias),
+        to_optional_tensor(image_bias),
+        to_optional_tensor(image_token_mask),
+        to_optional_tensor(fix_routing_mask),
+        to_optional_tensor(to_physical_map),
+        to_optional_tensor(logical_count),
+        to_optional_tensor(unmapped_topk_idx),
+        to_optional_tensor(force_random),
+        out_opt);
+    return tvm::ffi::Tuple<Tensor, Tensor>(
+        Tensor::FromDLPack(at::toDLPack(std::get<0>(result))),
+        Tensor::FromDLPack(at::toDLPack(std::get<1>(result))));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_mega_gate, dg_bf16_mega_gate);
+
+void dg_batched_syrk(TensorView a,
+    TensorView d) {
+    gemm::batched_syrk(
+        convert_to_torch_tensor(a),
+        convert_to_torch_tensor(d));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batched_syrk, dg_batched_syrk);
+
+void dg_batched_symm(TensorView a,
+    TensorView b,
+    TensorView d) {
+    gemm::batched_symm(
+        convert_to_torch_tensor(a),
+        convert_to_torch_tensor(b),
+        convert_to_torch_tensor(d));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(batched_symm, dg_batched_symm);
+
+void dg_cublaslt_nvfp4_gemm_nt(TensorView a,
+    TensorView a_sf,
+    TensorView b,
+    TensorView b_sf,
+    TensorView d,
+    Optional<TensorView> c) {
+    gemm::cublaslt_nvfp4_gemm_nt(
+        std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+        std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
+        convert_to_torch_tensor(d),
+        to_optional_tensor(c));
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cublaslt_nvfp4_gemm_nt, dg_cublaslt_nvfp4_gemm_nt);
+
+Map<String, int64_t> dg_get_bf16_mega_gate_config(int64_t num_tokens, int64_t hidden,
+    int64_t num_routed_experts, int64_t num_topk) {
+    const auto config = mega_gate::get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk);
+    Map<String, int64_t> result;
+    for (const auto& [key, value] : config)
+        result.Set(key, value);
+    return result;
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_bf16_mega_gate_config, dg_get_bf16_mega_gate_config);
+
+void dg_k_grouped_fp4_gemm_nt_contiguous(TensorView a, TensorView a_sf,
+                                         TensorView b, TensorView b_sf,
+                                         TensorView d,
+                                         Optional<Array<int64_t>> ks,
+                                         TensorView grouped_layout,
+                                         Optional<TensorView> c,
+                                         Tuple<int64_t, int64_t, int64_t> recipe,
+                                         std::string compiled_dims,
+                                         bool use_psum_layout) {
+    auto ks_val = to_optional_int_vector(ks);
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    auto recipe_val = std::make_tuple(static_cast<int>(recipe.get<0>()),
+                                      static_cast<int>(recipe.get<1>()),
+                                      static_cast<int>(recipe.get<2>()));
+    gemm::k_grouped_fp4_gemm_nt_contiguous(
+        std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+        std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
+        convert_to_torch_tensor(d), ks_val, convert_to_torch_tensor(grouped_layout),
+        c_opt, recipe_val, compiled_dims, use_psum_layout
+    );
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_fp4_gemm_nt_contiguous, dg_k_grouped_fp4_gemm_nt_contiguous);

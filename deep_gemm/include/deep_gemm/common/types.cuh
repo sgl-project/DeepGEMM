@@ -8,6 +8,7 @@ enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
     MXFP4       = 2,
+    MXF4        = MXFP4,
     NVFP4       = 3,
 };
 
@@ -70,6 +71,16 @@ enum class KernelType {
     Kernel1D1D = 0,
     Kernel1D2D = 1,
     KernelNoSF = 2
+};
+
+// Host-visible runtime state of the `epilogue::transform` operators, which derive from
+// this struct without adding members, so the host fully determines the operator on launch.
+// Only the fields consumed by the selected epilogue type are meaningful
+struct EpilogueArgs {
+    uint32_t* sfd = nullptr;
+    uint32_t sfd_stride = 0;
+    uint32_t shape_m = 0, shape_n = 0;
+    float alpha = 1.0f;
 };
 
 } // namespace deep_gemm

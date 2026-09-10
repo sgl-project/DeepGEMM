@@ -1,5 +1,11 @@
 #pragma once
 
+#include <cutlass/arch/barrier.h>
+
+#include <cute/arch/copy_sm100.hpp>
+
+#include <deep_gemm/common/exception.cuh>
+
 namespace deep_gemm::ptx {
 
 /// UMMA versions with relaxed assertions
@@ -213,6 +219,27 @@ struct SM100_MMA_F16BF16_WS_SS {
 };
 
 /// Tensor memory operations
+template <uint32_t kNumValues>
+CUTLASS_DEVICE void tmem_load_32dp32b(const uint32_t tmem_addr, uint32_t* values) {
+    DG_STATIC_ASSERT(kNumValues == 4 or kNumValues == 8 or kNumValues == 16 or
+                     kNumValues == 32 or kNumValues == 64 or kNumValues == 128,
+                     "Invalid TMEM load width");
+    using Loader = cute::conditional_t<kNumValues == 4, cute::SM100_TMEM_LOAD_32dp32b4x,
+                   cute::conditional_t<kNumValues == 8, cute::SM100_TMEM_LOAD_32dp32b8x,
+                   cute::conditional_t<kNumValues == 16, cute::SM100_TMEM_LOAD_32dp32b16x,
+                   cute::conditional_t<kNumValues == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
+                   cute::conditional_t<kNumValues == 64, cute::SM100_TMEM_LOAD_32dp32b64x,
+                                                               cute::SM100_TMEM_LOAD_32dp32b128x>>>>>;
+    [&]<size_t... Is>(cute::index_sequence<Is...>) {
+        Loader::copy(tmem_addr, values[Is]...);
+    }(cute::make_index_sequence<kNumValues>{});
+}
+
+CUTLASS_DEVICE void umma_arrive_no_elect(cutlass::arch::ClusterTransactionBarrier& barrier) {
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::
+                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&barrier))));
+}
+
 CUTLASS_DEVICE void tcgen05_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;");
 }

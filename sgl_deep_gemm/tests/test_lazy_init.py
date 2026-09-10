@@ -18,3 +18,6 @@ if __name__ == '__main__':
         p.start()
     for p in procs:
         p.join()
+
+    failures = [(i, p.exitcode) for i, p in enumerate(procs) if p.exitcode != 0]
+    assert not failures, f'CUDA initialization failed in forked children: {failures}'

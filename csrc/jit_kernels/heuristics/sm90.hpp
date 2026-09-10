@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../runtime/runtime.hpp"
+
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
@@ -57,7 +59,7 @@ struct SM90ArchSpec {
             block_n_candidates.push_back(i);
 
         // Block K is always in a fixed manner
-        const int block_k = 128 / get_element_size(desc.get_mma_kind());
+        const int block_k = 128 * 8 / get_num_element_bits(desc.get_mma_kind());
 
         // Disable multicast for performance
         const bool disable_multicast =
@@ -182,7 +184,8 @@ struct SM90ArchSpec {
             kNumMaxStages);
         return {
             smem_extra + num_stages * smem_per_stage,
-            num_stages
+            num_stages,
+            2
         };
     }
 

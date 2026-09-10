@@ -98,6 +98,15 @@ jobs:
           sudo apt-get install -y libcusparse-$CUDA_VERSION libcusolver-$CUDA_VERSION 
           sudo apt-get clean
 
+      - name: Install C++ build dependencies
+        run: |
+          # DeepJIT requires std::format and libdw headers; keep Ubuntu 22.04's glibc.
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 libdw-dev
+          echo "CC=gcc-13" >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
       - name: Install PyTorch ${{ inputs.torch-version }}+cu${{ inputs.cuda-version }}
         run: |
           pip install --upgrade pip
