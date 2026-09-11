@@ -7,10 +7,7 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 
-#if DG_TENSORMAP_COMPATIBLE
-#include "../jit/compiler.hpp"
-#endif
-#include "../jit/device_runtime.hpp"
+#include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_pre_dispatch.hpp"
@@ -53,7 +50,7 @@ get_symm_buffer_size_for_mega_moe(
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_sms = runtime->get_num_sms();
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
@@ -81,7 +78,7 @@ get_symm_buffer_size_for_mega_moe(
     // Parse MMA type
     const auto with_sf = is_mma_with_sf(mma_kind);
 
-    const bool host_use_fp8_combine = with_sf and get_env<int>("DG_USE_FP8_COMBINE") != 0;
+    const bool host_use_fp8_combine = with_sf and deep_jit::get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
@@ -237,13 +234,14 @@ static void fp8_fp4_mega_moe(
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+    const auto weight_dtype = l1_weights.scalar_type();
+    DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
@@ -338,7 +336,7 @@ static void fp8_fp4_mega_moe(
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales] = slice(sym_buffer);
-    const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
+    const bool use_fp8_combine = deep_jit::get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -374,7 +372,7 @@ static void fp8_fp4_mega_moe(
 
     // Zero the entire symmetric buffer for debug mode
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 
@@ -406,7 +404,7 @@ static void bf16_mega_moe(
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = get_shape<3>(l1_weights);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
     DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
@@ -482,13 +480,12 @@ static void bf16_mega_moe(
 
     // Zero the entire symmetric buffer for debug mode
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 
-#if 0
+#ifndef DG_USE_TVM_FFI
 static void register_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
@@ -507,7 +504,6 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("mma_type") = "fp8xfp4",
           pybind11::arg("buf_x_scales") = std::nullopt,
           pybind11::arg("expert_scales") = std::nullopt);
-#endif
 }
 
 #endif

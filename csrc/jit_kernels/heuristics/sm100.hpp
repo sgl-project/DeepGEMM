@@ -1,5 +1,8 @@
 #pragma once
 
+#include "../../runtime/runtime.hpp"
+
+#include <algorithm>
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
@@ -28,7 +31,7 @@ struct SM100ArchSpec {
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         // Block K is always in a fixed manner
-        const int block_k = 128 / get_element_size(desc.get_mma_kind());
+        const int block_k = 128 * 8 / get_num_element_bits(desc.get_mma_kind());
 
         // Always enable swap A/B (and multicasting if possible) for m-grouped GEMMs
         if (desc.gemm_type == GemmType::MGroupedContiguous or
@@ -44,8 +47,27 @@ struct SM100ArchSpec {
             return candidates;
         }
 
+        // Large K-major batched projections benefit from the deeper non-overlapped
+        // pipeline. Keep overlapping tiles for smaller/shallow projections and MN-major B.
+        const bool prefer_batched_nonoverlap =
+            desc.gemm_type == GemmType::Batched and
+            desc.a_dtype == torch::kFloat8_e4m3fn and desc.b_dtype == torch::kFloat8_e4m3fn and
+            desc.cd_dtype == torch::kBFloat16 and not desc.with_accumulation and
+            desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K and
+            desc.m >= 8192 and desc.n <= 1024 and desc.k >= 2048 and desc.max_gran_k == 128;
+        // This mixed-format FP32 accumulation family also favors the deeper pipeline.
+        // BF16 output, other layouts, and deeper K retain the overlapping-tile gains.
+        const bool prefer_mixed_nonoverlap =
+            desc.gemm_type == GemmType::Normal and
+            desc.a_dtype == torch::kFloat8_e4m3fn and desc.b_dtype == kPackedFP4 and
+            desc.cd_dtype == torch::kFloat and desc.with_accumulation and desc.cd_n_contiguous and
+            desc.major_a == cute::UMMA::Major::MN and desc.major_b == cute::UMMA::Major::MN and
+            desc.m >= 8192 and desc.n == 4096 and desc.k == 1536;
+        const bool prefer_nonoverlap = prefer_batched_nonoverlap or prefer_mixed_nonoverlap;
+
         // Enumerate all candidates
         std::vector<Layout> candidates;
+        std::vector<Layout> preferred_candidates;
         for (int swap_ab = 0; swap_ab < 2; ++ swap_ab) {
             // Block M/N candidates
             std::vector<int> block_m_candidates;
@@ -126,9 +148,9 @@ struct SM100ArchSpec {
                             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, desc.get_mma_kind());
                             const auto sf_granularity = get_sf_gran_k(desc.get_mma_kind());
                             const auto tmem_sf_cols = sf_granularity ?
-                                sf_block_m / sf_granularity + sf_block_n / sf_granularity : sf_granularity;
+                                (sf_block_m + sf_block_n) * (block_k / (sf_granularity * 4)) / 32 : sf_granularity;
                             const auto umma_n = swap_ab ? block_m : block_n;
-                            if (2 * umma_n + tmem_sf_cols > 512)
+                            if (umma_n + tmem_sf_cols > 512)
                                 continue;
 
                             const auto layout = Layout{swap_ab, block_m, block_n, block_k, cluster_m, cluster_n};
@@ -141,10 +163,27 @@ struct SM100ArchSpec {
                             }
 
                             candidates.push_back(layout);
+                            if (prefer_nonoverlap and 2 * umma_n + tmem_sf_cols <= 512)
+                                preferred_candidates.push_back(layout);
                         }
                     }
                 }
             }
+        }
+
+        // Explicit block-size constraints may leave only overlapping layouts available.
+        if (not preferred_candidates.empty())
+            candidates = std::move(preferred_candidates);
+
+        // Dynamic FP8 output requires the physical store atom to own complete per-32 SF groups
+        if (desc.cd_dtype == torch::kFloat8_e4m3fn) {
+            const auto owns_partial_sf_groups = [&](const Layout& layout) {
+                const auto store_block_n = layout.swap_ab ? layout.block_n :
+                    get_storage_config(desc, layout).swizzle_cd_mode;
+                return store_block_n % 32 != 0;
+            };
+            candidates.erase(std::remove_if(candidates.begin(), candidates.end(), owns_partial_sf_groups),
+                             candidates.end());
         }
 
         DG_HOST_ASSERT(not candidates.empty());
@@ -162,11 +201,13 @@ struct SM100ArchSpec {
         const auto store_block_n = layout.block_n;
 
         // Decide swizzling by the inner dim
-        // TODO: support FP4 sub-byte
-        const auto swizzle_mode_a = get_swizzle_mode(
-            desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
-        const auto swizzle_mode_b = get_swizzle_mode(
-            desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
+        const int pack_factor = desc.get_smem_pack_factor();
+        const int swizzle_mode_a = get_swizzle_mode(
+            (desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m) / pack_factor,
+            c10::elementSize(desc.a_dtype));
+        const int swizzle_mode_b = get_swizzle_mode(
+            (desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n) / pack_factor,
+            c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_cd = get_swizzle_mode(
             store_block_n, c10::elementSize(desc.cd_dtype));
 
@@ -177,26 +218,43 @@ struct SM100ArchSpec {
         };
     }
 
+    static int get_num_tma_store_stages(const GemmDesc& desc, const Layout& layout) {
+        // With single-stage TMA stores, each SM keeps at most one bulk store in
+        // flight. This paces the store traffic and improves the achieved DRAM
+        // throughput when C/D flushes dominate DRAM traffic; it also frees up
+        // shared memory for the A/B mainloop and halves the C/D smem read/write
+        // footprint. Only enabled for k-grouped GEMMs.
+        if (desc.get_mma_kind() == MmaKind::BF16 or layout.swap_ab or
+            not is_k_grouped_contiguous(desc.gemm_type))
+            return 2;
+
+        const int num_k_blocks_per_group = desc.k / std::max(desc.num_groups, 1) / layout.block_k;
+        const int min_k_blocks = desc.cd_dtype != torch::kFloat ? 16 :
+                                 desc.with_accumulation ? 24 : 32;
+        return num_k_blocks_per_group >= min_k_blocks ? 1 : 2;
+    }
+
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
         constexpr int kNumMaxStages = 32;
 
         // C/D for TMA stores
-        const int smem_cd = layout.swap_ab ? storage_config.store_block_m * storage_config.store_block_n * c10::elementSize(desc.cd_dtype) * 2
-                                           : storage_config.store_block_m * storage_config.swizzle_cd_mode * 2;
+        const int num_tma_store_stages = get_num_tma_store_stages(desc, layout);
+        const int smem_cd = (layout.swap_ab ? storage_config.store_block_m * storage_config.store_block_n * c10::elementSize(desc.cd_dtype)
+                                            : storage_config.store_block_m * storage_config.swizzle_cd_mode) * num_tma_store_stages;
 
         // TODO: remove SF barriers for BF16 GEMMs
-        // TMA full/empty barriers, with-SF full barriers, tensor memory full/empty barriers
+        // A/B-and-SF-transpose full, SF-TMA full, empty, and tensor memory full/empty/overlap barriers
         // NOTES: some shapes may only have 1 epilogue stage, but we still allocate space for 2 stages
         // NOTES: the last barrier is for tensor core utilization control
-        const int smem_barriers = kNumMaxStages * 8 * 3 + 2 * 8 * 2 + 8;
+        const int smem_barriers = kNumMaxStages * 8 * 3 + 2 * 8 * 3 + 8;
 
         // Tensor memory pointer
         const int smem_tmem_ptr = 4;
 
         // Calculate A/B per stages
-        // TODO: consider FP4
-        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
-        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
+        const int pack_factor = desc.get_smem_pack_factor();
+        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype) / pack_factor;
+        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype) / pack_factor;
 
         // Calculate SF A/B per stages
         int smem_sfa_per_stage = 0;
@@ -204,8 +262,8 @@ struct SM100ArchSpec {
         if (desc.kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(
                 layout.block_m, layout.block_n, desc.get_mma_kind());
-            smem_sfa_per_stage = sf_block_m * 4;
-            smem_sfb_per_stage = sf_block_n * 4;
+            smem_sfa_per_stage = sf_block_m * layout.block_k / 32;
+            smem_sfb_per_stage = sf_block_n * layout.block_k / 32;
         }
 
         // Calculate stages
@@ -216,7 +274,8 @@ struct SM100ArchSpec {
             kNumMaxStages);
         return {
             smem_extra + num_stages * smem_per_stage,
-            num_stages
+            num_stages,
+            num_tma_store_stages
         };
     }
 

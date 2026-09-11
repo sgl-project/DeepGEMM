@@ -34,6 +34,7 @@ import math
 import os
 import random
 import sys
+import zlib
 import torch
 import torch.distributed as dist
 import triton
@@ -380,6 +381,10 @@ def _reference_fused(
     return y_full_bf16[start:end].contiguous()
 
 
+def _accuracy_seed(name: str, rank_idx: int) -> int:
+    return rank_idx * 1000 + zlib.crc32(name.encode("utf-8"))
+
+
 def _run_accuracy_scenario(
     name: str,
     cfg: Dict[str, Any],
@@ -412,8 +417,9 @@ def _run_accuracy_scenario(
             print(f"[rank{rank_idx}] {name} :: {stage}", flush=True)
 
     trace("begin")
-    torch.manual_seed(rank_idx * 1000 + abs(hash(name)) % 1000)
-    random.seed(rank_idx * 1000 + abs(hash(name)) % 1000)
+    seed = _accuracy_seed(name, rank_idx)
+    torch.manual_seed(seed)
+    random.seed(seed)
 
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     l1_weights_bf16 = torch.randn(
@@ -464,18 +470,22 @@ def _run_accuracy_scenario(
     buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+
+    def run_fused():
+        deep_gemm.fp8_mega_moe(
+            y_fused,
+            transformed_l1,
+            transformed_l2,
+            buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(128, 128, 128),
+            activation="swiglu",
+            activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
+            fast_math=fast_math,
+        )
+
     trace("launch_fused")
-    deep_gemm.fp8_mega_moe(
-        y_fused,
-        transformed_l1,
-        transformed_l2,
-        buffer,
-        cumulative_local_expert_recv_stats=cum_stats,
-        recipe=(128, 128, 128),
-        activation="swiglu",
-        activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
-        fast_math=fast_math,
-    )
+    run_fused()
     torch.cuda.synchronize()
 
     trace("reference")
@@ -499,13 +509,54 @@ def _run_accuracy_scenario(
     )
 
     diff = calc_diff(y_fused, y_ref)
-    ok = diff < diff_tol
+    ok = torch.tensor(int(diff < diff_tol), dtype=torch.int32, device="cuda")
+    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+    ok = bool(ok.item())
     dist_print(
         f"  [{name:<32}] diff={diff:.4f} (tol={diff_tol:.2f}) "
         f"{'OK' if ok else 'FAIL'}",
         once_in_node=True,
     )
     assert ok, f"{name}: diff={diff} >= tol={diff_tol}"
+
+    def check_reused_output(label: str):
+        torch.cuda.synchronize()
+        replay_diff = calc_diff(y_fused, y_ref)
+        passed = torch.tensor(int(replay_diff < diff_tol), dtype=torch.int32, device="cuda")
+        dist.all_reduce(passed, op=dist.ReduceOp.MIN, group=group)
+        assert passed.item(), f"{name}/{label}: a rank failed numerical checking (local diff={replay_diff}, tol={diff_tol})"
+        dist_print(f"  [{name}/{label}] diff={replay_diff:.4f} OK", once_in_node=True)
+
+    for repeat_idx in range(cfg.get("num_repeated_launches", 0)):
+        # Keep the same symmetric buffer and poison only the output so a stale
+        # result cannot satisfy the reference check on a subsequent launch.
+        y_fused.fill_(float("nan"))
+        dist.barrier()
+        run_fused()
+        check_reused_output(f"repeat{repeat_idx + 1}")
+
+    num_graph_replays = cfg.get("num_graph_replays", 0)
+    if num_graph_replays:
+        # Warm the capture stream before recording the same-buffer launch.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        dist.barrier()
+        with torch.cuda.stream(capture_stream):
+            run_fused()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        check_reused_output("graph_warmup")
+
+        graph = torch.cuda.CUDAGraph()
+        dist.barrier()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run_fused()
+        for replay_idx in range(num_graph_replays):
+            y_fused.fill_(float("nan"))
+            dist.barrier()
+            graph.replay()
+            check_reused_output(f"graph_replay{replay_idx + 1}")
+        del graph
+
     if num_tokens > 0 and masked_ratio < 1.0:
         assert cum_stats.sum().item() >= 0
 
@@ -592,6 +643,14 @@ def _accuracy_layer4_edges(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     cfg = dict(base)
     cfg.update(num_tokens=base["num_max_tokens_per_rank"])
     out.append(("L4.tokens_max", cfg))
+    cfg = dict(base)
+    cfg.update(
+        num_max_tokens_per_rank=8192,
+        num_tokens=8192,
+        num_repeated_launches=3,
+        num_graph_replays=3,
+    )
+    out.append(("L4.tokens8192_reuse", cfg))
     return out
 
 

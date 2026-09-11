@@ -45,7 +45,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
           typename cd_dtype_t,
-          typename epilogue_type_t>
+          typename epilogue_op_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -279,7 +279,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                 // Dispatch `num_former_iters` and launch MMAs
                 dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
-                    #pragma unroll 8
+                    #pragma unroll (kGemmType == GemmType::Normal && SHAPE_M == 0 && SHAPE_N == 0 && SHAPE_K == 0 && BLOCK_M == 256 && BLOCK_N == 128 ? 2 : 8)
                     for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                         const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
                         const auto b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
@@ -430,7 +430,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
-                auto n_idx = epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
+                auto n_idx = epilogue_op_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
                 auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
                 if constexpr (kGemmType == GemmType::Batched) {
                     cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,

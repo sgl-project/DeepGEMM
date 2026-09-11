@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../runtime/runtime.hpp"
+
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 

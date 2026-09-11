@@ -27,9 +27,8 @@ namespace deep_gemm {
 // with the contiguous `(P, num_groups/4)` int32 slot storing 4 bytes per int32
 // in row-major order.
 //
-// The FP4 quant matches `per_token_cast_to_fp4` (host helper) bytewise via
-// explicit bucketize boundaries — PTX `cvt.rn.satfinite.e2m1x2.f32` rounds
-// midpoints to-even, but the host helper rounds midpoints toward zero.
+// The FP4 quant matches `per_token_cast_to_fp4` (host helper) bytewise,
+// including round-to-nearest-even at E2M1 midpoints.
 
 // ceil_to_ue8m0(raw_scale) — matches `deep_gemm.utils.math.ceil_to_ue8m0`:
 // returns the UE8M0 exponent byte (in [1, 254]) such that 2^(exp-127) is the
@@ -45,14 +44,13 @@ __forceinline__ __device__ uint32_t pre_dispatch_cast_to_ue8m0(float raw_scale) 
 }
 
 // E2M1 (FP4) bucketize encode matching `deep_gemm.utils.math._quantize_to_fp4_e2m1`.
-// Boundaries are midpoints between adjacent representable magnitudes; ties round
-// toward zero (bucketize default), which differs from PTX `cvt.rn.satfinite`
-// rounding ties to even.
+// Boundaries are midpoints between adjacent representable magnitudes. A tie
+// selects the even code, matching the host helper and PTX `cvt.rn.satfinite`.
 __forceinline__ __device__ uint32_t pre_dispatch_e2m1_encode(float v) {
     float ax = fabsf(v);
     if (ax > 6.0f) ax = 6.0f;
-    uint32_t idx = (ax > 0.25f) + (ax > 0.75f) + (ax > 1.25f) +
-                   (ax > 1.75f) + (ax > 2.5f)  + (ax > 3.5f)  + (ax > 5.0f);
+    uint32_t idx = (ax > 0.25f) + (ax >= 0.75f) + (ax > 1.25f) +
+                   (ax >= 1.75f) + (ax > 2.5f) + (ax >= 3.5f) + (ax > 5.0f);
     uint32_t code = idx;
     if ((v < 0.0f) && (idx != 0u))
         code |= 0x8u;

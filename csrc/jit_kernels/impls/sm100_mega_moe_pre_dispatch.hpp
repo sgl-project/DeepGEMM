@@ -1,15 +1,12 @@
 #pragma once
 
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include <optional>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/mega_moe.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
 #include "../../utils/math.hpp"
 
 namespace deep_gemm {
@@ -18,7 +15,7 @@ namespace deep_gemm {
 // `deep_gemm/include/deep_gemm/impls/sm100_mega_moe_pre_dispatch.cuh`).
 // Templated on (kGroupSize, kMmaKind, kUsePDL); host fn picks the
 // instantiation from explicit args.
-class SM100MegaMoEPreDispatchRuntime final : public LaunchRuntime<SM100MegaMoEPreDispatchRuntime> {
+class SM100MegaMoEPreDispatchRuntime final {
 public:
     struct Args {
         int group_size;
@@ -41,11 +38,11 @@ public:
         uint32_t    num_groups;
         uint32_t    top_k;
 
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_pre_dispatch.cuh>
 
 using namespace deep_gemm;
@@ -60,12 +57,12 @@ static void __instantiate_kernel() {{
     args.use_pdl ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.x, args.topk_idx, args.topk_weights, args.expert_scales,
             args.buf_x, args.buf_x_sf, args.buf_x_scales,
             args.buf_topk_idx, args.buf_topk_weights,
-            args.num_tokens, args.padded_max, args.hidden, args.num_groups, args.top_k));
+            args.num_tokens, args.padded_max, args.hidden, args.num_groups, args.top_k);
     }
 };
 
@@ -172,7 +169,7 @@ static void mega_moe_pre_dispatch(
     const auto num_total_blocks = num_tokens + num_pad_blocks;
     if (num_total_blocks == 0) return;
 
-    const bool use_pdl = device_runtime->get_pdl();
+    const bool use_pdl = *jit->default_launch_options.enable_pdl;
 
     SM100MegaMoEPreDispatchRuntime::Args args = {
         .group_size = group_size,
@@ -194,13 +191,13 @@ static void mega_moe_pre_dispatch(
         .hidden = static_cast<uint32_t>(hidden),
         .num_groups = static_cast<uint32_t>(num_groups),
         .top_k = static_cast<uint32_t>(top_k),
-        .launch_args = LaunchArgs(num_total_blocks, num_threads, /*smem_size=*/0,
+        .launch_args = make_launch_options(num_total_blocks, num_threads, /*smem_size=*/0,
                                   /*cluster_dim=*/1, /*enable_pdl=*/use_pdl)
     };
 
     const auto code = SM100MegaMoEPreDispatchRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_mega_moe_pre_dispatch", code);
-    SM100MegaMoEPreDispatchRuntime::launch(runtime, args);
+    const auto kernel = jit->compile("sm100_mega_moe_pre_dispatch", code);
+    SM100MegaMoEPreDispatchRuntime::launch(kernel, args);
 }
 
 } // namespace deep_gemm

@@ -4,7 +4,7 @@ import triton.language as tl
 from typing import Tuple
 
 from .tune_options import *
-from .._C import get_mk_alignment_for_contiguous_layout
+from ..utils.layout import get_mk_alignment_for_contiguous_layout
 
 
 @triton.autotune(configs=get_m_grouped_gemm_configs(), key=[])
@@ -62,7 +62,7 @@ def m_grouped_bf16_gemm_nt_contiguous_tl(a: torch.Tensor, b: torch.Tensor, d: to
                                          m_indices: torch.Tensor):
     r0, r1, r2 = b.shape
 
-    assert a.is_contiguous() and (b.is_contiguous or b.mT.is_contiguous())
+    assert a.is_contiguous() and (b.is_contiguous() or b.mT.is_contiguous())
     assert m_indices.is_contiguous() and d.is_contiguous()
     assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
     assert m_indices.dtype == torch.int32 and d.dtype == torch.bfloat16

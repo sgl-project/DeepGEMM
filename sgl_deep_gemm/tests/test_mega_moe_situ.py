@@ -129,7 +129,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     kernel_sources = [
         path.read_text()
         for path in Path(jit_cache.name).glob(
-            "cache/kernel.sm100_fp8_fp4_mega_moe.*/kernel.cu"
+            "cache/sm100_fp8_fp4_mega_moe.*/kernel.cu"
         )
     ]
     assert len(kernel_sources) == 2

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../runtime/runtime.hpp"
+
 #include "mega_moe.hpp"
 
 namespace deep_gemm {
@@ -154,7 +156,7 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
     // swapAB is ENABLED by default (the L1 SF-pool stride bug that corrupted
     // pool blocks >= 1 was fixed: BLOCK_M -> SF_BLOCK_M in the swapAB L1 epilogue).
     // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
-    if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
+    if (deep_jit::get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
         return false;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
@@ -235,7 +237,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = runtime->get_num_sms();
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
@@ -270,8 +272,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
     };
 
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG") or deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
             "MegaMoESM90Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, swap_ab={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
             use_swap_ab);

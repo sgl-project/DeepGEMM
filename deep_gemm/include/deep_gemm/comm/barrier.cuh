@@ -11,6 +11,18 @@ namespace deep_gemm::comm {
 // 300s timeout, at 2 GHz
 constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
 
+// Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
+template <typename pred_t, typename print_timeout_t>
+CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
+    const auto start_clock = clock64();
+    while (not pred()) {
+        if (clock64() - start_clock >= kNumTimeoutCycles) {
+            print_timeout();
+            DG_DEVICE_ASSERT(false and "Timeout");
+        }
+    }
+}
+
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
     // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee

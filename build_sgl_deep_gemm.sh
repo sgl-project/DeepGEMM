@@ -6,7 +6,7 @@
 # (so existing call sites like `import deep_gemm` in sglang keep working).
 #
 # Build flow:
-#   1. Initialises submodules (cutlass, fmt) — same prerequisite as `bash build.sh`.
+#   1. Initialises submodules (cutlass, deep_jit) — same prerequisite as `bash build.sh`.
 #   2. Stages the package layout under build/deep_gemm/ with the Python
 #      sub-modules pulled from the source deep_gemm/ tree (utils, testing,
 #      legacy, mega).
@@ -54,6 +54,7 @@ mkdir -p "$PKG_DIR/include"
 cp -r "${ROOT_DIR}/deep_gemm/include/deep_gemm" "$PKG_DIR/include/deep_gemm"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cute" "$PKG_DIR/include/cute"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cutlass" "$PKG_DIR/include/cutlass"
+cp -r "${ROOT_DIR}/third-party/deep_jit/include/deep_jit" "$PKG_DIR/include/deep_jit"
 
 echo "--- Reading version from sgl_deep_gemm/VERSION ---"
 if [[ ! -f "sgl_deep_gemm/VERSION" ]]; then
@@ -115,7 +116,7 @@ extra_include_paths = [
     os.path.join(torch_dir, 'include', 'torch', 'csrc', 'api', 'include'),
     os.path.join(root_dir, 'deep_gemm', 'include'),
     os.path.join(root_dir, 'third-party', 'cutlass', 'include'),
-    os.path.join(root_dir, 'third-party', 'fmt', 'include'),
+    os.path.join(root_dir, 'third-party', 'deep_jit', 'include'),
 ]
 cccl = f'{cuda_home}/include/cccl'
 if os.path.exists(cccl):

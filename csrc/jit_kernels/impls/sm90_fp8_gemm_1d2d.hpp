@@ -1,12 +1,10 @@
 #pragma once
 
+#include <format>
 #include <torch/torch.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../heuristics/sm90.hpp"
 
 #include "epilogue.hpp"
@@ -14,12 +12,12 @@
 
 namespace deep_gemm {
 
-class SM90FP8Gemm1D2DRuntime final: public LaunchRuntime<SM90FP8Gemm1D2DRuntime> {
+class SM90FP8Gemm1D2DRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
         // TODO: move this into `gemm_desc`
         const std::optional<std::string>& epilogue_type;
 
@@ -31,8 +29,12 @@ public:
         CUtensorMap tensor_map_sfa;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        // A known N keeps wide single-CTA SM90 tiles free of register spills.
+        const bool specialize_n = args.gemm_desc.gemm_type == GemmType::Normal &&
+            args.gemm_desc.compiled_dims.empty() && args.gemm_config.layout.block_m == 128 &&
+            args.gemm_config.layout.block_n > 128 && args.gemm_config.layout.get_cluster_size() == 1;
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
@@ -55,7 +57,7 @@ static void __instantiate_kernel() {{
 )",
         to_string(args.major_sfb),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
-        get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
+        get_compiled_dim(args.gemm_desc.n, 'n', specialize_n ? "n" : args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
         args.gemm_desc.num_groups,
         args.gemm_config.layout.block_m, args.gemm_config.layout.block_n, args.gemm_config.layout.block_k,
@@ -65,16 +67,16 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         to_string(args.gemm_desc.cd_dtype),
-        get_default_epilogue_type(args.epilogue_type));
-    }
+        get_default_epilogue_type(args.epilogue_type)));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // TODO: optimize `args` copy
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        // Launch
+        jit->launch(
+            kernel, args.options,
             args.sfb, args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_d, args.tensor_map_sfa));
+            args.tensor_map_d, args.tensor_map_sfa
+        );
     }
 };
 
@@ -97,8 +99,9 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -123,13 +126,16 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, 1, 0);
 
-    // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
+    // Compile and launch
+    SM90FP8Gemm1D2DRuntime::compile_and_launch("sm90_fp8_gemm_1d2d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .epilogue_type = epilogue_type,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
@@ -138,10 +144,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
-    };
-    const auto code = SM90FP8Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
-    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -171,8 +174,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
@@ -200,13 +204,16 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, 1, 0);
 
-    // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
+    // Compile and launch
+    SM90FP8Gemm1D2DRuntime::compile_and_launch("sm90_m_grouped_fp8_gemm_contiguous_1d2d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
@@ -215,10 +222,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
-    };
-    const auto code = SM90FP8Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_fp8_gemm_contiguous_1d2d", code);
-    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -240,8 +244,9 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
@@ -267,13 +272,16 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, num_groups, 0);
 
-    // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
+    // Compile and launch
+    SM90FP8Gemm1D2DRuntime::compile_and_launch("sm90_fp8_m_grouped_gemm_masked_1d2d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
@@ -282,10 +290,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
-    };
-    const auto code = SM90FP8Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_m_grouped_gemm_masked_1d2d", code);
-    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -306,8 +311,9 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -338,13 +344,16 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, batch_size, 0);
 
-    // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
+    // Compile and launch
+    SM90FP8Gemm1D2DRuntime::compile_and_launch("sm90_fp8_gemm_1d2d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
@@ -353,10 +362,7 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
-    };
-    const auto code = SM90FP8Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
-    SM90FP8Gemm1D2DRuntime::launch(runtime, args);
+    });
 }
 
 } // namespace deep_gemm

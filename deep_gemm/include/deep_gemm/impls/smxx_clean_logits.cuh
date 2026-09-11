@@ -41,8 +41,9 @@ void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const 
 
     if (cute::elect_one_sync()) {
         for (uint32_t i = warp_seq_start; i < warp_seq_start + warp_seq_len; ++ i) {
-            const auto ks = cu_seq_len_k_start == nullptr ? 0 : cu_seq_len_k_start[i / kNextN];
-            const auto ke = cu_seq_len_k_end[i / kNextN] - kNextN + i % kNextN + 1;
+            // Match the scheduler's logical bounds before aligning cleanup stores.
+            const auto ks = cu_seq_len_k_start == nullptr ? 0 : cute::min(cu_seq_len_k_start[i / kNextN], seq_len_kv);
+            const auto ke = cute::min(cu_seq_len_k_end[i / kNextN] - kNextN + i % kNextN + 1, seq_len_kv);
             const auto aligned_ks = ks / kAlignment * kAlignment, aligned_ke = (ke + kAlignment - 1) / kAlignment * kAlignment;
 
             for (uint32_t left = 0; left < seq_len_kv; left += BLOCK_KV) {
@@ -61,8 +62,8 @@ void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const 
     __syncwarp();
 
     for (uint32_t i = warp_seq_start; i < warp_seq_start + warp_seq_len; ++ i) {
-        const auto ks = cu_seq_len_k_start == nullptr ? 0 : cu_seq_len_k_start[i / kNextN];
-        const auto ke = cu_seq_len_k_end[i / kNextN] - kNextN + i % kNextN + 1;
+        const auto ks = cu_seq_len_k_start == nullptr ? 0 : cute::min(cu_seq_len_k_start[i / kNextN], seq_len_kv);
+        const auto ke = cute::min(cu_seq_len_k_end[i / kNextN] - kNextN + i % kNextN + 1, seq_len_kv);
         const auto aligned_ks = ks / kAlignment * kAlignment, aligned_ke = (ke + kAlignment - 1) / kAlignment * kAlignment;
         for (uint32_t j = aligned_ks; j < ks; ++ j)
             logits[i * stride_logits + j] = neg_inf;

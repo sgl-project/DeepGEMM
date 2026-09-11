@@ -2,7 +2,7 @@
 
 #include <functional>
 
-#include "mega.hpp"
+#include "mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 
@@ -23,7 +23,7 @@ static void mega_moe_pre_dispatch_sm90(
     const int& num_tokens,
     const int& group_size,
     const float& routed_scaling_factor) {
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     sm90_mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
@@ -154,7 +154,7 @@ static void fp8_mega_moe(
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -217,7 +217,7 @@ static void fp8_mega_moe(
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 

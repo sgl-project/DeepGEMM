@@ -46,6 +46,14 @@ def _run_one(use_fp4_acts: bool, args: argparse.Namespace) -> None:
 
     # --- Inputs (BF16 acts, int32 topk_idx, float topk_weights) ---
     x = torch.randn((M, H), dtype=torch.bfloat16, device='cuda')
+    if use_fp4_acts and M > 0 and G >= 32:
+        # Force scale=1 in the first group and exercise every positive/negative
+        # E2M1 midpoint; random BF16 inputs alone need not hit each tie.
+        x[0, :G] = 0
+        x[0, :16] = torch.tensor(
+            [0, .25, .75, 1.25, 1.75, 2.5, 3.5, 5, 6,
+             -.25, -.75, -1.25, -1.75, -2.5, -3.5, -5],
+            dtype=x.dtype, device=x.device)
     # Use plausible expert ids in [0, num_experts) and float weights.
     num_experts = args.num_experts
     topk_idx = torch.randint(0, num_experts, (M, K), dtype=torch.int32, device='cuda')
@@ -88,6 +96,11 @@ def _run_one(use_fp4_acts: bool, args: argparse.Namespace) -> None:
             f'[{"FP4" if use_fp4_acts else "FP8"}] buf_x mismatch '
             f'at row {i}, col {j}: kernel={int(kernel_bytes[i, j])} '
             f'ref={int(ref_bytes[i, j])} (total mismatches={int(diff_x.sum())})')
+    if use_fp4_acts and M > 0 and G >= 32:
+        expected_midpoints = torch.tensor(
+            [0x00, 0x22, 0x44, 0x66, 0x07, 0xaa, 0xcc, 0xee],
+            dtype=torch.uint8, device=x.device)
+        assert torch.equal(kernel_bytes[0, :8], expected_midpoints), 'FP4 ties must round to even'
 
     # SF byte layout: (M, num_groups/4) int32 → (M, num_groups) UE8M0 bytes.
     kernel_sf_bytes = buf_x_sf[:M].view(torch.uint8)
