@@ -70,13 +70,12 @@ def test_gemm_skip_head_mid() -> None:
 
 
 def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
-    num_cases = os.getenv('DG_MQA_NUM_CASES')
-    if num_cases is None:
-        selected = cases
-    else:
-        rng = random.Random({'prefill': 0, 'paged': 100000, 'sparse': 200000}[name])
-        selected = rng.sample(cases, min(int(num_cases), len(cases)))
-    print(f' > {name}: running {len(selected)}/{len(cases)} cases')
+    from release_test_profile import select_mqa_cases
+
+    profile = os.getenv('DG_TEST_PROFILE', 'full')
+    selected = select_mqa_cases(name, cases, profile=profile, num_cases=os.getenv('DG_MQA_NUM_CASES'))
+    coverage = ' [release profile: reduced coverage]' if profile == 'release' else ''
+    print(f' > {name}: running {len(selected)}/{len(cases)} cases{coverage}')
     return selected
 
 

@@ -3,8 +3,9 @@
 # Runs from sgl_deep_gemm/tests/ so `import deep_gemm` hits the wheel's prebuilt _C.so, not
 # the source tree (which JIT-rebuilds _C); the guard below aborts if that resolution is wrong.
 #
-# Usage: run_tests.sh [DEEPGEMM_SRC] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
+# Usage: run_tests.sh [DEEPGEMM_SRC] [--release] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
 #   DEEPGEMM_SRC defaults to this script's own repo root.
+#   --release selects bounded attention coverage and focused sanitizer functions.
 set -uo pipefail
 
 # TVM FFI probes CUDA availability while loading Torch's DLPack fast path.
@@ -19,14 +20,21 @@ fi
 MAX_PROCS=""
 SKIP_SANITIZER=0
 SKIP_MEGA_MOE=0
+TEST_PROFILE=full
 while [ $# -gt 0 ]; do
   case "$1" in
+    --release) TEST_PROFILE=release; shift ;;
     --max-procs) MAX_PROCS="$2"; shift 2 ;;
     --skip-sanitizer) SKIP_SANITIZER=1; shift ;;
     --skip-mega-moe) SKIP_MEGA_MOE=1; shift ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+export DG_TEST_PROFILE="${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ] && [ "${DG_MQA_NUM_CASES+x}" = x ]; then
+  echo "--release cannot be combined with DG_MQA_NUM_CASES; unset the random sampling cap." >&2
+  exit 1
+fi
 
 TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
 PYTHON="${PYTHON:-python3}"
@@ -68,6 +76,10 @@ echo " DeepGEMM wheel test run"
 echo "   deep_gemm:    ${DG_FILE}"
 echo "   GPUs:         ${NUM_GPUS} (compute_cap ${COMPUTE_CAP}, arch major ${ARCH_MAJOR})"
 echo "   processes:    ${NPROC}"
+echo "   profile:      ${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ]; then
+  echo "   coverage:     reduced attention matrix and focused memcheck/synccheck"
+fi
 echo "   skip-mega:    ${SKIP_MEGA_MOE}   skip-sanitizer: ${SKIP_SANITIZER}"
 echo "=============================================================="
 
@@ -233,6 +245,13 @@ fi
 if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
   if [ "${SKIP_SANITIZER}" -eq 1 ]; then
     skip_test test_sanitizer.py "--skip-sanitizer"
+  elif [ "${TEST_PROFILE}" = release ]; then
+    # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
+    SANITIZER_FUNCS=test_attention.test_gemm_skip_head_mid
+    if [ "${ARCH_MAJOR}" -eq 10 ]; then
+      SANITIZER_FUNCS+=,test_clean_logits_bounds.test_clean_logits_bounds
+    fi
+    run_test test_sanitizer.py --funcs "${SANITIZER_FUNCS}" --tools memcheck,synccheck
   else
     run_test test_sanitizer.py
   fi
