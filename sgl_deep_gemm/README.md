@@ -15,6 +15,14 @@ K-grouped FP8 GEMM and its scale-packing helper preserve compact per-group scali
 
 Run wheel validation with `bash sgl_deep_gemm/run_tests.sh`. The Mega MoE reference comparisons require DeepEP with `ElasticBuffer`; Mega Gate and Mega mHC also require TileKernels and TileLang. Install the validation extras with `pip install 'sgl-deep-gemm[dev]'` (TileLang 0.1.9 and TileKernels 1.0.0). The runner enables NVML-based CUDA discovery to preserve fork compatibility while retaining TVM FFI's DLPack fast path. It runs legacy, lazy-init, and compute-sanitizer checks; `--skip-sanitizer` is available for ordinary development runs. Distributed MegaMoE runs include separate Hopper numerical accuracy coverage; the sanitizer's automatic discovery covers single-process tests and reports distributed entrypoints separately.
 
+Run `bash sgl_deep_gemm/run_tests.sh --release` for reduced attention coverage and focused `memcheck`/`synccheck`, targeting a release gate under one hour. Selected cases retain their original assertions; other ordinary and distributed tests remain unchanged. The default command keeps the full suite; the table shows release / full attention case counts.
+
+| GPU architecture | Dense MQA | Paged MQA | Sparse MQA |
+| --- | ---: | ---: | ---: |
+| Hopper (SM90) | 8 / 192 | 8 / 24 | unsupported |
+| Blackwell (SM100/SM103) | 36 / 2304 | 72 / 4320 | 12 / 161 |
+| Blackwell (SM120) | 16 / 256 | 16 / 48 | unsupported |
+
 Use Compute Sanitizer 2025.4.1 or newer for Python tests; older releases can retain Python tensors while collecting host backtraces and exhaust GPU memory. Set `COMPUTE_SANITIZER` to select a separately installed executable. See [NVIDIA's release notes](https://docs.nvidia.com/compute-sanitizer/ReleaseNotes/index.html#updates-in-2025-4-1).
 
 To release a new set of wheels, please contact SGLang team and run the [release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepgemm.yml) under SGLang repo
