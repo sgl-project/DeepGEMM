@@ -126,6 +126,7 @@ DEFAULT_SINGLE_GPU_TESTS=(
 )
 SM120_SINGLE_GPU_TESTS=(
   test_bf16.py
+  test_bf16_repeatability.py
   test_einsum.py
   test_fp8_fp4.py
   test_attention.py
