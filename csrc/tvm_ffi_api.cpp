@@ -658,6 +658,10 @@ int64_t dg_get_token_alignment_for_mega_moe() {
     return (int64_t)mega::get_token_alignment_for_mega_moe();
 }
 
+int64_t dg_get_token_alignment_for_sm90_mega_moe() {
+    return (int64_t)mega::get_token_alignment_for_sm90_mega_moe();
+}
+
 int64_t dg_get_block_m_for_mega_moe(int64_t num_ranks, int64_t num_experts,
                                     int64_t num_max_tokens_per_rank, int64_t num_tokens,
                                     int64_t num_topk, std::string mma_type) {
@@ -719,9 +723,22 @@ dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int
         num_bytes, slice_input_buffers);
 }
 
-Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>
+Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>, int64_t, int64_t>
 dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
-                                         int64_t intermediate_hidden, bool use_fp8_dispatch, std::string activation) {
+                                         int64_t intermediate_hidden, bool use_fp8_dispatch, std::string activation,
+                                         int64_t num_experts_per_wave, int64_t l2_act_sf_gran_k) {
+    // The ring capacity and the L2-lag schedule are derived once here and returned with the size; the buffer passes them back at every launch
+    const auto [num_ring_tokens, l2_lag_encoded] = get_num_ring_tokens_for_sm90_mega_moe(
+        static_cast<int>(num_ranks),
+        static_cast<int>(num_experts),
+        static_cast<int>(num_experts) / static_cast<int>(num_ranks),
+        static_cast<int>(num_max_tokens_per_rank),
+        static_cast<int>(num_topk),
+        static_cast<int>(hidden),
+        static_cast<int>(intermediate_hidden),
+        static_cast<int>(num_experts_per_wave),
+        static_cast<int>(l2_act_sf_gran_k)
+    );
     auto [num_bytes, fn] = mega::get_symm_buffer_size_for_sm90_mega_moe(
         static_cast<int>(num_ranks),
         static_cast<int>(num_experts),
@@ -730,7 +747,9 @@ dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts
         static_cast<int>(hidden),
         static_cast<int>(intermediate_hidden),
         use_fp8_dispatch,
-        activation
+        activation,
+        num_ring_tokens,
+        static_cast<int>(l2_act_sf_gran_k)
     );
 
     auto slice_input_buffers = [=](TensorView buffer) {
@@ -746,8 +765,8 @@ dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts
             Tensor::FromDLPack(at::toDLPack(l2_acts_sf))
         );
     };
-    return Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>(
-        num_bytes, slice_input_buffers);
+    return Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>, int64_t, int64_t>(
+        num_bytes, slice_input_buffers, num_ring_tokens, l2_lag_encoded);
 }
 
 void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
@@ -826,7 +845,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
 void dg_fp8_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
                     Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                     int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
-                    Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math) {
+                    Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math,
+                    int64_t num_ring_tokens, int64_t num_tokens_bound, int64_t l2_lag_encoded, int64_t l2_act_sf_gran_k) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -844,7 +864,9 @@ void dg_fp8_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_
         std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
-        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math
+        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math,
+        static_cast<int>(num_ring_tokens), static_cast<int>(num_tokens_bound),
+        static_cast<int>(l2_lag_encoded), static_cast<int>(l2_act_sf_gran_k)
     );
 }
 
@@ -895,6 +917,7 @@ void dg_mega_moe_pre_dispatch_sm90(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_block_m_for_mega_moe, dg_get_block_m_for_mega_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_sm90_mega_moe, dg_get_token_alignment_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);

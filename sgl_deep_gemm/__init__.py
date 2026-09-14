@@ -399,13 +399,22 @@ def _from_dlpack_if_needed(tensor, dtype: Optional[torch.dtype] = None) -> torch
     return tensor
 
 
+# K granularity of the L2 activation scale the SM90 fused kernel writes between its two GEMMs (`l2_act_sf_gran_k`, 64 or 128).
+# Default (None): per-128 K where the 256-wide decode tile fits, i.e. hidden and 2 x intermediate_hidden are multiples of 512
+# (the 2-CTA pairing needs even N block counts); otherwise per-64 K, whose 128-wide decode tile fits every hidden % 256 == 0.
+def _default_l2_act_sf_gran_k(hidden: int, intermediate_hidden: int) -> int:
+    return 128 if hidden % 512 == 0 and (2 * intermediate_hidden) % 512 == 0 else 64
+
+
 class SM90SymmBuffer:
     def __init__(self, group,
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 num_experts_per_wave: Optional[int] = None,
+                 l2_act_sf_gran_k: Optional[int] = None):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group
@@ -414,13 +423,22 @@ class SM90SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        # None: default layout (full pool, or a lag-scheduled ring from kSm90AutoLagMinTokens tokens per rank);
+        # -1: ring sized for an automatically chosen expert wave; N > 0: ring sized for a wave of N experts
+        self.num_experts_per_wave = num_experts_per_wave if num_experts_per_wave is not None else 0
+        self.l2_act_sf_gran_k = l2_act_sf_gran_k if l2_act_sf_gran_k is not None else \
+            _default_l2_act_sf_gran_k(hidden, intermediate_hidden)
 
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
+        num_bytes, slice_input_buffers, num_ring_tokens, l2_lag_encoded = _C.get_symm_buffer_size_for_sm90_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            use_fp8_dispatch, activation
+            use_fp8_dispatch, activation,
+            self.num_experts_per_wave, self.l2_act_sf_gran_k
         )
+        # 0 = full-pool layout (no ring); the lag encoding goes back to the kernel at every launch
+        self.num_ring_tokens = num_ring_tokens if num_ring_tokens > 0 else None
+        self.l2_lag_encoded = int(l2_lag_encoded)
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
         self.buffer.zero_()
@@ -451,15 +469,18 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
-                                      activation: str = 'swiglu') -> SM90SymmBuffer:
+                                      activation: str = 'swiglu',
+                                      num_experts_per_wave: Optional[int] = None,
+                                      l2_act_sf_gran_k: Optional[int] = None) -> SM90SymmBuffer:
     from .utils.math import align
 
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
     return SM90SymmBuffer(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
+        use_fp8_dispatch, activation,
+        num_experts_per_wave, l2_act_sf_gran_k
     )
 
 
@@ -470,16 +491,21 @@ def get_symm_buffer_for_mega_moe(group,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu'):
+                                 activation: str = 'swiglu',
+                                 num_experts_per_wave: Optional[int] = None,
+                                 l2_act_sf_gran_k: Optional[int] = None):
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
         assert mma_type.split('x')[0] == 'fp8'
+        assert num_shared_experts == 0
         return get_symm_buffer_for_sm90_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            True, activation
+            True, activation,
+            num_experts_per_wave=num_experts_per_wave,
+            l2_act_sf_gran_k=l2_act_sf_gran_k
         )
     return mega.get_symm_buffer_for_mega_moe(
         group, num_experts,
@@ -516,7 +542,11 @@ def fp8_mega_moe(y: torch.Tensor,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 num_tokens_bound: Optional[int] = None):
+    """`num_tokens_bound`: upper bound on this call's per-rank token count on every rank (e.g. the maximum over a DP step);
+    lets the launch pick its schedule by the call instead of by the buffer capacity. None = the buffer capacity, and a
+    bound above it is rejected."""
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_mega_moe(
@@ -530,7 +560,11 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        sym_buffer.num_ring_tokens if sym_buffer.num_ring_tokens is not None else 0,
+        int(num_tokens_bound) if num_tokens_bound is not None else 0,
+        sym_buffer.l2_lag_encoded,
+        sym_buffer.l2_act_sf_gran_k
     )
 
 
