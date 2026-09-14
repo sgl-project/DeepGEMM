@@ -38,7 +38,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const bool& use_fp8_dispatch, const std::string& activation) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai");
 
     const auto workspace = layout::SM90Workspace(
         nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
@@ -148,6 +148,8 @@ static void fp8_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
+    const float& activation_alpha,
+    const float& activation_up_bias,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
@@ -160,7 +162,7 @@ static void fp8_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai");
 
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
@@ -215,7 +217,8 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, activation_alpha, activation_up_bias,
+                     fast_math);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
