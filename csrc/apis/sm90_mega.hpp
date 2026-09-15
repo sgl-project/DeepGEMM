@@ -305,7 +305,7 @@ static void fp8_fp4_mega_moe_sm90(
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -362,8 +362,8 @@ static void fp8_fp4_mega_moe_sm90(
     (void)topk_idx;
     (void)topk_weights;
 
-    DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
-    DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
+    DG_HOST_ASSERT(deep_jit::get_env<int>("DG_USE_FP4_ACTS") == 0);
+    DG_HOST_ASSERT(deep_jit::get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
     const auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk, use_situ);
@@ -388,7 +388,7 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 

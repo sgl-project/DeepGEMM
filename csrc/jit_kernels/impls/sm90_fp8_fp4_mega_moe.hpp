@@ -1,11 +1,12 @@
 #pragma once
 
-#include <torch/python.h>
-#include "../../jit/compiler.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
+
+#include <torch/torch.h>
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
 #include "runtime_utils.hpp"
+#include "../../runtime/launch.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -37,7 +38,7 @@ namespace deep_gemm {
 //     beyond the SFB UE8M0 word.
 // ============================================================================
 
-class SM90FP8FP4MegaMoERuntime final : public LaunchRuntime<SM90FP8FP4MegaMoERuntime> {
+class SM90FP8FP4MegaMoERuntime final {
 public:
     struct Args {
         // Templated arguments
@@ -87,11 +88,11 @@ public:
         const uint32_t* l2_weights_sf;
 
         // Launch configs
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -129,7 +130,7 @@ static void __instantiate_kernel() {{
     args.config.num_padded_sf_pool_tokens,
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
-    args.launch_args.grid_dim.first, args.num_ranks,
+    args.launch_args.grid_dim->x, args.num_ranks,
     args.use_situ ? "true" : "false",
     to_string(args.situ_beta), to_string(args.situ_linear_beta),
     to_string(args.activation_clamp),
@@ -141,8 +142,8 @@ static void __instantiate_kernel() {{
     args.use_swap_ab ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.y,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
@@ -156,7 +157,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
             args.l2_weights_sf
-        ));
+        );
     }
 };
 
@@ -287,7 +288,7 @@ static void sm90_fp8_fp4_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_sms = runtime->get_num_sms();
     const SM90FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -317,13 +318,13 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
-        .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .launch_args = make_launch_options(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8FP4MegaMoERuntime::generate(args);
     const auto runtime_name = "sm90_fp8_fp4_mega_moe";
-    const auto runtime = compiler->build(runtime_name, code);
-    SM90FP8FP4MegaMoERuntime::launch(runtime, args);
+    const auto kernel = jit->compile(runtime_name, code);
+    SM90FP8FP4MegaMoERuntime::launch(kernel, args);
 }
 
 } // namespace deep_gemm
