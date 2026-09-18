@@ -222,31 +222,15 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
-def _swap_l1_halves_for_trtllm(t: torch.Tensor) -> torch.Tensor:
-    # TRT-LLM stores each 16-row L1 group as [8 up, 8 gate], i.e. row `r ^ 8`.
-    squeeze_group_dim = t.dim() == 2
-    if squeeze_group_dim:
-        t = t.unsqueeze(0)
-    g, n, *rest = t.shape
-    assert n % 16 == 0
-    # `empty_like` keeps the MN-major strides the kernel's SF layout check expects
-    result = torch.empty_like(t).copy_(t.reshape(g, n // 16, 2, 8, *rest).flip(2).reshape(g, n, *rest))
-    return result.squeeze(0) if squeeze_group_dim else result
-
-
-def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tensor,
-                                  weight_layout: str = 'megamoe'):
+def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tensor):
     """Prepare packed NVFP4 UE4M3 metadata without touching expert weights.
 
     Inputs use the same canonical [gate; up] order and packed MN-major scale
-    layout as `transform_weights_for_mega_moe`. Under `weight_layout="trtllm"`
-    the L1 scales follow TRT's `row ^ 8`, since the kernel leaves those weight
-    rows as stored; L2's tensor map restores row order, so L2 scales do not.
+    layout as `transform_weights_for_mega_moe`. TRT-LLM weights carry their own
+    scale tensors, which `weight_layout="trtllm"` reads in place.
     """
-    l1 = _interleave_weights_packed_fp4(l1_scales)
-    if weight_layout == 'trtllm':
-        l1 = _swap_l1_halves_for_trtllm(l1)
-    return (_transpose_sf_for_utccp(l1), _transpose_sf_for_utccp(l2_scales))
+    return (_transpose_sf_for_utccp(_interleave_weights_packed_fp4(l1_scales)),
+            _transpose_sf_for_utccp(l2_scales))
 
 
 def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):

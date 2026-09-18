@@ -8,6 +8,10 @@
 # slots, so the two layouts must agree BITWISE -- same values, same MMA lanes,
 # same accumulation order, only the load path differs.
 #
+# The weight SFs come from TRT's own storage too ([row block][k chunk][128
+# words]) rather than a MegaMoE-layout copy, which is what lets a caller alias
+# TRT's scale tensors instead of keeping a second set.
+#
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29532 \
 #       python3 sgl_deep_gemm/tests/test_mega_moe_nvfp4_trtllm.py --bench 60
@@ -46,6 +50,40 @@ def l2_to_trtllm(w: torch.Tensor) -> torch.Tensor:
     return w.view(e, n // 32, 8, 4, k).transpose(2, 3).reshape(e, n, k).contiguous()
 
 
+def swap_l1_sf_halves(sf: torch.Tensor) -> torch.Tensor:
+    """TRT's L1 scales follow its weight rows through `reorder_w1w3_to_w3w1`.
+
+    That is the same `row ^ 8` as the weights, which the UTCCP 4x32 transpose
+    has already turned into `p ^ 32` on these packed SF words.
+    """
+    e, mn, k = sf.shape
+    return torch.empty_like(sf).copy_(sf.reshape(e, mn // 64, 2, 32, k).flip(2).reshape(e, mn, k))
+
+
+def sf_to_trtllm(sf: torch.Tensor, is_l1: bool) -> torch.Tensor:
+    """MegaMoE SF words -> TRT-LLM's [row block][k chunk][128 words].
+
+    Derived from `make_trtllm_fp4_sf_tma_desc` rather than restated: for a box
+    coordinate `(i0, i1, i2)` the descriptor reads gmem word `i0 + 32*i1 + 4*i2`
+    (strides 128B/16B over 4B words) and writes SMEM slot `i0 + 4*i1 + 16*i2`
+    (box extents 4, 4, 8, innermost fastest). L1's box is the flat 128, so its
+    slot map is the identity and only the outer axes swap.
+    """
+    e, mn, k_words = sf.shape
+    src = sf.reshape(e, mn // 128, 128, k_words)
+    if is_l1:
+        gmem_of_slot = torch.arange(128, device=sf.device)
+    else:
+        s_idx = torch.arange(128, device=sf.device)
+        gmem_of_slot = (s_idx % 4) + 32 * ((s_idx // 4) % 4) + 4 * (s_idx // 16)
+    out = torch.empty((e, mn // 128, k_words, 128), dtype=sf.dtype, device=sf.device)
+    # SMEM slot `s` must receive MegaMoE's row `s`, so it lands at gmem `f(s)`.
+    out[:, :, :, gmem_of_slot] = src.permute(0, 1, 3, 2)
+    # The kernel reads this through a tensor map, so only the byte order matters;
+    # the (experts, mn, k words) shape is kept for the host's SF shape check.
+    return out.reshape(e, mn, k_words)
+
+
 # noinspection PyUnboundLocalVariable
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
@@ -79,11 +117,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         (l1_packed, l1_raw_sf), (l2_packed, l2_raw_sf), 'swiglu', 'nvfp4xnvfp4')
     # The TRT arm packs the same numbers, but stores L1 rows shuffled and asks
     # `transform_scales_for_mega_moe` for scales that follow that shuffle.
-    trt_l1_sf, trt_l2_sf = deep_gemm.transform_scales_for_mega_moe(
-        l1_raw_sf, l2_raw_sf, weight_layout='trtllm')
+    # Same numbers throughout, stored the way TRT stores them.
+    trt_l1, trt_l2 = l1_to_trtllm(mm_l1), l2_to_trtllm(mm_l2)
+    trt_l1_sf = sf_to_trtllm(swap_l1_sf_halves(mm_l1_sf), True)
+    trt_l2_sf = sf_to_trtllm(mm_l2_sf, False)
     arms = {
         'megamoe': ((mm_l1, mm_l1_sf), (mm_l2, mm_l2_sf)),
-        'trtllm': ((l1_to_trtllm(mm_l1), trt_l1_sf), (l2_to_trtllm(mm_l2), trt_l2_sf)),
+        'trtllm': ((trt_l1, trt_l1_sf), (trt_l2, trt_l2_sf)),
     }
 
     def run(weights, layout: str) -> torch.Tensor:
@@ -107,15 +147,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y_trt = run(arms['trtllm'], 'trtllm')
     assert y_mm.abs().sum() > 0, 'megamoe arm produced an all-zero output'
     assert torch.equal(y_trt, y_mm), (
-        'trtllm weight layout differs from megamoe layout: '
+        'trtllm layout differs from megamoe layout: '
         f'max |delta| {(y_trt.float() - y_mm.float()).abs().max().item():.3e}')
-    dist_print(' > trtllm weight layout == megamoe layout, bitwise', once_in_node=True)
+    dist_print(' > trtllm weights + scales == megamoe layout, bitwise', once_in_node=True)
 
-    # Control: feed the trtllm arm UNSHUFFLED L1 rows. A kernel that ignored the
-    # `row ^ 8` swap entirely would still match above; this must diverge.
+    # Two controls, one per descriptor family. A kernel that ignored either
+    # shuffle would still match above; each of these must diverge.
     assert not torch.equal(run(((mm_l1, trt_l1_sf), arms['trtllm'][1]), 'trtllm'), y_mm), \
-        'unshuffled L1 also matched -- the bitwise check has no teeth'
-    dist_print(' > row-swap control: unshuffled L1 diverges', once_in_node=True)
+        'unshuffled L1 weights also matched -- the weight check has no teeth'
+    dist_print(' > weight control: unshuffled L1 diverges', once_in_node=True)
+    assert not torch.equal(run(((trt_l1, mm_l1_sf), (trt_l2, mm_l2_sf)), 'trtllm'), y_mm), \
+        'megamoe-layout SFs read as TRT also matched -- the SF check has no teeth'
+    dist_print(' > sf control: megamoe-layout SFs read as TRT diverge', once_in_node=True)
 
     if args.bench:
         order = [(name, name, w) for name, w in arms.items()]

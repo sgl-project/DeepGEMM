@@ -34,6 +34,44 @@ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
     return result;
 }
 
+// TRT-LLM stores weight SFs as [row block][k chunk][128 words]. L1's 128-word UTCCP
+// group is identical, so only the outer axes swap; L2's also carries TRT's 32-row
+// shuffle, at `slot = a + 4*(b>>2) + 32*(b&3)`.
+static CUtensorMap make_trtllm_fp4_sf_tma_desc(
+    const torch::Tensor& sf, const bool& is_l1,
+    const int& num_row_blocks, const int& num_k_chunks,
+    const int& box_k_chunks, const int& box_row_blocks) {
+    DG_HOST_ASSERT(num_row_blocks > 0 and num_k_chunks > 0);
+    DG_HOST_ASSERT(box_k_chunks <= num_k_chunks and box_row_blocks <= num_row_blocks);
+    CUtensorMap result;
+    const auto row_block_stride = static_cast<cuuint64_t>(num_k_chunks) * 512ull;
+    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+    if (is_l1) {
+        const cuuint64_t dims[3] = {128, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[2] = {512ull, row_block_stride};
+        const cuuint32_t box[3] = {128, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 3, sf.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    } else {
+        const cuuint64_t dims[5] = {4, 4, 8, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[4] = {128ull, 16ull, 512ull, row_block_stride};
+        const cuuint32_t box[5] = {4, 4, 8, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    return result;
+}
+
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
@@ -61,7 +99,9 @@ static void sm100_fp8_fp4_mega_moe(
     const float* l2_act_scales,
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    // Bit 0: read L1's weight SFs from TRT-LLM storage, bit 1: L2's.
+    const int& trtllm_sf_mask = 0
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -78,6 +118,9 @@ static void sm100_fp8_fp4_mega_moe(
 
     if (use_trtllm_weights)
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
+    if (trtllm_sf_mask != 0)
+        DG_HOST_ASSERT(use_trtllm_weights and config.block_n % 128 == 0 and
+                       config.block_k % (config.gran_k * 4) == 0);
 
     // Make tensormap
     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
@@ -103,7 +146,10 @@ static void sm100_fp8_fp4_mega_moe(
                                                         block_k_inner, config.load_block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
                                                         config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+    const auto tensor_map_l1_weights_sf = (trtllm_sf_mask & 1) ? make_trtllm_fp4_sf_tma_desc(
+        l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
+        hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -134,7 +180,10 @@ static void sm100_fp8_fp4_mega_moe(
                                                         block_k_inner, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+    const auto tensor_map_l2_weights_sf = (trtllm_sf_mask & 2) ? make_trtllm_fp4_sf_tma_desc(
+        l2_weights_sf, false, num_experts_per_rank * hidden / 128,
+        intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -228,7 +277,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {}, {}, {}, {},
-        {}
+        {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -254,7 +303,8 @@ static void __instantiate_kernel() {{
     (l2_act_scales != nullptr) ? "true" : "false",
     use_fp8_combine ? "true" : "false",
     to_string(l1_weights.scalar_type()),
-    use_trtllm_weights ? "true" : "false"));
+    use_trtllm_weights ? "true" : "false",
+    trtllm_sf_mask));
     // Launch
     jit->launch(
         kernel, {

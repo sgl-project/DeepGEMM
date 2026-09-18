@@ -49,6 +49,9 @@ template <
     bool kUseFp8Combine,
     typename weight_dtype_t,
     bool kUseTrtllmWeights = false,
+    // Bit 0: L1 weight SFs come from TRT-LLM storage, bit 1: L2's. The SMEM tile
+    // then arrives as [row block][k chunk][128 words] instead of [k chunk][row].
+    uint32_t kTrtllmSfMask = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -183,6 +186,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kGranK = get_sf_gran_k(kMmaKind);
     constexpr uint32_t kSFChunkK = kGranK * 4;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
+    constexpr uint32_t kNumSFChunksPerBlock = BLOCK_K / kSFChunkK;
+    constexpr bool kTrtllmSfL1 = (kTrtllmSfMask & 1u) != 0;
+    constexpr bool kTrtllmSfL2 = (kTrtllmSfMask & 2u) != 0;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
 
@@ -914,9 +920,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     __syncwarp();
                     if (cute::elect_one_sync()) {
-                        tma::copy<BLOCK_N, 1, 0>(
-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx],
-                            shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                        if ((kTrtllmSfL1 and is_l1) or (kTrtllmSfL2 and not is_l1)) {
+                            auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                            const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                            const uint32_t sf_row_block = n_idx / 128;
+                            const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
+                            if (is_l1)
+                                cute::SM100_TMA_2SM_LOAD_3D::copy(
+                                    tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                    0, sf_k_chunk, sf_row_block);
+                            else
+                                cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                    tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                    0, 0, 0, sf_k_chunk, sf_row_block);
+                        } else
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                         if (is_leader_cta)
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                                 (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
@@ -1022,6 +1043,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t a_desc_base_lo = a_desc_lo + stage_idx * sizeof(SharedStorage::smem_a[0]) / 16;
                     const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
                     if (cute::elect_one_sync()) {
+                        const bool sfb_row_block_major = kUseTrtllmWeights and
+                            (task_info.block_phase == sched::BlockPhase::Linear1 ? kTrtllmSfL1 : kTrtllmSfL2);
                         #pragma unroll
                         for (uint32_t sf_chunk_idx = 0; sf_chunk_idx < BLOCK_K / kSFChunkK; ++ sf_chunk_idx) {
                             // UTCCP copy SFA and SFB to TMEM
@@ -1034,7 +1057,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] + sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
+                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
+                                    (sfb_row_block_major
+                                        ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
+                                        : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                                 cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                             }
