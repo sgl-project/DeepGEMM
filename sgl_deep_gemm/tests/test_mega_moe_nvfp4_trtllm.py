@@ -115,9 +115,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     (mm_l1, mm_l1_sf), (mm_l2, mm_l2_sf) = deep_gemm.transform_weights_for_mega_moe(
         (l1_packed, l1_raw_sf), (l2_packed, l2_raw_sf), 'swiglu', 'nvfp4xnvfp4')
-    # The TRT arm packs the same numbers, but stores L1 rows shuffled and asks
-    # `transform_scales_for_mega_moe` for scales that follow that shuffle.
-    # Same numbers throughout, stored the way TRT stores them.
+    # Store the same weights and scales in TRT order, including L1's row swap.
     trt_l1, trt_l2 = l1_to_trtllm(mm_l1), l2_to_trtllm(mm_l2)
     trt_l1_sf = sf_to_trtllm(swap_l1_sf_halves(mm_l1_sf), True)
     trt_l2_sf = sf_to_trtllm(mm_l2_sf, False)
@@ -143,6 +141,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f'{num_topk}/{num_global_experts} experts, {num_experts} local, '
                f'pool {num_pool_rows} rows', once_in_node=True)
 
+    # Dense tensor maps must reject scale views whose strides they cannot honor.
+    for layer, sf in enumerate((trt_l1_sf, trt_l2_sf)):
+        strided_sf = sf[..., :1].contiguous().expand_as(sf)
+        assert not strided_sf.is_contiguous()
+        weights = list(arms['trtllm'])
+        weights[layer] = (weights[layer][0], strided_sf)
+        try:
+            run(weights, 'trtllm')
+        except RuntimeError as error:
+            assert 'is_contiguous' in str(error), str(error)
+        else:
+            raise AssertionError(f'L{layer + 1} accepted non-contiguous TRT scales')
+
     y_mm = run(arms['megamoe'], 'megamoe')
     y_trt = run(arms['trtllm'], 'trtllm')
     assert y_mm.abs().sum() > 0, 'megamoe arm produced an all-zero output'
@@ -156,9 +167,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert not torch.equal(run(((mm_l1, trt_l1_sf), arms['trtllm'][1]), 'trtllm'), y_mm), \
         'unshuffled L1 weights also matched -- the weight check has no teeth'
     dist_print(' > weight control: unshuffled L1 diverges', once_in_node=True)
-    assert not torch.equal(run(((trt_l1, mm_l1_sf), (trt_l2, mm_l2_sf)), 'trtllm'), y_mm), \
-        'megamoe-layout SFs read as TRT also matched -- the SF check has no teeth'
-    dist_print(' > sf control: megamoe-layout SFs read as TRT diverge', once_in_node=True)
+    assert not torch.equal(run(((trt_l1, mm_l1_sf.contiguous()), (trt_l2, mm_l2_sf.contiguous())), 'trtllm'), y_mm), \
+        'incorrect SF packing also matched -- the SF check has no teeth'
+    dist_print(' > sf control: incorrect SF packing read as TRT diverges', once_in_node=True)
 
     if args.bench:
         order = [(name, name, w) for name, w in arms.items()]

@@ -99,9 +99,7 @@ static void sm100_fp8_fp4_mega_moe(
     const float* l2_act_scales,
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
-    const bool& use_trtllm_weights = false,
-    // Bit 0: read L1's weight SFs from TRT-LLM storage, bit 1: L2's.
-    const int& trtllm_sf_mask = 0
+    const bool& use_trtllm_weights = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -116,11 +114,10 @@ static void sm100_fp8_fp4_mega_moe(
         num_ring_tokens, num_sf_ring_tokens,
         mma_kind);
 
-    if (use_trtllm_weights)
+    if (use_trtllm_weights) {
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
-    if (trtllm_sf_mask != 0)
-        DG_HOST_ASSERT(use_trtllm_weights and config.block_n % 128 == 0 and
-                       config.block_k % (config.gran_k * 4) == 0);
+        DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
+    }
 
     // Make tensormap
     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
@@ -146,7 +143,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         block_k_inner, config.load_block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
                                                         config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l1_weights_sf = (trtllm_sf_mask & 1) ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
@@ -180,7 +177,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         block_k_inner, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l2_weights_sf = (trtllm_sf_mask & 2) ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
@@ -277,7 +274,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {}, {}, {}, {},
-        {}, {}
+        {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -303,8 +300,7 @@ static void __instantiate_kernel() {{
     (l2_act_scales != nullptr) ? "true" : "false",
     use_fp8_combine ? "true" : "false",
     to_string(l1_weights.scalar_type()),
-    use_trtllm_weights ? "true" : "false",
-    trtllm_sf_mask));
+    use_trtllm_weights ? "true" : "false"));
     // Launch
     jit->launch(
         kernel, {

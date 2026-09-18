@@ -256,12 +256,13 @@ static void fp8_fp4_mega_moe(
     // TRT-LLM weights carry their own SFs, and the kernel leaves L1's rows as
     // stored, so the SFs must come from TRT storage too -- there is no valid
     // mixed state. Those SFs are neither MN-major nor TMA-strided; the tensor
-    // map carries the axes instead, so the stride checks do not apply.
-    const int trtllm_sf_mask = use_trtllm_weights ? 3 : 0;
+    // map carries the axes instead and requires dense TRT storage.
+    if (use_trtllm_weights)
+        DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, (trtllm_sf_mask & 1) == 0, false, torch::kInt);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, (trtllm_sf_mask & 2) == 0, false, torch::kInt);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
@@ -372,7 +373,7 @@ static void fp8_fp4_mega_moe(
                                l2_act_scales.has_value()
                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
                                mma_kind,
-                               use_fp8_combine, use_trtllm_weights, trtllm_sf_mask);
+                               use_fp8_combine, use_trtllm_weights);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
