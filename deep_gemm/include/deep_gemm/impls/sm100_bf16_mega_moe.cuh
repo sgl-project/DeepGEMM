@@ -33,6 +33,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -73,6 +74,11 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or kNumSharedExperts == 0,
+                     "TRTLLM weight layout does not support shared experts");
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+                     (kHidden % 64 == 0 and kIntermediateHidden % 64 == 0 and BLOCK_K % 64 == 0),
+                     "TRTLLM BF16 weights require complete 128-byte K blocks");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -146,6 +152,8 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or (LOAD_BLOCK_N % 32 == 0 and LOAD_BLOCK_N / 32 <= 32),
+                     "TRTLLM L1 loads one 32-row permutation block per lane");
 
     // Swizzle configs
     constexpr uint32_t kSwizzleAMode = 128;
@@ -729,7 +737,38 @@ sm100_bf16_mega_moe_impl(void* y,
                 uint32_t k_idx = k_block_idx * BLOCK_K;
 
                 // TMA copy weights
-                if (cute::elect_one_sync()) {
+                if constexpr (kUseTrtllmWeights) {
+                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                    #pragma unroll
+                    for (uint32_t atom = 0; atom < BLOCK_K / 64; ++ atom) {
+                        auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 64;
+                        const uint32_t physical_row =
+                            (task_info.local_expert_idx * (shape_k / 64) + k_idx / 64 + atom) * shape_n +
+                            n_block_idx * BLOCK_N;
+                        auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                        const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        if (is_l1) {
+                            // One 32-row permutation block per lane
+                            if (lane_idx < LOAD_BLOCK_N / 32) {
+                                const uint32_t row = lane_idx * 32;
+                                cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                    tensor_map_b_ptr, full, cache_hint, tile + row * 64,
+                                    0, 0, 0, 0, (physical_row + row) / 4);
+                            }
+                        } else if (cute::elect_one_sync()) {
+                            cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                tensor_map_b_ptr, full, cache_hint, tile,
+                                0, 0, 0, physical_row / 32);
+                        }
+                    }
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
+                } else if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
                     if (is_leader_cta) {
@@ -964,10 +1003,13 @@ sm100_bf16_mega_moe_impl(void* y,
                         // Apply SwiGLU: silu(gate) * up
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
                         auto fp32_values = reinterpret_cast<float*>(values);
+                        // TRT keeps `row ^ 8`, so up precedes gate
+                        constexpr uint32_t kGateOff = kUseTrtllmWeights ? 2u : 0u;
+                        constexpr uint32_t kUpOff = 2u - kGateOff;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
-                            auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+                            auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kGateOff], fp32_values[k * 4 + kGateOff + 1]));
+                            auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kUpOff], fp32_values[k * 4 + kUpOff + 1]));
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {

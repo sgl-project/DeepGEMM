@@ -13,6 +13,27 @@
 
 namespace deep_gemm {
 
+// Stored row `32*i3 + 8*i1 + i2` lands at slot `32*i3 + 4*i2 + i1`: TRT's
+// 8x4 -> 4x8 L2 transpose, inverted by the axis order alone.
+static CUtensorMap make_trtllm_fp4_l2_tma_desc(
+    const torch::Tensor& weights, const int inner_bytes, const int rows) {
+    DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
+    DG_HOST_ASSERT(inner_bytes % 128 == 0);
+    CUtensorMap result;
+    const cuuint64_t dims[4] = {static_cast<cuuint64_t>(inner_bytes), 4, 8,
+                                static_cast<cuuint64_t>(rows / 32)};
+    const cuuint64_t strides[3] = {8ull * inner_bytes,
+                                   static_cast<cuuint64_t>(inner_bytes), 32ull * inner_bytes};
+    const cuuint32_t box[4] = {128, 4, 8, 4};
+    const cuuint32_t element_strides[4] = {1, 1, 1, 1};
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.data_ptr(), dims,
+        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return result;
+}
+
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
@@ -39,7 +60,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float* l2_alphas,
     const float* l2_act_scales,
     const MmaKind& mma_kind,
-    const bool& use_fp8_combine
+    const bool& use_fp8_combine,
+    const bool& use_trtllm_weights = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -53,6 +75,9 @@ static void sm100_fp8_fp4_mega_moe(
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         mma_kind);
+
+    if (use_trtllm_weights)
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
 
     // Make tensormap
     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
@@ -102,7 +127,9 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim);
-    const auto tensor_map_l2_weights = make_tma_2d_desc(weight_tensor(l2_weights),
+    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+        l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
+        make_tma_2d_desc(weight_tensor(l2_weights),
                                                         weight_inner(intermediate_hidden), num_experts_per_rank * hidden,
                                                         block_k_inner, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
@@ -200,7 +227,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {},
+        {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -225,7 +253,8 @@ static void __instantiate_kernel() {{
     (l2_alphas != nullptr) ? "true" : "false",
     (l2_act_scales != nullptr) ? "true" : "false",
     use_fp8_combine ? "true" : "false",
-    to_string(l1_weights.scalar_type())));
+    to_string(l1_weights.scalar_type()),
+    use_trtllm_weights ? "true" : "false"));
     // Launch
     jit->launch(
         kernel, {
