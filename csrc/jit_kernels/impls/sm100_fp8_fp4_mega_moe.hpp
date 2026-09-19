@@ -13,8 +13,7 @@
 
 namespace deep_gemm {
 
-// Stored row `32*i3 + 8*i1 + i2` lands at slot `32*i3 + 4*i2 + i1`: TRT's
-// 8x4 -> 4x8 L2 transpose, inverted by the axis order alone.
+// Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
 static CUtensorMap make_trtllm_fp4_l2_tma_desc(
     const torch::Tensor& weights, const int inner_bytes, const int rows) {
     DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
@@ -34,9 +33,7 @@ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
     return result;
 }
 
-// TRT-LLM stores weight SFs as [row block][k chunk][128 words]. L1's 128-word UTCCP
-// group is identical, so only the outer axes swap; L2's also carries TRT's 32-row
-// shuffle, at `slot = a + 4*(b>>2) + 32*(b&3)`.
+// TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
 static CUtensorMap make_trtllm_fp4_sf_tma_desc(
     const torch::Tensor& sf, const bool& is_l1,
     const int& num_row_blocks, const int& num_k_chunks,

@@ -893,8 +893,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if constexpr (kUseTrtllmWeights) {
-                    // L1's `row ^ 8` is left in place for the epilogue; L2's
-                    // transpose is undone by the descriptor's axis order.
+                    // L1's row swap is handled in the epilogue; L2's shuffle in the descriptor.
                     if (task_info.block_phase == sched::BlockPhase::Linear1) {
                         if (cute::elect_one_sync()) {
                             tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(

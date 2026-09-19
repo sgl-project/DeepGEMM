@@ -223,11 +223,9 @@ def transform_weights_for_mega_moe(
 
 
 def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tensor):
-    """Prepare packed NVFP4 UE4M3 metadata without touching expert weights.
+    """Convert canonical [gate; up], packed MN-major NVFP4 scales to MegaMoE layout.
 
-    Inputs use the same canonical [gate; up] order and packed MN-major scale
-    layout as `transform_weights_for_mega_moe`. TRT-LLM weights carry their own
-    scale tensors, which `weight_layout="trtllm"` reads in place.
+    TRT mode uses TRT-packed scales directly.
     """
     return (_transpose_sf_for_utccp(_interleave_weights_packed_fp4(l1_scales)),
             _transpose_sf_for_utccp(l2_scales))

@@ -74,7 +74,7 @@ static void sm100_bf16_mega_moe(
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    // BlockMajorK is physically [expert, K/64, row, 64], whatever the tensor's alias.
+    // BlockMajorK storage: [expert, K/64, row, 64].
     const auto tensor_map_l1_weights = use_trtllm_weights ? make_trtllm_bf16_weight_tma_desc(
         l1_weights, num_experts_per_rank * (hidden / 64) * intermediate_hidden * 2, true) :
         make_tma_2d_desc(l1_weights,

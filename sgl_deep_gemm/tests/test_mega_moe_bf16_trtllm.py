@@ -1,15 +1,4 @@
-# BF16 mega-MoE with TRT-LLM's weight storage: bitwise check and per-layout bench.
-#
-# MegaMoE aliases TRT-LLM's final weight buffers, so sglang passes
-# `weight_layout="trtllm"` for the BF16 experts too. TRT's L1 shuffle permutes
-# the 4-row group index inside every 32-row block AND swaps the gate/up halves;
-# TRT's L2 shuffle transposes each 32-row group 8x4 -> 4x8. Both are undone by
-# the load's tensor map (the gate/up half by the SwiGLU epilogue), so the two
-# layouts must agree BITWISE -- same values, same MMA lanes, same accumulation
-# order, only the load path differs.
-#
-# One rank, `num_experts` local experts of `--num-global-experts`, so the pool
-# matches what an EP rank sees for a T-token chunk.
+# Check BF16 TRT-layout bitwise equality and benchmark both layouts.
 #
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29531 \
@@ -36,13 +25,7 @@ L1_ROW_MAP = [((r & 1) << 4) | ((1 - ((r >> 3) & 1)) << 3) | (((r >> 4) & 1) << 
 
 
 def l1_to_trtllm(w: torch.Tensor, row_map=None) -> torch.Tensor:
-    """Scatter canonical L1 rows into the slots TRT-LLM stores them in.
-
-    Within each 32-row block, canonical row `r` is stored at row `s` with
-    `s4 = r0`, `s3 = ~r3`, `s2 = r4`, `s[1:0] = r[2:1]` -- a reversal of the
-    4-row group index plus the `row ^ 8` gate/up swap. This is the inverse of
-    the gather the kernel's load path performs.
-    """
+    """Scatter L1 rows: s4=r0, s3=~r3, s2=r4, s[1:0]=r[2:1]."""
     row_map = L1_ROW_MAP if row_map is None else row_map
     assert sorted(row_map) == list(range(32)), 'row map is not a permutation'
     e, n, k = w.shape
@@ -59,7 +42,6 @@ def l2_to_trtllm(w: torch.Tensor) -> torch.Tensor:
     return bmk.transpose(3, 4).reshape(e, n, k).contiguous()
 
 
-# noinspection PyUnboundLocalVariable
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     assert num_ranks == 1, 'one rank stands in for one EP rank of a larger MoE'
@@ -72,8 +54,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     scores = torch.randn((num_tokens, num_global_experts), dtype=torch.float, device='cuda')
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-    # Keep this rank's expert slice, mask the rest: the pool is then the ~2T rows
-    # an EP rank of `num_global_experts` sees for a T-token chunk.
+    # Simulate one rank's expert slice.
     topk_idx = torch.where(topk_idx < num_experts, topk_idx, torch.full_like(topk_idx, -1))
     topk_weights = topk_weights.masked_fill(topk_idx < 0, 0)
     num_pool_rows = int((topk_idx >= 0).sum())
@@ -111,9 +92,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f'max |delta| {(y_trt.float() - y_mm.float()).abs().max().item():.3e}')
     dist_print(' > trtllm weight layout == megamoe layout, bitwise', once_in_node=True)
 
-    # Control: the row map has teeth. Undo just the gate/up half of the L1
-    # permutation (`s3` uninverted) and the output must move -- otherwise a
-    # kernel that ignored the shuffle entirely would pass the check above.
+    # A missing gate/up swap must change the output.
     bad_map = [s ^ 8 for s in L1_ROW_MAP]
     bad_l1 = l1_to_trtllm(mm_l1, bad_map)
     assert not torch.equal(run((bad_l1, arms['trtllm'][1]), 'trtllm'), y_mm), \
@@ -123,8 +102,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.bench:
         order = [(name, name, w) for name, w in arms.items()]
         if args.aa:
-            # A/A control: a second canonical clone, allocated after the first,
-            # carries whatever placement cost the second arm of any A/B pays.
+            # A/A control for allocation-placement effects.
             order.append(('megamoe#2', 'megamoe',
                           (arms['megamoe'][0].clone(), arms['megamoe'][1].clone())))
         for label, name, weights in order:

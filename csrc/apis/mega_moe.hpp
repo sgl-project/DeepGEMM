@@ -253,10 +253,7 @@ static void fp8_fp4_mega_moe(
     // Check weight SF layout for byte-packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1;
     const int kGranK = rk;
-    // TRT-LLM weights carry their own SFs, and the kernel leaves L1's rows as
-    // stored, so the SFs must come from TRT storage too -- there is no valid
-    // mixed state. Those SFs are neither MN-major nor TMA-strided; the tensor
-    // map carries the axes instead and requires dense TRT storage.
+    // TRT weights require matching dense TRT scales; descriptors encode their layout.
     if (use_trtllm_weights)
         DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,

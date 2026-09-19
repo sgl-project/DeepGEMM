@@ -1,16 +1,4 @@
-# NVFP4 mega-MoE with TRT-LLM's weight storage: bitwise check and per-layout bench.
-#
-# MegaMoE aliases TRT-LLM's final weight buffers, so sglang can hand the kernel
-# TRT-packed experts with `weight_layout="trtllm"` instead of repacking them.
-# TRT's L1 shuffle swaps the two 8-row halves of every 16-row group (`row ^ 8`);
-# TRT's L2 shuffle transposes each 32-row group 8x4 -> 4x8. L2 is undone by the
-# load's tensor map and L1 by the SwiGLU epilogue reading the swapped register
-# slots, so the two layouts must agree BITWISE -- same values, same MMA lanes,
-# same accumulation order, only the load path differs.
-#
-# The weight SFs come from TRT's own storage too ([row block][k chunk][128
-# words]) rather than a MegaMoE-layout copy, which is what lets a caller alias
-# TRT's scale tensors instead of keeping a second set.
+# Check NVFP4 TRT-layout bitwise equality and benchmark both layouts.
 #
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29532 \
@@ -51,23 +39,15 @@ def l2_to_trtllm(w: torch.Tensor) -> torch.Tensor:
 
 
 def swap_l1_sf_halves(sf: torch.Tensor) -> torch.Tensor:
-    """TRT's L1 scales follow its weight rows through `reorder_w1w3_to_w3w1`.
-
-    That is the same `row ^ 8` as the weights, which the UTCCP 4x32 transpose
-    has already turned into `p ^ 32` on these packed SF words.
-    """
+    """After UTCCP packing, the L1 row swap `row ^ 8` becomes `slot ^ 32`."""
     e, mn, k = sf.shape
     return torch.empty_like(sf).copy_(sf.reshape(e, mn // 64, 2, 32, k).flip(2).reshape(e, mn, k))
 
 
 def sf_to_trtllm(sf: torch.Tensor, is_l1: bool) -> torch.Tensor:
-    """MegaMoE SF words -> TRT-LLM's [row block][k chunk][128 words].
+    """Pack SFs as [row block][k chunk][128 words].
 
-    Derived from `make_trtllm_fp4_sf_tma_desc` rather than restated: for a box
-    coordinate `(i0, i1, i2)` the descriptor reads gmem word `i0 + 32*i1 + 4*i2`
-    (strides 128B/16B over 4B words) and writes SMEM slot `i0 + 4*i1 + 16*i2`
-    (box extents 4, 4, 8, innermost fastest). L1's box is the flat 128, so its
-    slot map is the identity and only the outer axes swap.
+    L2 maps SMEM slot i0 + 4*i1 + 16*i2 to GMEM word i0 + 32*i1 + 4*i2.
     """
     e, mn, k_words = sf.shape
     src = sf.reshape(e, mn // 128, 128, k_words)
@@ -77,14 +57,11 @@ def sf_to_trtllm(sf: torch.Tensor, is_l1: bool) -> torch.Tensor:
         s_idx = torch.arange(128, device=sf.device)
         gmem_of_slot = (s_idx % 4) + 32 * ((s_idx // 4) % 4) + 4 * (s_idx // 16)
     out = torch.empty((e, mn // 128, k_words, 128), dtype=sf.dtype, device=sf.device)
-    # SMEM slot `s` must receive MegaMoE's row `s`, so it lands at gmem `f(s)`.
     out[:, :, :, gmem_of_slot] = src.permute(0, 1, 3, 2)
-    # The kernel reads this through a tensor map, so only the byte order matters;
-    # the (experts, mn, k words) shape is kept for the host's SF shape check.
+    # Preserve the logical shape expected by host validation.
     return out.reshape(e, mn, k_words)
 
 
-# noinspection PyUnboundLocalVariable
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     assert num_ranks == 1, 'one rank stands in for one EP rank of a larger MoE'
@@ -98,8 +75,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     x_packed, x_sf = per_token_cast_to_nvfp4(x, gran_k=GRAN_K, use_packed_ue4m3=True)
     scores = torch.randn((num_tokens, num_global_experts), dtype=torch.float, device='cuda')
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-    # Keep this rank's expert slice, mask the rest: the pool is then the ~2T rows
-    # an EP rank of `num_global_experts` sees for a T-token chunk.
+    # Simulate one rank's expert slice.
     topk_idx = torch.where(topk_idx < num_experts, topk_idx, torch.full_like(topk_idx, -1)).long()
     topk_weights = topk_weights.masked_fill(topk_idx < 0, 0)
     num_pool_rows = int((topk_idx >= 0).sum())
@@ -115,7 +91,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     (mm_l1, mm_l1_sf), (mm_l2, mm_l2_sf) = deep_gemm.transform_weights_for_mega_moe(
         (l1_packed, l1_raw_sf), (l2_packed, l2_raw_sf), 'swiglu', 'nvfp4xnvfp4')
-    # Store the same weights and scales in TRT order, including L1's row swap.
     trt_l1, trt_l2 = l1_to_trtllm(mm_l1), l2_to_trtllm(mm_l2)
     trt_l1_sf = sf_to_trtllm(swap_l1_sf_halves(mm_l1_sf), True)
     trt_l2_sf = sf_to_trtllm(mm_l2_sf, False)
@@ -141,7 +116,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f'{num_topk}/{num_global_experts} experts, {num_experts} local, '
                f'pool {num_pool_rows} rows', once_in_node=True)
 
-    # Dense tensor maps must reject scale views whose strides they cannot honor.
+    # Reject scale views incompatible with the dense tensor maps.
     for layer, sf in enumerate((trt_l1_sf, trt_l2_sf)):
         strided_sf = sf[..., :1].contiguous().expand_as(sf)
         assert not strided_sf.is_contiguous()
@@ -162,8 +137,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f'max |delta| {(y_trt.float() - y_mm.float()).abs().max().item():.3e}')
     dist_print(' > trtllm weights + scales == megamoe layout, bitwise', once_in_node=True)
 
-    # Two controls, one per descriptor family. A kernel that ignored either
-    # shuffle would still match above; each of these must diverge.
+    # Incorrect weights or scale packing must change the output.
     assert not torch.equal(run(((mm_l1, trt_l1_sf), arms['trtllm'][1]), 'trtllm'), y_mm), \
         'unshuffled L1 weights also matched -- the weight check has no teeth'
     dist_print(' > weight control: unshuffled L1 diverges', once_in_node=True)
@@ -174,8 +148,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.bench:
         order = [(name, name, w) for name, w in arms.items()]
         if args.aa:
-            # A/A control: a second canonical clone, allocated after the first,
-            # carries whatever placement cost the second arm of any A/B pays.
+            # A/A control for allocation-placement effects.
             order.append(('megamoe#2', 'megamoe',
                           ((mm_l1.clone(), mm_l1_sf.clone()), (mm_l2.clone(), mm_l2_sf.clone()))))
         for label, name, weights in order:
