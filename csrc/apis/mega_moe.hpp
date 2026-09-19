@@ -200,7 +200,8 @@ static void fp8_fp4_mega_moe(
     const bool& use_x_scales,
     const std::optional<torch::Tensor>& l1_alphas,
     const std::optional<torch::Tensor>& l2_alphas,
-    const std::optional<torch::Tensor>& l2_act_scales
+    const std::optional<torch::Tensor>& l2_act_scales,
+    const bool& use_trtllm_weights = false
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -219,6 +220,7 @@ static void fp8_fp4_mega_moe(
                             mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
+    DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
                    (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
@@ -251,10 +253,13 @@ static void fp8_fp4_mega_moe(
     // Check weight SF layout for byte-packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1;
     const int kGranK = rk;
+    // TRT weights require matching dense TRT scales; descriptors encode their layout.
+    if (use_trtllm_weights)
+        DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
+                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
@@ -365,7 +370,7 @@ static void fp8_fp4_mega_moe(
                                l2_act_scales.has_value()
                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
                                mma_kind,
-                               use_fp8_combine);
+                               use_fp8_combine, use_trtllm_weights);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -389,7 +394,8 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_trtllm_weights = false
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -473,7 +479,7 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, fast_math, use_trtllm_weights);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

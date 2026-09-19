@@ -382,6 +382,7 @@ from . import mega
 from .mega import (
     SymmBuffer,
     transform_weights_for_mega_moe,
+    transform_scales_for_mega_moe,
     fp8_fp4_mega_moe,
     nvfp4_mega_moe,
     bf16_mega_moe,

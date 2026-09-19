@@ -222,6 +222,21 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tensor):
+    """Convert canonical [gate; up], packed MN-major NVFP4 scales to MegaMoE layout.
+
+    TRT mode uses TRT-packed scales directly.
+    """
+    return (_transpose_sf_for_utccp(_interleave_weights_packed_fp4(l1_scales)),
+            _transpose_sf_for_utccp(l2_scales))
+
+
+def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):
+    if weight_layout not in ('megamoe', 'trtllm'):
+        raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
+    if weight_layout == 'trtllm' and (shared_l1_weights is not None or shared_l2_weights is not None):
+        raise ValueError('TRT-LLM weight layout does not support shared experts')
+
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -237,7 +252,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      use_x_scales: bool = False,
                      l1_alphas: Optional[torch.Tensor] = None,
                      l2_alphas: Optional[torch.Tensor] = None,
-                     l2_act_scales: Optional[torch.Tensor] = None):
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     weight_layout: str = 'megamoe'):
+    _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+    if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
+        raise ValueError('TRT-LLM packed weights require NVFP4 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
             '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
@@ -261,7 +280,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales
+        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
+        weight_layout == 'trtllm'
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -277,7 +297,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    use_x_scales: bool = False,
                    l1_alphas: Optional[torch.Tensor] = None,
                    l2_alphas: Optional[torch.Tensor] = None,
-                   l2_act_scales: Optional[torch.Tensor] = None):
+                   l2_act_scales: Optional[torch.Tensor] = None,
+                   weight_layout: str = 'megamoe'):
     fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights,
@@ -285,7 +306,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
         recipe=(1, 1, 16),
         activation=activation, activation_clamp=activation_clamp,
         fast_math=fast_math, use_x_scales=use_x_scales,
-        l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales
+        l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales,
+        weight_layout=weight_layout
     )
 
 
@@ -298,7 +320,9 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  weight_layout: str = 'megamoe'):
+    _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -313,7 +337,8 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        weight_layout == 'trtllm'
     )
 
 

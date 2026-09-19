@@ -48,6 +48,7 @@ template <
     // controls the dispatch a2a and the mainloops.
     bool kUseFp8Combine,
     typename weight_dtype_t,
+    bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -100,6 +101,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+                     (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
+                     "TRT weight layout requires routed NVFP4 experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -179,6 +183,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kGranK = get_sf_gran_k(kMmaKind);
     constexpr uint32_t kSFChunkK = kGranK * 4;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
+    constexpr uint32_t kNumSFChunksPerBlock = BLOCK_K / kSFChunkK;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
 
@@ -887,7 +892,48 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / kSFChunkK) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / kSFChunkK);
 
                 // TMA copy weights with SF
-                if (cute::elect_one_sync()) {
+                if constexpr (kUseTrtllmWeights) {
+                    // L1's row swap is handled in the epilogue; L2's shuffle in the descriptor.
+                    if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                        if (cute::elect_one_sync()) {
+                            tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
+                            auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
+                            auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                            const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                            if (cute::elect_one_sync()) {
+                                cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                    tensor_map_b_ptr, full, cache_hint, tile,
+                                    k_idx + atom * 128, 0, 0, n_idx / 32);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                        auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                        const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        const uint32_t sf_row_block = n_idx / 128;
+                        const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
+                        if (is_l1)
+                            cute::SM100_TMA_2SM_LOAD_3D::copy(
+                                tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                0, sf_k_chunk, sf_row_block);
+                        else
+                            cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                0, 0, 0, sf_k_chunk, sf_row_block);
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
+                } else if (cute::elect_one_sync()) {
                     if (task_info.is_shared()) {
                         tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, shared_b_dtype_t>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), k_idx, n_idx, 2);
@@ -998,7 +1044,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] + sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
+                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
+                                    (kUseTrtllmWeights
+                                        ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
+                                        : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                                 cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                             }
@@ -1223,14 +1272,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         constexpr float kSituBeta = 4.0f;
                         constexpr float kSituLinearBeta = 25.0f;
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
+                        // TRT keeps `row ^ 8`, so up precedes gate
+                        constexpr uint32_t kGateSlot = kUseTrtllmWeights ? 1u : 0u;
+                        constexpr uint32_t kUpSlot = 1u - kGateSlot;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             if constexpr (kUseXScales or kWithL1Alphas) {
-                                fp32_values[k * 2 + 0] = __fmul2_rn(fp32_values[k * 2 + 0], gate_scales);
-                                fp32_values[k * 2 + 1] = __fmul2_rn(fp32_values[k * 2 + 1], up_scales);
+                                fp32_values[k * 2 + kGateSlot] = __fmul2_rn(fp32_values[k * 2 + kGateSlot], gate_scales);
+                                fp32_values[k * 2 + kUpSlot] = __fmul2_rn(fp32_values[k * 2 + kUpSlot], up_scales);
                             }
-                            auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
-                            auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
+                            auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + kGateSlot]);
+                            auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + kUpSlot]);
 
                             // Clamp (SwiGLU-with-limit only; SiTU soft-clips below)
                             if constexpr (not kUseSitu and kActivationClamp != cute::numeric_limits<float>::infinity()) {
