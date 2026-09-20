@@ -338,6 +338,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     compute_kstep(cur);
                 }
 
+                // Complete all math readers before the producer can reuse the stage.
+                // Barrier 0 is used by the shared-memory output epilogue below.
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
                 if (lane_idx == 0)
                     empty_barriers[stage]->arrive();
             }
