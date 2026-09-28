@@ -23,22 +23,7 @@
 
 namespace deep_gemm {
 
-// SM90 FP8 x FP4 GEMM, RS-mode variant.
-//
-// S2 stage: this kernel is a verbatim copy of `sm90_fp8_fp4_gemm_1d2d_impl`,
-// renamed to `sm90_fp8_fp4_gemm_1d2d_rs_impl` so it gets its own JIT artifact.
-// Functionally identical to the SS variant; later steps will replace the
-// inner WGMMA loop with RS-mode (register A) WGMMA + register-resident FP4
-// dequant (using `FP8MMASelectorRS`, ldmatrix, prmt+lop3) without touching
-// the SS variant or the contiguous code path.
-
-// =============================================================================
-// S3 prep (M1): RS-mode utility helpers.
-// These helpers are intentionally not yet called by `sm90_fp8_fp4_gemm_1d2d_rs_impl`;
-// they are introduced as a self-contained, side-effect-free building block so
-// the second-round kernel rewrite can plug them in without further header
-// surgery. Numerical equivalence with the SS variant is preserved this round.
-// =============================================================================
+// SM90 FP8 x FP4 GEMM with register-sourced A operands.
 namespace fp4_rs_detail {
 
 template <bool kBF16FinalAccum>
@@ -455,12 +440,6 @@ struct SM90_U32x4_LDSM_T {
     }
 };
 
-template <uint32_t COL_BYTES, uint32_t NV>
-CUTLASS_DEVICE uint32_t permute_col(const uint32_t row, const uint32_t col) {
-    constexpr uint32_t strd = 128 / (COL_BYTES < 128u ? COL_BYTES : 128u);
-    return ((col / NV) ^ (row % 8 / strd)) * NV;
-}
-
 template <typename dtype_t>
 struct SM90_U32x2_STSM_T {
     CUTLASS_DEVICE static void
@@ -471,49 +450,6 @@ struct SM90_U32x2_STSM_T {
                      :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
     }
 };
-
-// Decode a single FP4 (E2M1) code (low 4 bits) to its E4M3 byte
-// representation. Same byte-LUT formulation as the scalar path inside the SS
-// kernel, hoisted to namespace scope so it can also be called from
-// register-level dequant routines.
-//   mag {0..7} -> {0x00, 0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c}
-//   sign bit copied from FP4 bit 3 to E4M3 bit 7 (FP4 -0 maps to E4M3 -0;
-//   WGMMA treats -0 as 0, so this is numerically safe and saves a branch).
-CUTLASS_DEVICE uint32_t fp4_to_e4m3_byte(uint32_t code) {
-    constexpr uint32_t LUT_LO = 0x3c383000u;
-    constexpr uint32_t LUT_HI = 0x4c484440u;
-    const uint32_t mag      = code & 0x07u;
-    const uint32_t mag_byte = __byte_perm(LUT_LO, LUT_HI, mag) & 0xffu;
-    const uint32_t sign     = (code & 0x08u) << 4;  // 0 or 0x80
-    return mag_byte | sign;
-}
-
-// Decode 8 packed FP4 codes (one 32-bit word holding 8 nibbles) into 8 E4M3
-// bytes packed into a single 64-bit value (low byte = code 0).
-//
-// This is the register-resident analogue of the SS variant's
-// `fp4_pair_to_e4m3_pair` chained over 4 bytes. It is the building block the
-// second-round kernel will use after `ldmatrix.x4.trans` to materialise A
-// operand registers for RS-mode WGMMA without round-tripping through smem.
-//
-// Implementation kept straightforward (LUT per nibble). PTX-level
-// vectorisation via `prmt`/`lop3` is left for a follow-up micro-optimisation
-// in round 2 once the rest of the data path is verified correct.
-CUTLASS_DEVICE uint64_t fp4x8_to_e4m3x8(uint32_t packed) {
-    uint64_t out = 0;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const uint32_t nib = (packed >> (i * 4)) & 0x0fu;
-        out |= static_cast<uint64_t>(fp4_to_e4m3_byte(nib)) << (i * 8);
-    }
-    return out;
-}
-
-CUTLASS_DEVICE void fast_fp4_to_e4m3_convert(uint32_t outputs[2], uint32_t input) {
-    const uint64_t decoded = fp4x8_to_e4m3x8(input);
-    outputs[0] = static_cast<uint32_t>(decoded);
-    outputs[1] = static_cast<uint32_t>(decoded >> 32);
-}
 
 CUTLASS_DEVICE uint32_t fp4x4_to_e4m3x4(uint32_t packed) {
     constexpr uint32_t pos0 = 0x3c383000u;
@@ -578,10 +514,6 @@ CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_lut(uint32_t packed, ScaledE4M3Lu
     return (sign_bytes & 0x80808080u) | mantissa_bytes;
 }
 
-CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_offset(uint32_t packed, uint32_t exp_offset) {
-    return fp4x4_to_scaled_e4m3x4_lut(packed, make_scaled_e4m3_lut(exp_offset));
-}
-
 CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_humming(uint32_t packed_nibbles, uint32_t exp_offset) {
     const uint32_t packed =
         (packed_nibbles & 0x000fu) |
@@ -627,16 +559,71 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
           typename epilogue_type_t,
+          bool kDecodeStub = false,
+          bool kScaleAStub = false,
+          bool kScaleBStub = false,
+          bool kScaleBMulStub = false,
+          bool kScaleProductStub = false,
+          bool kScaleBPow2Promote = false,
+          bool kScaleBEarlyLoad = false,
+          bool kScaleBEarlyProduct = false,
           bool kScaleBDirectLoad = false,
+          bool kWeightStub = false,
+          bool kWGMMAStub = false,
+          bool kStoreStub = false,
+          bool kDirectStore = false,
+          bool kSTSMStub = false,
+          bool kTMAStoreStub = false,
+          bool kSTSMConvertOnly = false,
+          bool kPromoteStub = false,
+          bool kPromoteAccumStub = false,
+          bool kPromoteFinalAccumStub = false,
+          bool kPromoteMulStub = false,
+          bool kOverlapPromote = false,
+          bool kFusedPromote = false,
+          bool kPromoteFromSmem = false,
+          bool kFmaPromote = false,
+          bool kLateScaleA = false,
           bool kBF16FinalAccum = true,
+          bool kBF16PromoteMath = false,
+          bool kScaleKGroupExact = false,
+          bool kBLoadStub = false,
+          bool kDecodePairShfl = false,
+          bool kParallelNWaves = false,
+          bool kK32Pingpong = false,
+          bool kK32PairReduce = false,
           bool kK32QuadReduce = false,
           bool kK32QuadSplitPromote = false,
+          bool kK32QuadScaleBInline = false,
+          bool kK32QuadScaleBPrefetch = false,
+          bool kK32QuadScaleBVec4 = false,
+          bool kK32QuadPair4x2Promote = false,
+          bool kWGMMAF16Accum = false,
+          bool kFinalAccumScratch = false,
+          bool kK32QuadPersistentScaleProduct = false,
+          bool kK32QuadShortProductPromote = false,
           bool kSmallMSimpleSched = false,
+          bool kFuseScaleBDecode = false,
+          bool kFuseScaleBDecodeStub = false,
+          bool kFuseScaleBHummingDecode = false,
+          bool kFuseScaleBDecodeFastCommon = false,
+          bool kFuseScaleBPredecode = false,
+          bool kFuseScaleBPredecodePair = false,
+          bool kFuseScaleBSharedStage = false,
+          bool kFuseScaleBWSDecode = false,
+          bool kFuseScaleBOnDemandLut = false,
+          bool kFuseScaleBSlicePromote = false,
+          uint32_t kFuseScaleBDecodeAssumeExp = 0,
+          bool kScaleBPackedUE8M0 = false,
           uint32_t kScaleBGranK = 128,
+          uint32_t kScaleKGroup = 1,
+          uint32_t kLaunchBoundsMinBlocks = 1,
+          uint32_t kMathRegCap = 0,
           bool kBIsInt4Sym = false,
           bool kScaleBBF16 = false,
-          bool kScaleBE8M0 = false>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+          bool kScaleBE8M0 = false,
+          bool kReorderMaskedByMaxM = false>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
                             uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -649,10 +636,21 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(kScaleBGranK == 32 or kScaleBGranK == 128,
                      "Only support per-32 or per-128-channel FP4 scaling");
+    DG_STATIC_ASSERT(not kScaleBPackedUE8M0 or (kFuseScaleBDecode and kScaleBGranK == 32),
+                     "Packed UE8M0 SFB is only supported by fused per-32 scale_b decode");
+    DG_STATIC_ASSERT(kScaleBGranK == 128 or not kOverlapPromote,
+                     "DG_W4_OVERLAP_PROMOTE does not support per-32 FP4 scaling");
+    DG_STATIC_ASSERT(kScaleBGranK == 128 or kScaleKGroup == 1,
+                     "DG_W4_SCALE_K_GROUP does not support per-32 FP4 scaling");
+    DG_STATIC_ASSERT(kScaleKGroup == 1 or kScaleKGroup == 2 or kScaleKGroup == 4,
+                     "DG_W4_SCALE_K_GROUP only supports 1/2/4");
     DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
     DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
     DG_STATIC_ASSERT((not kScaleBBF16 and not kScaleBE8M0) or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "Compressed Scale-B dtypes are only supported by direct-load per-32 path");
+    DG_STATIC_ASSERT(kFuseScaleBDecodeAssumeExp == 0 or kFuseScaleBDecodeAssumeExp == 5 or
+                     kFuseScaleBDecodeAssumeExp == 6,
+                     "DG_W4_FUSE_SCALE_B_DECODE_ASSUME_EXP only supports 0/5/6");
     DG_STATIC_ASSERT(
         math::constexpr_ceil_div(BLOCK_N, BLOCK_K) == 1 or
         (math::constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
@@ -693,7 +691,9 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     // SFB cache aliases smem_d when it fits. Small-M tiles may not have enough
     // smem_d capacity, so they fall back to a separate SFB region.
     const uint32_t smem_sfb_bytes = kScaleBGranK == 32 ?
-        math::align<uint32_t>((BLOCK_K / kScaleBGranK) * BLOCK_N * sizeof(float), 16u) :
+        math::align<uint32_t>((BLOCK_K / kScaleBGranK) *
+                              (kFuseScaleBDecode ? math::ceil_div(BLOCK_N, 4u) : BLOCK_N) *
+                              sizeof(float), 16u) :
         math::align<uint32_t>(shape_k_scales_b * BLOCK_N * sizeof(float), 16u);
     // NOTES: Make sure we have enough shared memory for WGMMA padding
     static constexpr uint32_t WGMMA_A_SIZE_PER_STAGE = WGMMA::M * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -706,8 +706,14 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
     constexpr uint32_t WAVE_BLOCK_M = BLOCK_N <= WGMMA::M ? BLOCK_N : WGMMA::M * 2;
     DG_STATIC_ASSERT(BLOCK_N % WAVE_BLOCK_M == 0, "Invalid block sizes");
     constexpr uint32_t WAVE_WGMMA = BLOCK_N / WAVE_BLOCK_M;
+    constexpr uint32_t kWGsPerNWave = WAVE_BLOCK_M / WGMMA::M;
+    constexpr bool kParallelNWavesEnabled =
+        kParallelNWaves and WAVE_WGMMA == 2 and kWGsPerNWave == 2 and kNumMathThreads == 512;
+    DG_STATIC_ASSERT(not kParallelNWaves or kParallelNWavesEnabled,
+                     "DG_W4_PARALLEL_N_WAVES only supports BN256 with 512 math threads");
     constexpr uint32_t kBaseWGMMAStoreThreads = WAVE_BLOCK_M * (128 / WGMMA::M);
-    constexpr uint32_t kEmptyBarrierMathWarps = kNumMathThreads / 32;
+    constexpr uint32_t kEmptyBarrierMathWarps =
+        kParallelNWavesEnabled ? kBaseWGMMAStoreThreads / 32 : kNumMathThreads / 32;
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
@@ -852,21 +858,25 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                     tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_a, &full_barrier,
                              smem_a[stage_idx], k_idx, scheduler.template get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
                              num_tma_multicast_a, batch_idx);
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
-                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales_a, 1, k_block_idx),
-                             num_tma_multicast_a);
+                    if constexpr (not kScaleAStub) {
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
+                                 smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales_a, 1, k_block_idx),
+                                 num_tma_multicast_a);
+                    }
 
-                    // Issue TMA B (packed FP4 bytes loaded as raw uint8 via FP8 alias) on the same barrier.
-                    const uint32_t k_idx_packed = k_block_idx * BLOCK_K_PACKED;
-                    tma::copy<BLOCK_K_PACKED, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
-                             reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[stage_idx]),
-                             k_idx_packed,
-                             scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                             num_tma_multicast_b, batch_idx);
+                    if constexpr (not kWeightStub) {
+                        // Issue TMA B (packed FP4 bytes loaded as raw uint8 via FP8 alias) on the same barrier.
+                        const uint32_t k_idx_packed = k_block_idx * BLOCK_K_PACKED;
+                        tma::copy<BLOCK_K_PACKED, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                                 reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[stage_idx]),
+                                 k_idx_packed,
+                                 scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                 num_tma_multicast_b, batch_idx);
+                    }
 
                     constexpr uint32_t kExpectedTxBytes = SMEM_A_TMA_SIZE_PER_STAGE +
-                                                          SMEM_B_PACKED_SIZE_PER_STAGE +
-                                                          SMEM_SFA_TMA_SIZE_PER_STAGE;
+                                                          (kWeightStub ? 0 : SMEM_B_PACKED_SIZE_PER_STAGE) +
+                                                          (kScaleAStub ? 0 : SMEM_SFA_TMA_SIZE_PER_STAGE);
                     full_barrier.arrive_and_expect_tx(kExpectedTxBytes);
                 }
             }
@@ -967,11 +977,62 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
             }
 
             auto cache_sfb_k32 = [&](uint32_t k_block_idx) {
-                if constexpr (kScaleBGranK == 32 and not kScaleBDirectLoad) {
+                if constexpr (kScaleBGranK == 32 and not kScaleBStub and not kFuseScaleBDecodeStub and not kScaleBDirectLoad) {
                     const uint32_t n_block_base = n_block_idx * BLOCK_N;
                     const uint32_t scale_k_base = k_block_idx * (BLOCK_K / kScaleBGranK);
                     constexpr uint32_t kScaleRows = BLOCK_K / kScaleBGranK;
-                    if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
+                    if constexpr (kFuseScaleBDecode) {
+                        DG_STATIC_ASSERT(not kScaleBPackedUE8M0 or kMajorSFB == cute::UMMA::Major::MN,
+                                         "Packed UE8M0 SFB path expects MN-major transformed scale layout");
+                        constexpr uint32_t kVec = 4;
+                        DG_STATIC_ASSERT(BLOCK_N % kVec == 0,
+                                         "BLOCK_N must be a multiple of 4 for packed K/32 SFB exp cache");
+                        constexpr uint32_t kVecsPerRow = BLOCK_N / kVec;
+                        const uint32_t total_vecs = kScaleRows * kVecsPerRow;
+                        for (uint32_t i = threadIdx.x; i < total_vecs; i += kNumMathThreads) {
+                            const uint32_t k_off = i / kVecsPerRow;
+                            const uint32_t n_off = (i % kVecsPerRow) * kVec;
+                            const uint32_t n_idx = n_block_base + n_off;
+                            uint32_t packed_offsets = 0;
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kVec; ++ j) {
+                                uint32_t exp_offset = 6;
+                                if constexpr (kScaleBPackedUE8M0) {
+                                    if (n_idx + j < shape_n) {
+                                        const uint32_t packed_shape_k_scales_b = math::ceil_div(shape_k_scales_b, 4u);
+                                        const uint32_t packed_k_idx = (scale_k_base + k_off) / 4u;
+                                        const uint32_t byte_idx = (scale_k_base + k_off) % 4u;
+                                        const uint32_t* sfb_packed = reinterpret_cast<const uint32_t*>(sfb);
+                                        const uint32_t packed_scale = sfb_packed[
+                                            current_group_idx * aligned_shape_n_sfb * packed_shape_k_scales_b +
+                                            packed_k_idx * aligned_shape_n_sfb + n_idx + j];
+                                        const uint32_t e8m0_exp = (packed_scale >> (byte_idx * 8)) & 0xffu;
+                                        exp_offset = (e8m0_exp > 121u) ? (e8m0_exp - 121u) : 0u;
+                                    }
+                                } else {
+                                    float val = 1.0f;
+                                    if (n_idx + j < shape_n) {
+                                        if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
+                                            const float* sfb_base = sfb +
+                                                current_group_idx * aligned_shape_n_sfb * shape_k_scales_b;
+                                            const float* ptr = sfb_base +
+                                                (scale_k_base + k_off) * aligned_shape_n_sfb + n_idx + j;
+                                            val = *ptr;
+                                        } else {
+                                            const float* ptr = sfb +
+                                                current_group_idx * shape_n * shape_k_scales_b +
+                                                (n_idx + j) * shape_k_scales_b + scale_k_base + k_off;
+                                            val = *ptr;
+                                        }
+                                    }
+                                    const int32_t exp_shift = fp4_rs_detail::pow2_scale_to_exp_shift(val);
+                                    exp_offset = static_cast<uint32_t>(exp_shift + 6) & 0xffu;
+                                }
+                                packed_offsets |= exp_offset << (j * 8);
+                            }
+                            ptx::st_shared(smem_sfb_exp + k_off * kVecsPerRow + n_off / kVec, packed_offsets);
+                        }
+                    } else if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
                         constexpr uint32_t kVec = 4;
                         DG_STATIC_ASSERT(BLOCK_N % kVec == 0,
                                          "BLOCK_N must be a multiple of 4 for vectorized K/32 SFB load");
@@ -1087,33 +1148,61 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_N <= WGMMA::M ? BLOCK_N : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_N % WAVE_BLOCK_M == 0, "Invalid block sizes");
             constexpr uint32_t WAVE_WGMMA = BLOCK_N / WAVE_BLOCK_M;
+            constexpr uint32_t kWGsPerNWave = WAVE_BLOCK_M / WGMMA::M;
+            constexpr bool kParallelNWavesEnabled =
+                kParallelNWaves and WAVE_WGMMA == 2 and kWGsPerNWave == 2 and kNumMathThreads == 512;
+            constexpr bool kUseScaleKGroup = (kScaleKGroup > 1 and (WAVE_WGMMA == 1 or WAVE_WGMMA == 2));
+            constexpr bool kUseScaleKGroupExact =
+                (kScaleKGroupExact and kUseScaleKGroup and kScaleKGroup == 2 and not kFusedPromote);
             DG_STATIC_ASSERT(kNumMathThreads % 128 == 0, "RS-mode math threads must be whole warpgroups");
-            const uint32_t wave_warp_idx = math_wg_idx * 4 + warp_in_wg;
+            DG_STATIC_ASSERT(not kParallelNWaves or kParallelNWavesEnabled,
+                             "DG_W4_PARALLEL_N_WAVES only supports BN256 with 512 math threads");
+            const uint32_t wave_group_idx = kParallelNWavesEnabled ? math_wg_idx / kWGsPerNWave : 0;
+            const uint32_t wave_mwg_idx = kParallelNWavesEnabled ? math_wg_idx % kWGsPerNWave : math_wg_idx;
+            const uint32_t wave_warp_idx = wave_mwg_idx * 4 + warp_in_wg;
             const uint32_t r_0 = wave_warp_idx * 16 + row_idx;
             const uint32_t r_1 = r_0 + 8;
             using final_accum_t = typename fp4_rs_detail::FinalAccumStorage<kBF16FinalAccum>::type;
+            constexpr uint32_t kNumAccumSets = kUseScaleKGroup ? WAVE_WGMMA : 1;
             constexpr uint32_t kFinalAccumStride =
                 kBF16FinalAccum ? WGMMA::kNumAccum / 2 : WGMMA::kNumAccum;
             constexpr uint32_t kNumFinalAccumRegs = kFinalAccumStride * WAVE_WGMMA;
+            constexpr bool kUseFinalAccumScratch =
+                kFinalAccumScratch and kDirectStore and kGemmType == GemmType::MGroupedMasked and
+                BLOCK_M < WGMMA::M and not kUseScaleKGroup;
             constexpr uint32_t kBaseWGMMAStoreThreads = WAVE_BLOCK_M * (128 / WGMMA::M);
-            float accum_storage[WGMMA::kNumAccum];
-            final_accum_t final_accum_regs[kNumFinalAccumRegs];
+            constexpr uint32_t kNumWGMMAStoreThreads =
+                kParallelNWavesEnabled ? kBaseWGMMAStoreThreads * WAVE_WGMMA : kBaseWGMMAStoreThreads;
+            constexpr uint32_t kFinalAccumScratchBytes =
+                kNumMathThreads * kNumFinalAccumRegs * sizeof(final_accum_t);
+            float accum_storage[WGMMA::kNumAccum * kNumAccumSets];
+            final_accum_t final_accum_regs[kUseFinalAccumScratch ? 1 : kNumFinalAccumRegs];
             final_accum_t* final_accum = final_accum_regs;
+            if constexpr (kUseFinalAccumScratch) {
+                DG_STATIC_ASSERT(kFinalAccumScratchBytes <= SMEM_D_SIZE,
+                                 "DG_W4_FINAL_ACCUM_SCRATCH needs more smem_d scratch space");
+                final_accum = reinterpret_cast<final_accum_t*>(smem_d) +
+                    (warp_idx * 32 + lane_idx) * kNumFinalAccumRegs;
+            }
             #pragma unroll
             for (uint32_t i = 0; i < kNumFinalAccumRegs; ++ i)
                 fp4_rs_detail::final_accum_init<kBF16FinalAccum>(final_accum, i);
 
             // Pick threads whose WGMMA results are to be stored in shared memory
             DG_STATIC_ASSERT(BLOCK_N >= 64, "RS-mode swap_ab requires at least one 64-row compute tile");
-            const bool do_wgmma_store = warp_idx < kBaseWGMMAStoreThreads / 32;
+            const bool do_wgmma_store = warp_idx < kNumWGMMAStoreThreads / 32;
 
             // Empty barrier arrival
             auto empty_barrier_arrive_stage = [&](uint32_t target_stage) {
+                if constexpr (kParallelNWavesEnabled)
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 2);
                 if constexpr (kNumTMAMulticast == 1) {
-                    (lane_idx == 0) ? empty_barriers[target_stage]->arrive() : void();
+                    (lane_idx == 0 and (not kParallelNWavesEnabled or wave_group_idx == 0)) ?
+                        empty_barriers[target_stage]->arrive() : void();
                 } else {
                     auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
-                    (lane_idx < kNumTMAMulticast) ? empty_barriers[target_stage]->arrive(target_cta) : void();
+                    (lane_idx < kNumTMAMulticast and (not kParallelNWavesEnabled or wave_group_idx == 0)) ?
+                        empty_barriers[target_stage]->arrive(target_cta) : void();
                 }
             };
             auto empty_barrier_arrive = [&]() {

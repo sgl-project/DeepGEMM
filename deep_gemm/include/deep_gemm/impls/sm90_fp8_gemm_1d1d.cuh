@@ -11,6 +11,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
@@ -49,8 +50,10 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     // Scaling checks
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
+
+    // C/D type: only FP32 with accumulation
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
 
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
@@ -142,7 +145,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     }
 
     // Synchronize all threads to make barrier visible in normal memory model
-    (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+    (kNumTMAMulticast > 1) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Pipeline unroll control
     constexpr uint32_t kNumPipelineUnrolls = (kGemmType == GemmType::KGroupedContiguous ? 0 : kNumStages);
@@ -156,7 +159,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, 128u>(shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, true, 128u, 128u>(shape_m, shape_n, shape_k, grouped_layout);
 
     // TMA and MMA pipeline
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
@@ -185,8 +188,8 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                 const uint32_t m_idx = m_block_idx * BLOCK_M;
                 const uint32_t n_idx = n_block_idx * BLOCK_N;
 
-                if (kGemmType == GemmType::KGroupedContiguous && last_group_idx != scheduler.current_group_idx) {  
-                    last_group_idx = scheduler.current_group_idx;  
+                if (kGemmType == GemmType::KGroupedContiguous and last_group_idx != scheduler.current_group_idx) {
+                    last_group_idx = scheduler.current_group_idx;
 
                     // Directly update current tensor map
                     const uint64_t current_k_offset = scheduler.current_k_cumsum;
@@ -194,8 +197,16 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_b, gmem_b_ptr + current_k_offset * shape_n);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_a, scheduler.current_shape_k, scheduler.current_shape_k);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_b, scheduler.current_shape_k, scheduler.current_shape_k);
-                    *(gmem_tensor_map_a) = *(smem_tensor_map_a);  
-                    *(gmem_tensor_map_b) = *(smem_tensor_map_b);  
+
+                    // Make sure the tensor maps are not used by in-flight TMA loads before updating GMEM
+                    cute::tma_desc_commit_group();
+                    cute::tma_desc_wait_group();
+                    // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
+                    // Shouldn't be needed otherwise, since we only use one thread
+                    __syncwarp(1u << lane_idx);
+
+                    *(gmem_tensor_map_a) = *(smem_tensor_map_a);
+                    *(gmem_tensor_map_b) = *(smem_tensor_map_b);
                     ptx::tensor_map_release_gpu();
 
                     // Immediately acquire current tensor map

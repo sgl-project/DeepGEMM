@@ -84,7 +84,6 @@ public:
         LaunchArgs launch_args;
 
         cute::UMMA::Major major_sfb;
-        bool decode_stub;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -112,7 +111,6 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {},
         {}
     >);
 }};
@@ -129,8 +127,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        get_default_epilogue_type(std::nullopt),
-        args.decode_stub ? "true" : "false");
+        get_default_epilogue_type(std::nullopt));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -232,10 +229,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         const int& gran_k,
         const std::string& compiled_dims,
         const bool& use_psum_layout,
-        const std::optional<int>& expected_m_for_psum_layout,
-        const std::optional<int>& block_m_override,
-        const std::optional<int>& block_n_override,
-        const bool& decode_stub) {
+        const std::optional<int>& expected_m_for_psum_layout) {
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     DG_HOST_ASSERT(gran_k == 128);
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
@@ -407,23 +401,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     layout.cluster_m = 1;
     auto config = rebuild_config(layout);
 
-    // The contiguous fallback benchmark explicitly sweeps BLOCK_M/BLOCK_N via
-    // these overrides; keep this path independent from masked RS heuristics so
-    // regressions can be attributed to the selected block shape.
-    if (block_m_override or block_n_override) {
-        auto layout = config.layout;
-        if (block_m_override) {
-            DG_HOST_ASSERT(not use_psum_layout or *block_m_override == 128);
-            layout.block_m = *block_m_override;
-        }
-        if (block_n_override) {
-            layout.block_n = *block_n_override;
-        }
-        DG_HOST_ASSERT((layout.block_m == 64 or layout.block_m == 128 or layout.block_m == 256) and layout.block_n % 16 == 0);
-        DG_HOST_ASSERT(layout.block_n <= 256);
-        layout.cluster_m = 1;
-        config = rebuild_config(layout);
-    }
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
 
@@ -499,7 +476,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
         .major_sfb = get_major_type_ab(sfb),
-        .decode_stub = decode_stub,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
@@ -524,14 +500,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const std::optional<int>& gran_k_a_override,
         const std::optional<int>& gran_k_b_override,
         const std::string& compiled_dims,
-        const std::optional<int>& block_m_override,
-        const std::optional<int>& block_n_override,
-        const bool& decode_stub,
-        // INT4-sym (signed [-8, 7]) variant for B. The wire format is shared
-        // with packed-FP4 (2 nibbles/byte, kPackedFP4 dtype, fp32 SFB), so
-        // the kernel reuses the same TMA descriptors and SFB layout. Only
-        // the in-register decode primitive switches to int4_symx4_to_e4m3x4.
-        const bool& b_is_int4_sym = false,
         // DSV4 MTP/speculative-verify hint: caller passes masked_m.max() so
         // the host can pick BM matching the hottest group instead of the
         // distribution-average expected_m. Fast-path gating (k32 quad_reduce
@@ -551,11 +519,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const int gran_k_b_requested = gran_k_b_override.value_or(gran_k);
     DG_HOST_ASSERT(gran_k_a_requested == 128);
     DG_HOST_ASSERT(gran_k_b_requested == 32 or gran_k_b_requested == 128);
-    // INT4-sym path-A is restricted to per-128 fp32 SFB on the device side.
-    // Reject combinations that would otherwise silently bypass the
-    // INT4-decode dispatch (e.g. per-32 K-block scales fall into the fused
-    // decode path, which is not wired for INT4 yet).
-    DG_HOST_ASSERT(not b_is_int4_sym or gran_k_b_requested == 128);
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(a.second.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(b.first.scalar_type() == kPackedFP4);
@@ -642,157 +605,143 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     //
     // Selection criteria: maximize stages under (waves <= ceil_div(total_tiles, num_sms)),
     //                    then maximize last_wave utilization, then prefer smaller per-stage (smaller BN).
-    if (not block_m_override and not block_n_override) {
-        const int num_sms = desc.num_sms;
-        const int block_k = layout.block_k;
-        const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
+    const int num_sms = desc.num_sms;
+    const int block_k = layout.block_k;
+    const int shape_k_scales_b = ceil_div(static_cast<int>(k), gran_k_b);
 
-        auto eval_layout = [&](int bm, int bn) -> std::tuple<int, int, int, int> {
-            // Returns (sat_stages, -waves, last_wave_util, -per_stage); higher is better.
-            // Stages saturate TMA hiding around ~6, so use saturated stage count to avoid
-            // small BN with stages=8 defeating candidates with better wave utilization.
-            const int tiles = ceil_div(expected_m, bm) * ceil_div(static_cast<int>(n), bn) * num_groups;
-            const int waves = ceil_div(tiles, num_sms);
-            const int last = tiles - (waves - 1) * num_sms;
-            const int last_util = last <= 0 ? num_sms : last;
-            const bool uniform_scale_b = (block_k % bn == 0);
-            const int sfb_old_bytes = gran_k_b == 32 ? 0 :
-                align(shape_k_scales_b * (uniform_scale_b ? 1 : 2) * static_cast<int>(sizeof(float)), 16);
-            const int sfb_cache_bytes = gran_k_b == 32 ? 0 :
-                align(shape_k_scales_b * bn * static_cast<int>(sizeof(float)), 16);
-            const int rs_padded_bm = std::max(bm, 64);
-            const int smem_d_bytes =
-                align(rs_padded_bm * bn * static_cast<int>(sizeof(nv_bfloat16)), 1024);
-            const int sfb_extra = (sfb_cache_bytes > smem_d_bytes ? sfb_cache_bytes : 0) - sfb_old_bytes;
-            const int smem_a_per_stage = rs_padded_bm * block_k * static_cast<int>(c10::elementSize(desc.a_dtype));
-            const int smem_sfa_per_stage =
-                align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
-            const int packed_per_stage = bn * (block_k / 2);
-            const int merged_per_stage = smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
-            constexpr int kMaxEvaluatedStages = 10;
-            constexpr int kBarrierBytes = 16 * kMaxEvaluatedStages * 2;
-            const int fixed = smem_d_bytes + kBarrierBytes + sfb_extra;
-            const int max_stages = (SM90ArchSpec::smem_capacity - fixed) / merged_per_stage;
-            constexpr int kStageSaturation = 6;
-            const int sat_stages = std::min(std::min(max_stages, kMaxEvaluatedStages), kStageSaturation);
-            return std::make_tuple(sat_stages, -waves, last_util, -merged_per_stage);
-        };
+    auto eval_layout = [&](int bm, int bn) -> std::tuple<int, int, int, int> {
+        // Returns (sat_stages, -waves, last_wave_util, -per_stage); higher is better.
+        // Stages saturate TMA hiding around ~6, so use saturated stage count to avoid
+        // small BN with stages=8 defeating candidates with better wave utilization.
+        const int tiles = ceil_div(expected_m, bm) * ceil_div(static_cast<int>(n), bn) * num_groups;
+        const int waves = ceil_div(tiles, num_sms);
+        const int last = tiles - (waves - 1) * num_sms;
+        const int last_util = last <= 0 ? num_sms : last;
+        const bool uniform_scale_b = (block_k % bn == 0);
+        const int sfb_old_bytes = gran_k_b == 32 ? 0 :
+            align(shape_k_scales_b * (uniform_scale_b ? 1 : 2) * static_cast<int>(sizeof(float)), 16);
+        const int sfb_cache_bytes = gran_k_b == 32 ? 0 :
+            align(shape_k_scales_b * bn * static_cast<int>(sizeof(float)), 16);
+        const int rs_padded_bm = std::max(bm, 64);
+        const int smem_d_bytes =
+            align(rs_padded_bm * bn * static_cast<int>(sizeof(nv_bfloat16)), 1024);
+        const int sfb_extra = (sfb_cache_bytes > smem_d_bytes ? sfb_cache_bytes : 0) - sfb_old_bytes;
+        const int smem_a_per_stage = rs_padded_bm * block_k * static_cast<int>(c10::elementSize(desc.a_dtype));
+        const int smem_sfa_per_stage =
+            align(rs_padded_bm * static_cast<int>(sizeof(float)), 128);
+        const int packed_per_stage = bn * (block_k / 2);
+        const int merged_per_stage = smem_a_per_stage + smem_sfa_per_stage + packed_per_stage;
+        constexpr int kMaxEvaluatedStages = 10;
+        constexpr int kBarrierBytes = 16 * kMaxEvaluatedStages * 2;
+        const int fixed = smem_d_bytes + kBarrierBytes + sfb_extra;
+        const int max_stages = (SM90ArchSpec::smem_capacity - fixed) / merged_per_stage;
+        constexpr int kStageSaturation = 6;
+        const int sat_stages = std::min(std::min(max_stages, kMaxEvaluatedStages), kStageSaturation);
+        return std::make_tuple(sat_stages, -waves, last_util, -merged_per_stage);
+    };
 
-        std::vector<std::pair<int, int>> w4_candidates = {
-            {64, 64}, {64, 128}, {64, 256},
-            {128, 64}, {128, 128},
-        };
-        if (expected_m <= 32) {
-            w4_candidates.insert(w4_candidates.begin(), {{8, 64}, {16, 64}, {32, 64}});
+    std::vector<std::pair<int, int>> w4_candidates = {
+        {64, 64}, {64, 128}, {64, 256},
+        {128, 64}, {128, 128},
+    };
+    if (expected_m <= 32) {
+        w4_candidates.insert(w4_candidates.begin(), {{8, 64}, {16, 64}, {32, 64}});
+    }
+
+    std::pair<int, int> best{layout.block_m, layout.block_n};
+    std::tuple<int, int, int, int> best_score{-1, 0, 0, 0};
+    bool first = true;
+    for (const auto& cand : w4_candidates) {
+        const int bm = cand.first;
+        const int bn = cand.second;
+        // 1D2D kernel unroll requirements
+        if (bn > block_k and (bn % (bn - block_k) != 0 and block_k % (bn - block_k) != 0))
+            continue;
+        // Masked multicast validity: currently fixed cluster_m=1, cluster_n=1, always satisfied
+        const auto score = eval_layout(bm, bn);
+        if (std::get<0>(score) < 3)
+            continue;
+        if (first or score > best_score) {
+            best_score = score;
+            best = cand;
+            first = false;
         }
+    }
+    layout.block_m = best.first;
+    layout.block_n = best.second;
 
-        std::pair<int, int> best{layout.block_m, layout.block_n};
-        std::tuple<int, int, int, int> best_score{-1, 0, 0, 0};
-        bool first = true;
-        for (const auto& cand : w4_candidates) {
-            const int bm = cand.first;
-            const int bn = cand.second;
-            // 1D2D kernel unroll requirements
-            if (bn > block_k and (bn % (bn - block_k) != 0 and block_k % (bn - block_k) != 0))
-                continue;
-            // Masked multicast validity: currently fixed cluster_m=1, cluster_n=1, always satisfied
-            const auto score = eval_layout(bm, bn);
-            if (std::get<0>(score) < 3)
-                continue;
-            if (first or score > best_score) {
-                best_score = score;
-                best = cand;
-                first = false;
-            }
-        }
-        layout.block_m = best.first;
-        layout.block_n = best.second;
+    // RS masked W4 fallback:
+    // pick BM close to max(expected_m, masked_m_max_hint) to avoid
+    // over-computing promotion work on hot groups. Path-B per-32 scale keeps
+    // the proven BM=32 fast path for hot groups; small/fan-out cases use the
+    // BM ladder and simple scheduler where applicable.
+    const int bm_select_m = std::max(
+        expected_m, masked_m_max_hint.value_or(expected_m));
+    if (desc.gemm_type == GemmType::MGroupedMasked) {
+        // DSV4 / speculative-verify shape set. This is the former relaxed
+        // shape set, now fixed as the only specialized masked path.
+        const bool dsv4_shape =
+            static_cast<int64_t>(desc.num_groups) >= 8 and
+             (static_cast<int64_t>(desc.n) == 4096 or
+              static_cast<int64_t>(desc.n) == 6144 or
+              static_cast<int64_t>(desc.n) == 7168) and
+             (static_cast<int64_t>(desc.k) == 2048 or
+              static_cast<int64_t>(desc.k) == 3072 or
+              static_cast<int64_t>(desc.k) == 4096 or
+              static_cast<int64_t>(desc.k) == 7168);
 
-        // RS masked W4 fallback:
-        // pick BM close to max(expected_m, masked_m_max_hint) to avoid
-        // over-computing promotion work on hot groups. Path-B per-32 scale keeps
-        // the proven BM=32 fast path for hot groups; small/fan-out cases use the
-        // BM ladder and simple scheduler where applicable.
-        const int bm_select_m = std::max(
-            expected_m, masked_m_max_hint.value_or(expected_m));
-        if (desc.gemm_type == GemmType::MGroupedMasked) {
-            // DSV4 / speculative-verify shape set. This is the former relaxed
-            // shape set, now fixed as the only specialized masked path.
-            const bool dsv4_shape =
-                static_cast<int64_t>(desc.num_groups) >= 8 and
-                 (static_cast<int64_t>(desc.n) == 4096 or
-                  static_cast<int64_t>(desc.n) == 6144 or
-                  static_cast<int64_t>(desc.n) == 7168) and
-                 (static_cast<int64_t>(desc.k) == 2048 or
-                  static_cast<int64_t>(desc.k) == 3072 or
-                  static_cast<int64_t>(desc.k) == 4096 or
-                  static_cast<int64_t>(desc.k) == 7168);
-
-            if (gran_k_b == 32) {
-                const bool real_hot_present =
-                    masked_m_max_hint.has_value()
-                        ? (masked_m_max_hint.value() > 16)
-                        : (expected_m > 16);
-                if (real_hot_present) {
-                    layout.block_m = 32;
-                    const int hint_m = masked_m_max_hint.value_or(0);
-                    const int hint_active = active_groups_hint.value_or(
-                        static_cast<int>(desc.num_groups) / 2);
-                    const bool bn256_baseline =
-                        hint_m > 32 and
-                        static_cast<int64_t>(hint_active) * hint_m >= 1024;
-                    const bool bn256_eligible =
-                        dsv4_shape and
-                        masked_m_max_hint.has_value() and
-                        bn256_baseline;
-                    layout.block_n = bn256_eligible ? 256 : 128;
-                } else {
-                    if (bm_select_m <= 8) layout.block_m = 8;
-                    else if (bm_select_m <= 16) layout.block_m = 16;
-                    else if (bm_select_m <= 32) layout.block_m = 32;
-                    else if (bm_select_m <= 64) layout.block_m = 64;
-                    layout.block_n = 256;
-                }
+        if (gran_k_b == 32) {
+            const bool real_hot_present =
+                masked_m_max_hint.has_value()
+                    ? (masked_m_max_hint.value() > 16)
+                    : (expected_m > 16);
+            if (real_hot_present) {
+                layout.block_m = 32;
+                const int hint_m = masked_m_max_hint.value_or(0);
+                const int hint_active = active_groups_hint.value_or(
+                    static_cast<int>(desc.num_groups) / 2);
+                const bool bn256_baseline =
+                    hint_m > 32 and
+                    static_cast<int64_t>(hint_active) * hint_m >= 1024;
+                const bool bn256_eligible =
+                    dsv4_shape and
+                    masked_m_max_hint.has_value() and
+                    bn256_baseline;
+                layout.block_n = bn256_eligible ? 256 : 128;
             } else {
-                // Path-A: cooperative prefetch + sfb→smem, BM ladder effective.
                 if (bm_select_m <= 8) layout.block_m = 8;
                 else if (bm_select_m <= 16) layout.block_m = 16;
                 else if (bm_select_m <= 32) layout.block_m = 32;
                 else if (bm_select_m <= 64) layout.block_m = 64;
                 layout.block_n = 256;
+            }
+        } else {
+            // Path-A: cooperative prefetch + sfb→smem, BM ladder effective.
+            if (bm_select_m <= 8) layout.block_m = 8;
+            else if (bm_select_m <= 16) layout.block_m = 16;
+            else if (bm_select_m <= 32) layout.block_m = 32;
+            else if (bm_select_m <= 64) layout.block_m = 64;
+            layout.block_n = 256;
 
-                if (layout.block_m >= 64 and dsv4_shape) {
-                    layout.block_n = 128;
-                }
-                if (bm_select_m > 32 and bm_select_m <= 64 and dsv4_shape) {
-                    layout.block_m = 32;
-                    layout.block_n = 128;
-                }
+            if (layout.block_m >= 64 and dsv4_shape) {
+                layout.block_n = 128;
+            }
+            if (bm_select_m > 32 and bm_select_m <= 64 and dsv4_shape) {
+                layout.block_m = 32;
+                layout.block_n = 128;
             }
         }
     }
-    if (not block_m_override and not block_n_override) {
-        DG_HOST_ASSERT(layout.block_m == 8 or layout.block_m == 16 or layout.block_m == 32 or
-                       layout.block_m == 64 or layout.block_m == 128);
-        DG_HOST_ASSERT(layout.block_n == 64 or layout.block_n == 128 or layout.block_n == 256);
-    }
+
+
+    DG_HOST_ASSERT(layout.block_m == 8 or layout.block_m == 16 or layout.block_m == 32 or
+                   layout.block_m == 64 or layout.block_m == 128);
+    DG_HOST_ASSERT(layout.block_n == 64 or layout.block_n == 128 or layout.block_n == 256);
+
+
     layout.cluster_m = 1;
     auto config = rebuild_config(layout);
 
-    if (block_m_override or block_n_override) {
-        auto layout = config.layout;
-        if (block_m_override) {
-            layout.block_m = *block_m_override;
-        }
-        if (block_n_override) {
-            layout.block_n = *block_n_override;
-        }
-        DG_HOST_ASSERT((layout.block_m == 8 or layout.block_m == 16 or layout.block_m == 32 or
-                        layout.block_m == 64 or layout.block_m == 128 or layout.block_m == 256) and layout.block_n % 16 == 0);
-        DG_HOST_ASSERT(layout.block_n <= 256);
-        layout.cluster_m = 1;
-        config = rebuild_config(layout);
-    }
     // Packed FP4 B has half the K bytes of FP8 B. Match PR #287's W4 path:
     // TMA writes B with a 64B swizzle and the RS kernel reads it via ldmatrix.
     config.storage_config.swizzle_b_mode = config.layout.block_k / 2;
@@ -928,7 +877,6 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
            static_cast<int64_t>(desc.k) == 3072 or
            static_cast<int64_t>(desc.k) == 4096 or
            static_cast<int64_t>(desc.k) == 7168)));
-    const bool compact_masked_sched = bm32_skew_fast_path;
     const bool scale_b_bf16 =
         ((scale_b_direct_load and gran_k_b == 32) or
          gran_k_b == 128) and
@@ -950,9 +898,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .k32_quad_reduce = k32_quad_reduce,
         .k32_quad_split_promote = k32_quad_split_promote,
         .small_m_simple_sched = small_m_simple_sched,
-        .compact_masked_sched = compact_masked_sched,
         .scale_b_gran_k = static_cast<uint32_t>(gran_k_b),
-        .b_is_int4_sym = b_is_int4_sym,
+        .b_is_int4_sym = false,
         .scale_b_bf16 = scale_b_bf16,
         .scale_b_e8m0 = scale_b_e8m0,
         .gmem_b_ptr = b.first.data_ptr(),

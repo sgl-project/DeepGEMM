@@ -40,6 +40,9 @@ try:
         m_grouped_fp8_fp4_gemm_nt_contiguous,
         m_grouped_fp8_fp4_gemm_nn_contiguous,
         m_grouped_fp8_fp4_gemm_nt_masked,
+        fp8_fp4_gemm_nt_sm90_fused_wgmma,
+        m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma,
+        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma,
         # FP8 GEMMs
         fp8_gemm_nt, fp8_gemm_nn,
         fp8_gemm_tn, fp8_gemm_tt,
@@ -70,31 +73,14 @@ try:
         tf32_hc_prenorm_gemm,
         # Layout kernels
         transform_sf_into_required_layout,
+        # MegaMoE
+        get_block_m_for_mega_moe,
     )
 
     # Some alias for legacy supports
     # TODO: remove these later
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
-    try:
-        fp8_fp4_gemm_nt_sm90_fused_wgmma = _C.fp8_fp4_gemm_nt_sm90_fused_wgmma
-    except AttributeError:
-        pass
-    try:
-        m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma
-        )
-    except AttributeError:
-        pass
-    try:
-        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
-        )
-        m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma
-        )
-    except AttributeError:
-        pass
 except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
     pass
@@ -105,6 +91,7 @@ from .mega import (
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    bf16_mega_moe,
 )
 
 # Some utils
@@ -142,4 +129,4 @@ _C.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.5.0'
+__version__ = '2.6.1'

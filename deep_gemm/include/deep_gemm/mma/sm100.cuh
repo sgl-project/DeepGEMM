@@ -91,26 +91,42 @@ uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, cons
     return base + (((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) * static_cast<uint32_t>(sizeof(dtype_t))) >> 4u);
 }
 
-template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode, bool kUseBase32 = false, typename dtype_t>
+template <typename dtype_t>
+CUTLASS_DEVICE
+constexpr uint32_t get_umma_desc_pack_factor() {
+    // Packed FP4 stores two logical elements per byte in SMEM.
+    if constexpr (cute::is_same_v<dtype_t, cutlass::float_e2m1_t>) {
+        return 2;
+    } else {
+        return 1;
+    }
+}
+
+template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode,
+          bool kUseBase32 = false, typename dtype_t>
 CUTLASS_DEVICE
 cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_idx, uint32_t k_idx) {
+    // NOTES: `base_smem_ptr` must use the logical SMEM element type used by UMMA descriptors.
+    constexpr uint32_t kPackFactor = get_umma_desc_pack_factor<dtype_t>();
+    DG_STATIC_ASSERT(kPackFactor == 1 or sizeof(dtype_t) == 1, "Packing expects a 1-byte storage type");
     const uint32_t stride_k = get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>();
     const auto layout_type = to_umma_layout_type<kMajorMode, kSwizzleMode, kUseBase32, dtype_t>();
     const auto num_non_contiguous = 128 / get_atom_base(layout_type);
     if constexpr (kMajorMode == cute::UMMA::Major::K) {
-        // NOTES: for K-major layout, the swizzle must be the same as `BLOCK_K * sizeof(dtype_t)`
+        // NOTES: for K-major layout, the swizzle must be the same as `BLOCK_K` elements in bytes
         // also, atom index must be 0, so that each block has exactly one swizzle atom on the K axis
-        DG_STATIC_ASSERT(kSwizzleMode == BLOCK_K * sizeof(dtype_t), "Unexpected value");
+        DG_STATIC_ASSERT(kSwizzleMode * kPackFactor == BLOCK_K * sizeof(dtype_t), "Unexpected value");
 
         // Atom size: 8 x `kSwizzleMode` (in bytes, on K)
         // {SBO, LBO} means the byte stride between atoms on {MN, K}
         // NOTES: on K, there is only 1 atom as asserted previously, so LBO can be 0
-        const uint32_t stride_byte_offset = num_non_contiguous * BLOCK_K * sizeof(dtype_t);
+        const uint32_t stride_byte_offset = num_non_contiguous * BLOCK_K * sizeof(dtype_t) / kPackFactor;
         const uint32_t leading_byte_offset = 0;
-        return make_smem_desc(layout_type,
-                              base_smem_ptr + mn_idx * BLOCK_K + k_idx * stride_k,
-                              stride_byte_offset, leading_byte_offset);
+        const auto byte_ptr = reinterpret_cast<uint8_t*>(base_smem_ptr) +
+                              (mn_idx * BLOCK_K + k_idx * stride_k) * sizeof(dtype_t) / kPackFactor;
+        return make_smem_desc(layout_type, byte_ptr, stride_byte_offset, leading_byte_offset);
     } else {
+        DG_STATIC_ASSERT(kPackFactor <= 1, "Packing only supports K-major");
         constexpr uint32_t BLOCK_MN_ATOM = tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
 
         // Must have no in-atom MN-idx

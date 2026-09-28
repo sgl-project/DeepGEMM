@@ -114,8 +114,7 @@ static void einsum(const std::string& expr,
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
     if (c.has_value()) {
-        DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.scalar_type() == c->scalar_type());
     }
 
     // Some hardcoded Einstein sum kernels
@@ -152,7 +151,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto [batch_size  , m , k ] = get_shape<3>(a);
     const auto [batch_size_ , n , k_] = get_shape<3>(b);
     const auto [batch_size__, m_, n_] = get_shape<3>(d);
-    DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size_);
+    DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size__);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);

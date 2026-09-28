@@ -109,7 +109,7 @@ sm90_fp8_fp4_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, int8_t* gmem_b_ptr,
     // Data on shared memory
     auto smem_d = reinterpret_cast<cd_dtype_t*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
     auto smem_a = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE)); 
+        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE));
     });
     auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
@@ -157,7 +157,7 @@ sm90_fp8_fp4_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, int8_t* gmem_b_ptr,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
-    
+
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, 128u>(shape_m, shape_n, shape_k, grouped_layout);
@@ -191,7 +191,7 @@ sm90_fp8_fp4_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, int8_t* gmem_b_ptr,
                 const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
                 const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
                 DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
-                
+
                 const uint32_t num_k_blocks = math::ceil_div(scheduler.current_shape_k, BLOCK_K);
                 const uint32_t m_idx = m_block_idx * BLOCK_M;
                 const uint32_t n_idx = n_block_idx * BLOCK_N;

@@ -36,10 +36,20 @@ static bool fp8_requires_k_major() {
 // Tensor utils
 template <int N>
 static auto get_shape(const torch::Tensor& t) {
+    DG_HOST_ASSERT(t.is_cuda());
     DG_HOST_ASSERT(t.dim() == N);
     return [&t] <size_t... Is> (std::index_sequence<Is...>) {
         return std::make_tuple(static_cast<int>(t.sizes()[Is])...);
     }(std::make_index_sequence<N>());
+}
+
+// Returns logical shape for packed FP4 by expanding the last dimension.
+template <int N>
+static auto get_logical_shape(const torch::Tensor& t) {
+    auto shape = get_shape<N>(t);
+    if (t.scalar_type() == kPackedFP4)
+        std::get<N - 1>(shape) *= 2;
+    return shape;
 }
 
 static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {

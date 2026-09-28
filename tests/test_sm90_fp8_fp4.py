@@ -1,11 +1,4 @@
-import argparse
-import sys
-import time
-from pathlib import Path
-
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import deep_gemm
 from deep_gemm.testing import calc_diff
@@ -291,8 +284,8 @@ def _masked_benchmark_case(
     )
     fp8_elapsed = _time_cuda(run_fp8)
 
-    #assert w4_diff < 0.015
-    #assert fp8_diff < 0.05
+    assert w4_diff < 0.015
+    assert fp8_diff < 0.05
 
     w4_bytes = _effective_bytes(groups, m_per_group, n, k, a_gran_k, fp8_b=False, b_gran_k=b_gran_k)
     fp8_bytes = _effective_bytes(groups, m_per_group, n, k, a_gran_k, fp8_b=True)
@@ -513,71 +506,6 @@ def _print_skew_table(rows: list[dict[str, float | int | str]]) -> None:
         )
 
 
-def _accuracy_case(
-    groups: int,
-    m_per_group: int,
-    n: int,
-    k: int,
-    gran_k: int = 128,
-    *,
-    block_m: int = 128,
-    block_n: int = 128,
-) -> tuple[float, float]:
-    m, group_starts, group_ends, grouped_layout = _build_grouped_layout(groups, m_per_group)
-    a_ref_src = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    b_ref_src = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
-
-    a = per_token_cast_to_fp8(a_ref_src, use_ue8m0=False, gran_k=gran_k)
-    b_fp4 = torch.empty((groups, n, k // 2), device="cuda", dtype=torch.int8)
-    b_sf = torch.empty((groups, n, k // gran_k), device="cuda", dtype=torch.float)
-    for group_id in range(groups):
-        b_fp4[group_id], b_sf[group_id] = per_token_cast_to_fp4(
-            b_ref_src[group_id], use_ue8m0=True, gran_k=gran_k
-        )
-    b_w4 = (b_fp4, b_sf)
-
-    a_dequant = _cast_back_from_fp8_1d(a[0], a[1], gran_k=gran_k)
-    b_fp8_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
-    b_fp8_sf = torch.empty((groups, n, k // gran_k), device="cuda", dtype=torch.float)
-    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-    for group_id in range(groups):
-        b_dequant = cast_back_from_fp4(b_w4[0][group_id], b_w4[1][group_id], gran_k=gran_k)
-        b_fp8_data[group_id], b_fp8_sf[group_id] = per_token_cast_to_fp8(
-            b_dequant, use_ue8m0=False, gran_k=gran_k
-        )
-        start = group_starts[group_id]
-        end = group_ends[group_id]
-        if start != end:
-            ref[start:end] = (a_dequant[start:end] @ b_dequant.t()).to(torch.bfloat16)
-    b_fp8 = (b_fp8_data, b_fp8_sf)
-
-    d_w4 = torch.empty_like(ref)
-    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
-        a,
-        b_w4,
-        d_w4,
-        grouped_layout,
-        gran_k=gran_k,
-        compiled_dims="nk",
-        use_psum_layout=False,
-        block_m_override=block_m,
-        block_n_override=block_n,
-    )
-
-    d_fp8 = torch.empty_like(ref)
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-        a,
-        b_fp8,
-        d_fp8,
-        grouped_layout,
-        recipe_a=(1, gran_k),
-        recipe_b=(1, gran_k),
-        use_psum_layout=False,
-    )
-
-    return calc_diff(d_w4, ref), calc_diff(d_fp8, ref)
-
-
 def test_sm90_fp8_fp4_contiguous() -> None:
     _require_sm90()
     torch.manual_seed(0)
@@ -635,268 +563,23 @@ def test_sm90_fp8_fp4_masked_skew_cases() -> None:
     _require_sm90()
     torch.manual_seed(4)
 
-    def skew_values(
-        total: int, hot: int, active: int = 8, groups: int = 32
-    ) -> list[int]:
-        assert active >= 1
-        assert active <= groups
-        assert total >= hot
-        values = [0] * groups
-        values[0] = hot
-        remaining = total - hot
-        for idx in range(1, active):
-            share = (remaining + active - idx - 1) // (active - idx)
-            values[idx] = share
-            remaining -= share
-        assert sum(values) == total
-        return values
-
-    def values_from_active(active_values: list[int], groups: int = 32) -> list[int]:
-        assert len(active_values) <= groups
-        assert all(value >= 0 for value in active_values)
-        return active_values + [0] * (groups - len(active_values))
-
-    def values_from_repeated(value: int, active: int, groups: int = 32) -> list[int]:
-        assert active <= groups
-        return values_from_active([value] * active, groups=groups)
-
-    def long_tail_values(
-        hot: int, tail_start: int, active: int, groups: int = 32
-    ) -> list[int]:
-        values = [hot]
-        next_value = tail_start
-        for _ in range(active - 1):
-            values.append(max(1, next_value))
-            next_value = max(1, next_value // 2)
-        return values_from_active(values, groups=groups)
-
-    print("skewed masked case: shape mirrors DSV4 MTP verify; "
-          "groups=32, b_gran_k=32 walks path-B (k32 fast path) "
-          "with b.second shape [groups, N, K/32]")
+    cases = [
+        ("uniform_17", [17] * 24, 17, 6144, 7168, 4096, 32),
+        ("one_hot_214", [214] + [0] * 23, 1, 6144, 7168, 4096, 32),
+        ("business_m2", [2] * 24, 2, 6144, 7168, 256, 32),
+    ]
     rows = []
-    shapes = [
-        ("gateup", 4096, 4096),
-        ("down", 4096, 2048),
-        # Non-DSV4 dimensions keep the same group/masked pattern but stress
-        # different N/K ratios that can expose scheduler or scale-load cliffs.
-        ("wide_n", 7168, 2048),
-        ("wide_k", 4096, 7168),
-    ]
-    distributions = [
-        # Uniform small-M cases validate that hint-aware BM32 selection does not
-        # regress the common non-skew path.
-        ("uniform_1", [1] * 32, 1),
-        ("uniform_2", [2] * 32, 2),
-        ("uniform_4", [4] * 32, 4),
-        ("uniform_8", [8] * 32, 8),
-        ("uniform_16", [16] * 32, 16),
-        ("uniform_32", [32] * 32, 32),
-        # Around the BM16 -> BM32 hot threshold.
-        ("one_hot_15", values_from_active([15]), 1),
-        ("one_hot_16", values_from_active([16]), 1),
-        ("one_hot_17", values_from_active([17]), 1),
-        ("one_hot_24", values_from_active([24]), 1),
-        ("one_hot_32", values_from_active([32]), 1),
-        ("one_hot_48", values_from_active([48]), 2),
-        ("one_hot_64", values_from_active([64]), 2),
-        ("one_hot_128", values_from_active([128]), 4),
-        ("one_hot_214", values_from_active([214]), 1),
-        ("one_hot_384", values_from_active([384]), 12),
-        # Original MTP verify distributions copied from observed DP logs.
-        ("mtp_dp2", skew_values(total=144, hot=50), 7),
-        ("mtp_dp0", skew_values(total=195, hot=160), 7),
-        ("mtp_dp4", skew_values(total=290, hot=214), 7),
-        # Same total token count but different active/hotness patterns.
-        ("mtp_144_hot96_a4", skew_values(total=144, hot=96, active=4), 7),
-        ("mtp_144_hot96_a8", skew_values(total=144, hot=96, active=8), 7),
-        ("mtp_195_hot96_a16", skew_values(total=195, hot=96, active=16), 7),
-        ("mtp_290_hot160_a16", skew_values(total=290, hot=160, active=16), 7),
-        ("mtp_384_hot256_a8", skew_values(total=384, hot=256, active=8), 12),
-        ("mtp_512_hot384_a8", skew_values(total=512, hot=384, active=8), 16),
-        # Multi-hot cases mimic router concentration on a few experts rather
-        # than a single dominant expert.
-        ("two_hot_64_64", values_from_active([64, 64]), 4),
-        ("two_hot_128_64", values_from_active([128, 64]), 6),
-        ("two_hot_160_96", values_from_active([160, 96]), 8),
-        ("four_hot_32", values_from_repeated(32, active=4), 4),
-        ("four_hot_64", values_from_repeated(64, active=4), 8),
-        ("eight_hot_32", values_from_repeated(32, active=8), 8),
-        ("eight_hot_64", values_from_repeated(64, active=8), 16),
-        # Long tails stress compact masked scheduling and active-group scanning.
-        ("longtail_128_a8", long_tail_values(hot=128, tail_start=64, active=8), 8),
-        ("longtail_214_a8", long_tail_values(hot=214, tail_start=48, active=8), 7),
-        ("longtail_256_a16", long_tail_values(hot=256, tail_start=64, active=16), 12),
-        # Dense active but skewed cases can happen when all experts receive a
-        # few tokens and one or two experts still become hot.
-        (
-            "dense_tail_hot64",
-            values_from_active([64, 32, 16, 8] + [4] * 28),
-            8,
-        ),
-        (
-            "dense_tail_hot128",
-            values_from_active([128, 64, 32, 16] + [4] * 28),
-            8,
-        ),
-        (
-            "dense_tail_hot214",
-            values_from_active([214, 64, 32, 16] + [4] * 28),
-            8,
-        ),
-    ]
-    # for shape_name, n, k in shapes:
-    #     for dist_name, masked_m_values, expected_m in distributions:
-    #         rows.append(
-    #             _masked_skew_benchmark_case(
-    #                 f"{shape_name}_{dist_name}",
-    #                 masked_m_values,
-    #                 expected_m=expected_m,
-    #                 n=n,
-    #                 k=k,
-    #                 max_m=1024,
-    #                 b_gran_k=32,
-    #             )
-    #         )
-
-    group24_shapes = [
-        ("g24_m4096_n6144_k7168", 6144, 7168, 4096),
-        ("g24_m4096_n7168_k3072", 7168, 3072, 4096),
-    ]
-    group24_distributions = [
-        # Reproduce the warmup cliff that showed up as:
-        # m=17, max_m=4096, n=6144, k=7168, num_groups=24.
-        ("uniform_1", values_from_repeated(1, active=24, groups=24), 1),
-        ("uniform_8", values_from_repeated(8, active=24, groups=24), 8),
-        ("uniform_16", values_from_repeated(16, active=24, groups=24), 16),
-        ("uniform_17", values_from_repeated(17, active=24, groups=24), 17),
-        ("uniform_24", values_from_repeated(24, active=24, groups=24), 24),
-        ("uniform_32", values_from_repeated(32, active=24, groups=24), 32),
-        ("uniform_64", values_from_repeated(64, active=24, groups=24), 64),
-        # Around the E8M0 direct-load threshold and BM16/BM32 transition.
-        ("one_hot_16", values_from_active([16], groups=24), 16),
-        ("one_hot_17", values_from_active([17], groups=24), 17),
-        ("one_hot_32", values_from_active([32], groups=24), 32),
-        ("one_hot_64", values_from_active([64], groups=24), 64),
-        ("one_hot_128", values_from_active([128], groups=24), 128),
-        ("one_hot_256", values_from_active([256], groups=24), 256),
-        ("one_hot_512", values_from_active([512], groups=24), 512),
-        ("two_hot_17", values_from_active([17, 17], groups=24), 17),
-        ("two_hot_64_64", values_from_active([64, 64], groups=24), 64),
-        ("two_hot_128_64", values_from_active([128, 64], groups=24), 128),
-        ("four_hot_17", values_from_repeated(17, active=4, groups=24), 17),
-        ("four_hot_32", values_from_repeated(32, active=4, groups=24), 32),
-        ("four_hot_64", values_from_repeated(64, active=4, groups=24), 64),
-        ("eight_hot_17", values_from_repeated(17, active=8, groups=24), 17),
-        ("eight_hot_32", values_from_repeated(32, active=8, groups=24), 32),
-        ("eight_hot_64", values_from_repeated(64, active=8, groups=24), 64),
-        # MTP-like skew for 24 local groups, including the m=17 average.
-        ("mtp_408_hot160_a8", skew_values(408, 160, active=8, groups=24), 17),
-        ("mtp_408_hot256_a8", skew_values(408, 256, active=8, groups=24), 17),
-        ("mtp_576_hot384_a8", skew_values(576, 384, active=8, groups=24), 24),
-        ("mtp_768_hot512_a8", skew_values(768, 512, active=8, groups=24), 32),
-        # Long tails and dense active tails stress compact scheduling when
-        # active_groups is neither tiny nor fully uniform.
-        (
-            "longtail_128_a8",
-            long_tail_values(128, tail_start=64, active=8, groups=24),
-            17,
-        ),
-        (
-            "longtail_256_a12",
-            long_tail_values(256, tail_start=96, active=12, groups=24),
-            24,
-        ),
-        (
-            "dense_tail_hot17",
-            values_from_active([17, 16, 8, 4] + [1] * 20, groups=24),
-            17,
-        ),
-        (
-            "dense_tail_hot64",
-            values_from_active([64, 32, 16, 8] + [4] * 20, groups=24),
-            17,
-        ),
-        (
-            "dense_tail_hot128",
-            values_from_active([128, 64, 32, 16] + [4] * 20, groups=24),
-            24,
-        ),
-        (
-            "dense_tail_hot256",
-            values_from_active([256, 128, 64, 32] + [8] * 20, groups=24),
-            32,
-        ),
-    ]
-    for shape_name, n, k, max_m in group24_shapes:
-        for dist_name, masked_m_values, expected_m in group24_distributions:
-            rows.append(
-                _masked_skew_benchmark_case(
-                    f"{shape_name}_{dist_name}",
-                    masked_m_values,
-                    expected_m=expected_m,
-                    n=n,
-                    k=k,
-                    max_m=max_m,
-                    b_gran_k=32,
-                )
-            )
-
-    # DSV4 EP 真实业务 shape mirror：m=256 + expected_m∈{1,2,3} + max_hint=None
-    # （caller 没传 hint，business dispatch_output 不携带 max_hint/active_hint）。
-    # 三组 shape：gateup(g24, n=6144, k=7168) / down(g24, n=7168, k=3072)
-    # 业务比例：expected_m=2 占 71%, expected_m=3 占 18%, expected_m=1 占 11%。
-    # 物理 m=256 但 caller 不知道每个 group 的真实 masked_m，masked_m_values 设
-    # expected_m * groups 模拟 uniform 分布，用 pass_hints=False 让 host 走没有
-    # hint 的 small-m candidate + simple_sched 路径。
-    business_shapes = [
-        ("biz_gateup_g24_m256_n6144_k7168", 6144, 7168, 256),
-        ("biz_down_g24_m256_n7168_k3072", 7168, 3072, 256),
-    ]
-    business_distributions = [
-        ("expected_m_1", values_from_repeated(1, active=24, groups=24), 1),
-        ("expected_m_2", values_from_repeated(2, active=24, groups=24), 2),
-        ("expected_m_3", values_from_repeated(3, active=24, groups=24), 3),
-    ]
-    for shape_name, n, k, max_m in business_shapes:
-        for dist_name, masked_m_values, expected_m in business_distributions:
-            rows.append(
-                _masked_skew_benchmark_case(
-                    f"{shape_name}_{dist_name}",
-                    masked_m_values,
-                    expected_m=expected_m,
-                    n=n,
-                    k=k,
-                    max_m=max_m,
-                    b_gran_k=32,
-                    pass_hints=False,
-                )
-            )
+    for name, masked_m, expected_m, n, k, max_m, b_gran_k in cases:
+        row = _masked_skew_benchmark_case(
+            name,
+            masked_m,
+            expected_m=expected_m,
+            n=n,
+            k=k,
+            max_m=max_m,
+            b_gran_k=b_gran_k,
+        )
+        assert row["w4_diff"] < 0.015
+        assert row["fp8_diff"] < 0.05
+        rows.append(row)
     _print_skew_table(rows)
-
-    # print("\nworst W4/FP8 speedup cases")
-    # _print_skew_table(sorted(rows, key=lambda row: float(row["speedup"]))[:12])
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SM90 FP8xFP4 accuracy and benchmark cases")
-    parser.add_argument(
-        "--case",
-        choices=("masked", "masked-skew", "masked-direct-fp32-scale", "contiguous"),
-        default="masked",
-        help="Benchmark case to run",
-    )
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = _parse_args()
-    start_time = time.time()
-    if args.case == "contiguous":
-        test_sm90_fp8_fp4_contiguous()
-    elif args.case == "masked-skew":
-        test_sm90_fp8_fp4_masked_skew_cases()
-    elif args.case == "masked-direct-fp32-scale":
-        test_sm90_fp8_fp4_masked_direct_fp32_scale()
-    else:
-        test_sm90_fp8_fp4_masked()
-    print(f"done in {time.time() - start_time:.2f}s")

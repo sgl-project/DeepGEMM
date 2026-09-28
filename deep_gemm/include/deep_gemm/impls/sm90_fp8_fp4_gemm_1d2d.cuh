@@ -43,8 +43,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename epilogue_type_t,
-          bool kDecodeStub = false>
+          typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -381,7 +380,7 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
-            
+
             // Pick threads whose WGMMA results are to be stored in shared memory
             DG_STATIC_ASSERT(BLOCK_M >= 64 or kNumMathThreads == 128, "Only one math warp group for `BLOCK_M < 64`");
             constexpr uint32_t kNumWGMMAStoreThreads = WAVE_BLOCK_M * (128 / WGMMA::M);
@@ -422,44 +421,44 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                                      "Packed K must be multiple of 16-byte vector width");
                     DG_STATIC_ASSERT(BLOCK_K == 128,
                                      "Swizzle assumes BLOCK_K == 128 so 32B store stays in-range");
-                    if constexpr (not kDecodeStub) {
-                        for (uint32_t idx = threadIdx.x; idx < kNumVecs; idx += kNumMathThreads) {
-                            const uint32_t tile_n = idx / kVecsPerRow;
-                            const uint32_t vec_k  = idx % kVecsPerRow;
-                            const uint32_t tile_k = vec_k * (kVecPackedBytes * 2);  // 32-byte step in K
-                            const uint4 packed16 = *reinterpret_cast<const uint4*>(
-                                smem_b_packed_bytes + tile_n * BLOCK_K_PACKED + vec_k * kVecPackedBytes);
-                            uint64_t decoded[4] = {0, 0, 0, 0};
-                            auto decode_u32 = [&](uint32_t packed_word, uint64_t& out) {
-                                #pragma unroll
-                                for (uint32_t b = 0; b < 4; ++ b) {
-                                    const uint32_t pair = fp4_pair_to_e4m3_pair((packed_word >> (b * 8)) & 0xffu);
-                                    out |= static_cast<uint64_t>(pair) << (b * 16);
-                                }
-                            };
-                            decode_u32(packed16.x, decoded[0]);
-                            decode_u32(packed16.y, decoded[1]);
-                            decode_u32(packed16.z, decoded[2]);
-                            decode_u32(packed16.w, decoded[3]);
-                            const uint32_t n_group = tile_n / 8;
-                            const uint32_t n_in_group = tile_n % 8;
-                            const uint32_t row_base = n_group * 8 * BLOCK_K + n_in_group * BLOCK_K;
-                            // Each segment writes 16 bytes (= 2 u64). Use a
-                            // single st.shared.v2.u64 instead of two
-                            // st.shared.u64, halving the store instruction
-                            // count for the decoded B tile.
-                            {
-                                const uint32_t swizzled_k = tile_k ^ (n_in_group * 16);
-                                ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
-                                                      decoded[0], decoded[1]);
+                    for (uint32_t idx = threadIdx.x; idx < kNumVecs; idx += kNumMathThreads) {
+                        const uint32_t tile_n = idx / kVecsPerRow;
+                        const uint32_t vec_k  = idx % kVecsPerRow;
+                        const uint32_t tile_k = vec_k * (kVecPackedBytes * 2);  // 32-byte step in K
+                        const uint4 packed16 = *reinterpret_cast<const uint4*>(
+                            smem_b_packed_bytes + tile_n * BLOCK_K_PACKED + vec_k * kVecPackedBytes);
+                        uint64_t decoded[4] = {0, 0, 0, 0};
+                        auto decode_u32 = [&](uint32_t packed_word, uint64_t& out) {
+                            #pragma unroll
+                            for (uint32_t b = 0; b < 4; ++ b) {
+                                const uint32_t pair = fp4_pair_to_e4m3_pair((packed_word >> (b * 8)) & 0xffu);
+                                out |= static_cast<uint64_t>(pair) << (b * 16);
                             }
-                            {
-                                const uint32_t swizzled_k = (tile_k + 16) ^ (n_in_group * 16);
-                                ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
-                                                      decoded[2], decoded[3]);
-                            }
+                        };
+                        decode_u32(packed16.x, decoded[0]);
+                        decode_u32(packed16.y, decoded[1]);
+                        decode_u32(packed16.z, decoded[2]);
+                        decode_u32(packed16.w, decoded[3]);
+                        const uint32_t n_group = tile_n / 8;
+                        const uint32_t n_in_group = tile_n % 8;
+                        const uint32_t row_base = n_group * 8 * BLOCK_K + n_in_group * BLOCK_K;
+                        // Each segment writes 16 bytes (= 2 u64). Use a
+                        // single st.shared.v2.u64 instead of two
+                        // st.shared.u64, halving the store instruction
+                        // count for the decoded B tile.
+                        {
+                            const uint32_t swizzled_k = tile_k ^ (n_in_group * 16);
+                            ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
+                                                  decoded[0], decoded[1]);
+                        }
+                        {
+                            const uint32_t swizzled_k = (tile_k + 16) ^ (n_in_group * 16);
+                            ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
+                                                  decoded[2], decoded[3]);
                         }
                     }
+
+
                 };
 
 
