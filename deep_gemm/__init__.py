@@ -40,6 +40,9 @@ try:
         m_grouped_fp8_fp4_gemm_nt_contiguous,
         m_grouped_fp8_fp4_gemm_nn_contiguous,
         m_grouped_fp8_fp4_gemm_nt_masked,
+        fp8_fp4_gemm_nt_sm90_fused_wgmma,
+        m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma,
+        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma,
         # FP8 GEMMs
         fp8_gemm_nt, fp8_gemm_nn,
         fp8_gemm_tn, fp8_gemm_tt,
