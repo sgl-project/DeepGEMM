@@ -363,12 +363,15 @@ def test_paged_mqa_logits():
                         for block_kv in ((128, 32, 64, ) if arch_major == 10 else (64, )):
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                    for next_n in ((1, ) if is_varlen else ((1, 2, 3, 6) if arch_major == 10 else (1, 2))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
                                             head_dims = (64, 128) if is_mxfp4 else ((32, 64, 128) if arch_major == 10 else (128, ))
                                             for num_heads in heads:
                                                 for head_dim in head_dims:
+                                                    # next_n 2 / 3 cover the per-next_n token Q tile (FP8, H32, D128)
+                                                    if arch_major == 10 and next_n in (2, 3) and (fmt, num_heads, head_dim) != ('fp8', 32, 128):
+                                                        continue
                                                     for avg_kv in (8192, 65536):
                                                         if batch_size * avg_kv > max_kv_pool_tokens:
                                                             continue
@@ -563,8 +566,10 @@ def test_paged_mqa_logits_histogram():
     cases = [(False, 1, 'mixed'), (True, 1, 'mixed'), (True, 1, 'fine'), (True, 1, 'unit')]
     cases += [(False, next_n, weights) for next_n in (2, 3, 4) for weights in ('mixed', 'fine', 'unit')]
     for is_varlen, next_n, score_scale in cases:
-        for batch_size in (1, 4, 16, 64, 128):
+        for num_requests in (1, 4, 16, 64, 128):
             for avg_kv in (4096, 32768, 262144, 1048576):
+                # The varlen branch below rebinds batch_size to the row count, so reset it every case
+                batch_size = num_requests
                 if batch_size * avg_kv > max_kv_pool_tokens:
                     continue
                 seq_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv) + 1, (batch_size, ), device='cuda', dtype=torch.int)
