@@ -35,10 +35,11 @@ public:
         const bool specialize_n = args.gemm_desc.gemm_type == GemmType::Normal &&
             args.gemm_desc.compiled_dims.empty() && args.gemm_config.layout.block_m == 128 &&
             args.gemm_config.layout.block_n > 128 && args.gemm_config.layout.get_cluster_size() == 1;
-        // Block32 scale addressing benefits from fixed weight dimensions.
-        // M remains dynamic, so one specialization serves decode and prefill.
-        const auto compiled_dims = args.sf_granularity == 32 and args.gemm_desc.compiled_dims.empty() ?
-            std::string("nk") : args.gemm_desc.compiled_dims;
+        // Specialize fixed N/K to simplify scale indexing.
+        // Keep M dynamic to avoid specialization for each token count.
+        auto compiled_dims = args.gemm_desc.compiled_dims;
+        if (args.sf_granularity == 32 and compiled_dims.empty())
+            compiled_dims = "nk";
         const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 

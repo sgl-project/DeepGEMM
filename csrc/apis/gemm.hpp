@@ -195,7 +195,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (arch_major == 9 or arch_major == 10) {
         // SM90/SM100 share the "transform scaling factors, then dispatch" flow.
         const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast, std::nullopt, true);
+            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
         if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
             DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
@@ -321,6 +321,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
@@ -395,6 +396,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
