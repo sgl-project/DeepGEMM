@@ -11,6 +11,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/epilogue/clean_logits.cuh>
+#include <deep_gemm/epilogue/coarse_histogram.cuh>
 #include <deep_gemm/layout/mqa_logits.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -86,7 +87,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128, typename Histogram = epilogue::NoHistogram>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
@@ -94,7 +95,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                const cute::TmaDescriptor& tensor_map_kv,
                                                const cute::TmaDescriptor& tensor_map_sf_kv,
                                                const cute::TmaDescriptor& tensor_map_weights,
-                                               const MakeScheduler& make_scheduler) {
+                                               const MakeScheduler& make_scheduler, Histogram histogram = {}) {
     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
 
     // For spilling cleaner/non-power-of-two families, keep contiguous CTA-ID reads
@@ -418,6 +419,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         const auto local_math_warp_idx = get_mqa_math_warp_idx<kPagedWideLoad>(warp_idx);
         const auto math_warpgroup_idx = local_math_warp_idx / 4;
         const auto math_thread_idx = local_math_warp_idx * 32 + lane_idx;
+        if constexpr (Histogram::kEnabled)
+            histogram.initialize(reinterpret_cast<int*>(smem_buffer + sizeof(SharedStorage)), math_thread_idx);
         DG_STATIC_ASSERT(kNumMathWarpGroups <= kNumTmemStages, "Math warp groups exceed TMEM stages");
         tmem_pipeline.advance(math_warpgroup_idx);
 
@@ -438,6 +441,9 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
             CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
             smem.full_q_barriers[q_stage_idx].wait(q_phase);
+
+            if constexpr (Histogram::kEnabled and Histogram::kNumSlots > 1)
+                histogram.prepare(scheduler.get_logits_row(q_block_idx, 0));
 
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
@@ -490,13 +496,17 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         smem.empty_kv_barriers[kv_stage_idx].arrive();
                     }
 
+                    // Histogram work waits until every token of the split has left TMEM
+                    float histogram_scores[Histogram::kEnabled ? kNumValidTokens : 1];
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
                         uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
                         if constexpr (kNumHeads == 8) {
                             ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
                             cutlass::arch::fence_view_async_tmem_load();
-                        } else if constexpr (kNumHeads == 16) {
+                        } else if constexpr (kNumHeads == 16 or
+                                             (Histogram::kEnabled and Histogram::kNumSlots > 1 and kNumHeads == 32)) {
+                            // Both disjoint TMEM loads complete at the following wait; keep them in flight together.
                             ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
                             ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + kNumHeads / 2,
                                                                   reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
@@ -560,6 +570,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             reduced = (sum.x + sum.y) / 2;
                         }
                         auto result = static_cast<logits_dtype_t>(kIsMXSF ? reduced : reduced * scale_kv);
+                        if constexpr (Histogram::kEnabled)
+                            histogram_scores[i] = static_cast<float>(result);
                         const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
                         if constexpr (kIsCompressedLogits) {
                             const uint32_t rel_kv = kv_offset - seq_k_start[i];
@@ -574,10 +586,21 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             logits[q_offset + kv_offset] = result;
                         }
                     }
+                    if constexpr (Histogram::kEnabled) {
+                        if constexpr (Histogram::kNumSlots > 1 and kNumValidTokens == Histogram::kNumSlots) {
+                            histogram.observe_split(kv_offset, histogram_scores);
+                        } else {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                                histogram.observe(scheduler.get_logits_row(q_block_idx, i), kv_offset, histogram_scores[i], i);
+                        }
+                    }
                 }
             };
 
-            if constexpr (decltype(scheduler)::kHasPartialBlock)
+            if constexpr (Histogram::kEnabled and Histogram::kNumSlots > 1)
+                process_q_block(cute::Int<Histogram::kNumSlots>{});  // verify: every Q block holds exactly next_n tokens
+            else if constexpr (decltype(scheduler)::kHasPartialBlock)
                 dispatch_num_block_tokens<BLOCK_Q>(scheduler.get_num_block_tokens(q_block_idx), process_q_block);
             else
                 process_q_block(cute::Int<BLOCK_Q>{});
@@ -590,6 +613,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (get_mqa_math_warp_idx<kPagedWideLoad>(warp_idx) == 0)
             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+        if constexpr (Histogram::kEnabled)
+            histogram.finish();
     }
 }
 
@@ -681,7 +706,7 @@ template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
-          typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t = float,
+          typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t = float, bool kWithHistogram = false,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
@@ -693,8 +718,18 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
-    static constexpr uint32_t BLOCK_Q = 128 / kNumHeads;
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights,
+                            int* histogram) {
+    // Q tile: a regular (non-varlen) request's next_n tokens always form one Q block of exactly next_n tokens, so a
+    // next_n < 128 / H FP8 call sizes the tile (Q TMA box, UMMA_N = next_n * H, TMEM stages, weights) to next_n instead
+    // of computing 128 / H - next_n empty tokens. Must match `use_token_q_tile` on the host.
+    static constexpr uint32_t kNativeBlockQ = 128 / kNumHeads;
+    static constexpr bool kTokenQTile = not kIsVarlen and not kIsMXSF and cute::is_same_v<qk_dtype_t, cutlass::float_e4m3_t> and
+                                        cute::is_same_v<reduce_dtype_t, float> and kNumHeads == 32 and kHeadDim == 128 and
+                                        kTokensPerRequest < kNativeBlockQ;
+    static constexpr uint32_t BLOCK_Q = kTokenQTile ? kTokensPerRequest : kNativeBlockQ;
+    DG_STATIC_ASSERT(not kTokenQTile or ((BLOCK_Q * kNumHeads) % 16 == 0 and BLOCK_Q * kNumHeads <= 256 and
+                                         (BLOCK_Q * kNumHeads * sizeof(reduce_dtype_t)) % 128 == 0), "Invalid token Q tile");
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
 
@@ -705,15 +740,26 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
             block_table, block_table_stride, num_q_tokens_total);
     };
 
+    DG_STATIC_ASSERT(not kWithHistogram or (not kIsMXSF and (kIsVarlen ? kTokensPerRequest == 1 : kTokensPerRequest <= kNativeBlockQ) and
+                     kNumHeads == 32 and kHeadDim == 128 and
+                     cute::is_same_v<logits_dtype_t, float>), "Histogram variant needs FP8 Q1/H32/D128 and FP32 logits");
+    // Without indices a request's next_n tokens share one Q block: each token counts into its own slot
+    using Histogram = cute::conditional_t<kWithHistogram,
+                                          epilogue::CoarseHistogram<1024, kNumMathThreads, kIsVarlen ? 1 : kTokensPerRequest>,
+                                          epilogue::NoHistogram>;
+    Histogram emit{};
+    if constexpr (kWithHistogram)
+        emit = {histogram, context_lens, logits_stride, schedule_meta, num_q_tokens_total};
+
     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false,
                                BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, 0,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
-                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
+                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups, Histogram>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
-        make_scheduler);
+        make_scheduler, emit);
 }
 
 } // namespace deep_gemm

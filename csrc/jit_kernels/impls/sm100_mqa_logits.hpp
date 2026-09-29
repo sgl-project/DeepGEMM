@@ -144,6 +144,15 @@ static int get_mqa_logits_smem_size(const int& num_heads, const int& head_dim,
     return static_cast<int>(math::align(num_smem_bytes, swizzle_alignment));
 }
 
+// Paged token Q tile: a regular (non-varlen) request's next_n tokens always form one Q block, so next_n < 128 / H
+// uses BLOCK_Q = next_n (UMMA_N = next_n * H). Must match `kTokenQTile` in `sm100_paged_mqa_logits`.
+static bool use_token_q_tile(const int& tokens_per_request, const int& num_heads, const int& head_dim,
+                             const bool& is_varlen, const bool& is_mx_sf,
+                             const at::ScalarType& qk_dtype, const at::ScalarType& weights_dtype) {
+    return not is_varlen and not is_mx_sf and qk_dtype == torch::kFloat8_e4m3fn and weights_dtype == torch::kFloat and
+           num_heads == 32 and head_dim == 128 and tokens_per_request < 128 / num_heads;
+}
+
 // Unified contiguous-KV runtime for FP8 / MXFP4 / MXFP8; FP8 reuses the unused `sf_q` descriptor slot
 static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::Tensor>& sf_q,
                              const torch::Tensor& kv, const torch::Tensor& sf_kv,
@@ -314,18 +323,24 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                    const int& split_kv,
                                    const int& splits_per_chunk,
                                    const bool& is_mx_sf,
-                                   const at::ScalarType& qk_dtype) {
+                                   const at::ScalarType& qk_dtype,
+                                   int* histogram = nullptr) {
     const bool is_fp4 = qk_dtype == kPackedFP4;
 
     const int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
     DG_HOST_ASSERT(split_kv == 256 and logits_stride % split_kv == 0);
 
-    const int num_q_stages = 3;
+    // The histogram keeps one 1024-bin slot per token of a verify Q block; 4 slots need the Q ring cut to 2 stages
+    const int num_histogram_slots = histogram == nullptr ? 0 : (is_varlen ? 1 : tokens_per_request);
+    const int num_q_stages = num_histogram_slots > 3 ? 2 : 3;
     // Match contiguous-KV pipeline depth.
     const int num_kv_stages = is_fp4 ? 10 : 5;
     DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
-    const int block_q = 128 / num_heads;
+    // BLOCK_Q = 128 / num_heads; a Q-block holds up to BLOCK_Q request tokens, or exactly next_n with the token Q tile
+    const bool token_q_tile = use_token_q_tile(tokens_per_request, num_heads, head_dim, is_varlen, is_mx_sf, qk_dtype,
+                                               weights.scalar_type());
+    const int block_q = token_q_tile ? tokens_per_request : 128 / num_heads;
 
     // MX SF formats consume `sf_q`; FP8 fills that descriptor slot with KV scales
     CUtensorMap tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv;
@@ -365,7 +380,9 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
     const int smem_size = get_mqa_logits_smem_size(
         num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(),
         block_q, split_kv, num_q_stages, num_kv_stages, 3);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    // The histogram variant appends its 1024 int32 bins per slot after the shared storage
+    const int launch_smem_size = smem_size + num_histogram_slots * 1024 * static_cast<int>(sizeof(int));
+    DG_HOST_ASSERT(launch_smem_size <= SM100ArchSpec::smem_capacity);
 
     // Compile
     const auto kernel = jit->compile("sm100_paged_mqa_logits", std::format(R"(
@@ -385,7 +402,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}, {}, {}
+        {}, {}, {}{}
     >);
 }};
 )",
@@ -403,12 +420,13 @@ static void __instantiate_kernel() {{
     num_specialized_threads, num_math_threads,
     qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
     to_string(logits_dtype),
-    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
+    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+    histogram != nullptr ? ", true" : ""));
 
     // Launch
     jit->launch(
         kernel, {
-            .num_smem_bytes = smem_size,
+            .num_smem_bytes = launch_smem_size,
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
         },
@@ -418,7 +436,7 @@ static void __instantiate_kernel() {{
         block_table.data_ptr<int>(), is_varlen ? indices.data_ptr<int>() : nullptr, schedule_meta.data_ptr<int>(),
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,
-        tensor_map_weights
+        tensor_map_weights, histogram
     );
 }
 
