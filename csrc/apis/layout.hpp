@@ -35,11 +35,11 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
     // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and (gran_k == 128 or gran_k == 32) and (arch_major == 9 or disable_ue8m0_cast))
         return get_mn_major_tma_aligned_tensor(sf);
 
     // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    if (sf.scalar_type() == torch::kFloat and ((gran_mn == 128 and gran_k == 128) or (gran_mn == 32 and gran_k == 32)) and (arch_major == 9 or disable_ue8m0_cast))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, x, gran_k) on SM100/SM120: transform to (INT, 1, gran_k), TMA-aligned and MN-major
@@ -67,7 +67,8 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
         const std::optional<int>& num_groups_b,
         const bool& disable_ue8m0_cast = false,
         // PSUM layout only applies to SFA (B is weights with no gaps)
-        const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+        const std::optional<torch::Tensor>& psum_layout = std::nullopt,
+        const bool allow_sm90_block32 = false) {
     // Use default recipe, if none is specified
     if (not recipe_a.has_value() and not recipe.has_value())
         recipe = get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
@@ -75,6 +76,11 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
     // Must be either 'recipe' or the 'recipe_a' + 'recipe_b' pair.
     DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value());
     DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
+
+    if (jit->device.get_arch_major() == 9 and not allow_sm90_block32) {
+        DG_HOST_ASSERT((recipe.has_value() ? std::get<2>(*recipe) : std::get<1>(*recipe_a)) == 128);
+        DG_HOST_ASSERT((recipe.has_value() ? std::get<2>(*recipe) : std::get<1>(*recipe_b)) == 128);
+    }
 
     // Transform SFA and SFB layout (PSUM only for SFA)
     const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast, psum_layout)

@@ -14,8 +14,11 @@ namespace deep_gemm {
 
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
+    static constexpr int block32_short_k = 8 * 128;
+    static constexpr int block32_small_m_k = 2 * block32_short_k;
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+        const bool block32 = desc.kernel_type == KernelType::Kernel1D2D and desc.max_gran_k == 32;
         // Block M candidates
         std::vector<int> block_m_candidates;
         if (desc.gemm_type == GemmType::Normal or
@@ -24,8 +27,8 @@ struct SM90ArchSpec {
             // TODO: check 256's performance
             block_m_candidates = {64, 128};
             // NOTES: smaller block M can avoid TMA L2 OOB bound
-            if (desc.m <= 16) block_m_candidates.push_back(16);
-            if (desc.m <= 32) block_m_candidates.push_back(32);
+            if (desc.m <= 16 and (not block32 or desc.k <= block32_small_m_k)) block_m_candidates.push_back(16);
+            if (desc.m <= 32 and (not block32 or desc.k <= block32_small_m_k)) block_m_candidates.push_back(32);
 
             // BF16 output GEMM supports 256
             if (desc.cd_dtype != torch::kFloat)
@@ -39,7 +42,7 @@ struct SM90ArchSpec {
 
         // Block N candidates
         std::vector<int> block_n_candidates;
-        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
+        int step = std::lcm(block32 ? 32 : 16, heuristics_runtime->get_block_n_multiple_of());
         int start = step;
         // Avoid bank conflicts for 1D1D kernel FP32 output
         if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
@@ -51,7 +54,7 @@ struct SM90ArchSpec {
         // Register spills
         int end = 256;
         if (desc.kernel_type == KernelType::Kernel1D2D)
-            end = 192;
+            end = block32 ? 128 : 192;
         if (desc.kernel_type == KernelType::Kernel1D1D)
             end = 160;
         // Enumerate
@@ -66,7 +69,7 @@ struct SM90ArchSpec {
             // The number of k-groups is large (a heuristic)
             (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
             // Not supported
-            (desc.gemm_type == GemmType::Batched);
+            (desc.gemm_type == GemmType::Batched) or block32;
 
         // Enumerate all candidates
         std::vector<Layout> candidates;
@@ -82,6 +85,10 @@ struct SM90ArchSpec {
 
                 for (int block_m: block_m_candidates) {
                     for (int block_n: block_n_candidates) {
+                        // Long K favors overlapping wide single-wave tiles; short K can
+                        // amortize B loads across two M waves without spilling.
+                        if (block32 and block_m > (desc.k <= block32_short_k ? 256 : 128))
+                            continue;
                         // 1D2D kernel unroll requirement
                         if (desc.kernel_type == KernelType::Kernel1D2D and block_n > block_k and (block_n % (block_n - block_k) != 0 and block_k % (block_n - block_k) != 0))
                             continue;
@@ -162,15 +169,16 @@ struct SM90ArchSpec {
         const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
 
         // Calculate SF A/B per stages
+        const bool block32 = desc.kernel_type == KernelType::Kernel1D2D and desc.max_gran_k == 32;
         const int smem_sfa_per_stage = desc.kernel_type == KernelType::KernelNoSF ?
-            0 : align(layout.block_m * static_cast<int>(sizeof(float)), 128);
+            0 : align(layout.block_m * (block32 ? 4 : 1) * static_cast<int>(sizeof(float)), 128);
         const int smem_sfb_per_stage = desc.kernel_type != KernelType::Kernel1D1D ?
             0 : align(layout.block_n * static_cast<int>(sizeof(float)), 128);
 
         // Extra SFB sizes for 1D2D kernels
         const int use_uniform_sfb = layout.block_k % layout.block_n == 0 ? 1 : 2;
         const int smem_extra_sfb = desc.kernel_type != KernelType::Kernel1D2D ?
-            0 : align<int>(ceil_div(desc.k, layout.block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
+            0 : align<int>(ceil_div(desc.k, block32 ? 32 : layout.block_k) * static_cast<int>(sizeof(float)) * (block32 ? layout.block_n / 32 : use_uniform_sfb), 8);
 
         // Extra tensormap for 1D1D kernels
         const int smem_tensormap =

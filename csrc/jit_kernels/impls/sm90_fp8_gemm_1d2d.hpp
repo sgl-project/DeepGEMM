@@ -27,6 +27,7 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
         CUtensorMap tensor_map_sfa;
+        int sf_granularity = 128;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -34,6 +35,10 @@ public:
         const bool specialize_n = args.gemm_desc.gemm_type == GemmType::Normal &&
             args.gemm_desc.compiled_dims.empty() && args.gemm_config.layout.block_m == 128 &&
             args.gemm_config.layout.block_n > 128 && args.gemm_config.layout.get_cluster_size() == 1;
+        // Block32 scale addressing benefits from fixed weight dimensions.
+        // M remains dynamic, so one specialization serves decode and prefill.
+        const auto compiled_dims = args.sf_granularity == 32 and args.gemm_desc.compiled_dims.empty() ?
+            std::string("nk") : args.gemm_desc.compiled_dims;
         const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
@@ -51,14 +56,14 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}
+        {}, {}
     >);
 }};
 )",
         to_string(args.major_sfb),
-        get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
-        get_compiled_dim(args.gemm_desc.n, 'n', specialize_n ? "n" : args.gemm_desc.compiled_dims),
-        get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
+        get_compiled_dim(args.gemm_desc.m, 'm', compiled_dims),
+        get_compiled_dim(args.gemm_desc.n, 'n', specialize_n ? "n" : compiled_dims),
+        get_compiled_dim(args.gemm_desc.k, 'k', compiled_dims),
         args.gemm_desc.num_groups,
         args.gemm_config.layout.block_m, args.gemm_config.layout.block_n, args.gemm_config.layout.block_k,
         args.gemm_config.storage_config.swizzle_a_mode, args.gemm_config.storage_config.swizzle_b_mode, args.gemm_config.storage_config.swizzle_cd_mode,
@@ -67,7 +72,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         to_string(args.gemm_desc.cd_dtype),
-        get_default_epilogue_type(args.epilogue_type)));
+        get_default_epilogue_type(args.epilogue_type), args.sf_granularity));
 
         // Launch
         jit->launch(
@@ -87,8 +92,11 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
-                               const std::optional<std::string>& epilogue_type = std::nullopt) {
+                               const std::optional<std::string>& epilogue_type = std::nullopt,
+                               const int sf_granularity = 128) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(sf_granularity == 128 or sf_granularity == 32);
+    DG_HOST_ASSERT(sf_granularity != 32 or (n % 8 == 0 and k % 32 == 0));
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto desc = GemmDesc {
@@ -101,7 +109,8 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .with_accumulation = c.has_value(),
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .max_gran_k = sf_granularity
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
@@ -124,7 +133,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                static_cast<int>(d.stride(-2)), 1,
                                                config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, config.layout.block_k, 1, 0);
+                                                 config.layout.block_m, sf_granularity, 1, 0, 0, false, config.layout.block_k / sf_granularity);
 
     // Compile and launch
     SM90FP8Gemm1D2DRuntime::compile_and_launch("sm90_fp8_gemm_1d2d", {
@@ -144,6 +153,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
+        .sf_granularity = sf_granularity,
     });
 }
 

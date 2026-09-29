@@ -195,16 +195,18 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (arch_major == 9 or arch_major == 10) {
         // SM90/SM100 share the "transform scaling factors, then dispatch" flow.
         const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast, std::nullopt, true);
 
         if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
             DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
             const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+            DG_HOST_ASSERT(gran_k_a == gran_k_b);
+            DG_HOST_ASSERT((gran_n == 32 and gran_k_a == 32) or (gran_k_a == 128 and (gran_n == 1 or gran_n == 128)));
             if (gran_n == 1) {
                 sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
             } else {
                 const auto major_sfb = get_major_type_ab(sfb);
-                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, std::nullopt, gran_k_a);
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
             sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
