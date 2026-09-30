@@ -199,7 +199,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
         if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
             DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+            // SM90 kernels read one activation scale per row.
+            const int gran_m = recipe.has_value() ? std::get<0>(recipe.value()) : std::get<0>(recipe_a.value());
             const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+            DG_HOST_ASSERT(gran_m == 1);
             DG_HOST_ASSERT(gran_k_a == gran_k_b);
             DG_HOST_ASSERT((gran_n == 32 and gran_k_a == 32) or (gran_k_a == 128 and (gran_n == 1 or gran_n == 128)));
             if (gran_n == 1) {
