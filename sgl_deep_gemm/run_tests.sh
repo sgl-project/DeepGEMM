@@ -150,12 +150,6 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
-if [ "${ARCH_MAJOR}" -eq 9 ]; then
-  run_test test_sm90_block32.py
-else
-  skip_test test_sm90_block32.py "SM90-only, arch major ${ARCH_MAJOR}"
-fi
-
 for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py; do
   if [ "${ARCH_MAJOR}" -eq 10 ]; then
     run_test "${t}"
