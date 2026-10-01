@@ -64,6 +64,7 @@ static std::string to_string(const GemmType& type) {
 static std::string to_string(const at::ScalarType& dtype, const bool& fp4_unpacked_smem = true) {
     switch (dtype) {
         case torch::kInt:           return "int";
+        case torch::kByte:          return "uint8_t";
         case torch::kFloat:         return "float";
         case torch::kBFloat16:      return "cutlass::bfloat16_t";
         case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
