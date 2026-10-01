@@ -199,12 +199,17 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
         if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
             DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+            // SM90 kernels read one activation scale per row.
+            const int gran_m = recipe.has_value() ? std::get<0>(recipe.value()) : std::get<0>(recipe_a.value());
             const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+            DG_HOST_ASSERT(gran_m == 1);
+            DG_HOST_ASSERT(gran_k_a == gran_k_b);
+            DG_HOST_ASSERT((gran_n == 32 and gran_k_a == 32) or (gran_k_a == 128 and (gran_n == 1 or gran_n == 128)));
             if (gran_n == 1) {
                 sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
             } else {
                 const auto major_sfb = get_major_type_ab(sfb);
-                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, std::nullopt, gran_k_a);
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
             sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
@@ -319,6 +324,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
@@ -393,6 +399,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);

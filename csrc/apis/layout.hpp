@@ -34,12 +34,12 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
-    // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // FP32 per-token scales on SM90: transform to TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and (gran_k == 128 or gran_k == 32) and (arch_major == 9 or disable_ue8m0_cast))
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // FP32 block scales on SM90: no need to transform, check SFB requirements
+    if (sf.scalar_type() == torch::kFloat and ((gran_mn == 128 and gran_k == 128) or (gran_mn == 32 and gran_k == 32)) and (arch_major == 9 or disable_ue8m0_cast))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, x, gran_k) on SM100/SM120: transform to (INT, 1, gran_k), TMA-aligned and MN-major
