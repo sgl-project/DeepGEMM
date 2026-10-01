@@ -363,12 +363,15 @@ def test_paged_mqa_logits():
                         for block_kv in ((128, 32, 64, ) if arch_major == 10 else (64, )):
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                    for next_n in ((1, ) if is_varlen else ((1, 2, 3, 6) if arch_major == 10 else (1, 2))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
                                             head_dims = (64, 128) if is_mxfp4 else ((32, 64, 128) if arch_major == 10 else (128, ))
                                             for num_heads in heads:
                                                 for head_dim in head_dims:
+                                                    # next_n 2 / 3 cover the per-next_n token Q tile (FP8, H32, D128)
+                                                    if arch_major == 10 and next_n in (2, 3) and (fmt, num_heads, head_dim) != ('fp8', 32, 128):
+                                                        continue
                                                     for avg_kv in (8192, 65536):
                                                         if batch_size * avg_kv > max_kv_pool_tokens:
                                                             continue
@@ -533,6 +536,101 @@ def test_paged_mqa_logits():
         if is_varlen:
             del tokens_per_seq, indices, offsets_within_seq
         torch.cuda.empty_cache()
+    print()
+
+
+def ref_coarse_histogram(logits: torch.Tensor, context_lens: torch.Tensor) -> torch.Tensor:
+    # 1024 bins per row over live, non-NaN FP32 scores: FP16-RN (exponent, 4 mantissa bits) below |x| = 16,
+    # unit bins from 16 to 223 (lower-inclusive for negatives), descending score order (bin 0 holds the largest)
+    hist = torch.zeros((logits.size(0), 1024), dtype=torch.int32, device=logits.device)
+    for row, n in enumerate(context_lens.view(-1).tolist()):
+        x = logits[row, :n].float()
+        x = x[~torch.isnan(x)]
+        bits = x.view(torch.int32).to(torch.int64) & 0xffffffff
+        magnitude = bits & 0x7fffffff
+        negative = ((bits >> 31) != 0) & (magnitude != 0)
+        code = (x.to(torch.float16).view(torch.int16).to(torch.int64) & 0x7fff) >> 6
+        bounded = torch.clamp(magnitude - negative.to(torch.int64), max=0x435f0000).to(torch.int32).view(torch.float32)
+        code = torch.where(code >= 304, torch.clamp(torch.floor(bounded).to(torch.int64) + 288, min=304), code)
+        hist[row] = torch.bincount(torch.where(negative, 512 + code, 511 - code), minlength=1024).to(torch.int32)
+    return hist
+
+
+@test_filter(lambda: get_arch_major() == 10)
+def test_paged_mqa_logits_histogram():
+    print('Testing FP8 Paged MQA Logits with the optional coarse histogram:')
+    num_heads, head_dim, block_kv, max_kv_pool_tokens = 32, 128, 64, 32 * 1024 * 1024
+    # (varlen, next_n, weights): next_n > 1 is a speculative verify step with per-token lengths; varlen runs group up to 4 tokens
+    # per request. 'mixed' (randn) gives scores on both sides of |x| = 16 within a warp, 'fine' (randn / 64) keeps every score
+    # in the FP16 bins and 'unit' (positive, |randn| + 1) keeps them in the unit-width bins, so each warp-uniform path runs
+    cases = [(False, 1, 'mixed'), (True, 1, 'mixed'), (True, 1, 'fine'), (True, 1, 'unit')]
+    cases += [(False, next_n, weights) for next_n in (2, 3, 4) for weights in ('mixed', 'fine', 'unit')]
+    for is_varlen, next_n, score_scale in cases:
+        for num_requests in (1, 4, 16, 64, 128):
+            for avg_kv in (4096, 32768, 262144, 1048576):
+                # The varlen branch below rebinds batch_size to the row count, so reset it every case
+                batch_size = num_requests
+                if batch_size * avg_kv > max_kv_pool_tokens:
+                    continue
+                seq_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv) + 1, (batch_size, ), device='cuda', dtype=torch.int)
+                # Per-token lengths; the last token of a request has the full length (the scheduler sizes work from it)
+                context_lens = ((seq_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
+                context_lens[:, -1] = seq_lens
+                context_lens = context_lens.contiguous()
+                raw_batch_size, indices = batch_size, None
+                if is_varlen:
+                    # Varlen: runs of 1..4 tokens per request (one row each), causal lengths rising to the request's length
+                    tokens_per_seq = torch.randint(1, 5, (batch_size, ), device='cuda', dtype=torch.int)
+                    indices = torch.arange(batch_size, device='cuda', dtype=torch.int).repeat_interleave(tokens_per_seq)
+                    offsets = torch.cat([torch.arange(n.item(), device='cuda', dtype=torch.int) for n in tokens_per_seq])
+                    context_lens = (seq_lens.repeat_interleave(tokens_per_seq) - tokens_per_seq.repeat_interleave(tokens_per_seq) + 1 + offsets)
+                    context_lens = context_lens.clamp(min=0).view(-1, 1).contiguous()
+                    batch_size = indices.numel()
+                max_model_len = ceil_div(seq_lens.max().item(), 256) * 256
+                num_blocks_per_seq = ceil_div(seq_lens, block_kv)
+                block_table = torch.zeros((raw_batch_size, num_blocks_per_seq.max().item()), device='cuda', dtype=torch.int)
+                block_idx_pool = torch.randperm(num_blocks_per_seq.sum().item(), device='cuda', dtype=torch.int)
+                offset = 0
+                for i, num_blocks in enumerate(num_blocks_per_seq.tolist()):
+                    block_table[i, :num_blocks] = block_idx_pool[offset:offset + num_blocks]
+                    offset += num_blocks
+                if is_varlen:
+                    block_table = block_table.repeat_interleave(tokens_per_seq, dim=0).contiguous()
+
+                # FP8 KV cache with per-token scales, as in `test_paged_mqa_logits`
+                kv = torch.randn((block_idx_pool.numel(), block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16)
+                sf = kv.abs().float().amax(dim=3, keepdim=True).clamp(1e-4) / 448.0
+                kv_fp8 = torch.empty((kv.size(0), block_kv * (head_dim + 4)), device='cuda', dtype=torch.uint8)
+                kv_fp8[:, :block_kv * head_dim] = (kv * (1.0 / sf)).to(torch.float8_e4m3fn).view(kv.size(0), -1).view(torch.uint8)
+                kv_fp8[:, block_kv * head_dim:] = sf.view(kv.size(0), block_kv).view(torch.uint8)
+                kv_fp8 = kv_fp8.view(kv.size(0), block_kv, 1, head_dim + 4)
+                del kv, sf
+                q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+                weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=torch.float)
+                weights = {'mixed': weights, 'fine': weights / 64, 'unit': weights.abs() + 1}[score_scale]
+
+                kwargs = dict(q=(q, None), kv_cache=kv_fp8, weights=weights, context_lens=context_lens, block_table=block_table,
+                              schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv, deep_gemm.get_num_sms(), indices=indices),
+                              max_context_len=max_model_len, clean_logits=False, indices=indices)
+                histogram = torch.zeros((batch_size * next_n, 1024), device='cuda', dtype=torch.int)
+                logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs)
+                hist_logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, histogram=histogram)
+
+                # Scores are unchanged; the histogram counts every live score of its row once and accumulates across calls
+                live = torch.arange(max_model_len, device='cuda')[None, :] < context_lens.view(-1, 1)
+                assert_bitwise_equal(hist_logits.masked_fill(~live, 0), logits.masked_fill(~live, 0), 'histogram variant scores')
+                ref_hist = ref_coarse_histogram(logits, context_lens.view(-1))
+                assert torch.equal(histogram, ref_hist), 'histogram mismatch'
+                deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, histogram=histogram)
+                assert torch.equal(histogram, 2 * ref_hist), 'histogram must accumulate'
+
+                t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs), 'paged_mqa_logits', suppress_kineto_output=True)
+                hist_t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, histogram=histogram),
+                                      'paged_mqa_logits', suppress_kineto_output=True)
+                print(f' > VAR={int(is_varlen)}, NextN={next_n}, {score_scale:5} scores, BSZ={raw_batch_size:4}, rows={batch_size * next_n:4}, L={avg_kv:7}: '
+                      f'{t * 1e6:7.1f} us -> {hist_t * 1e6:7.1f} us with histogram ({(hist_t / t - 1) * 100:+5.1f}%)')
+                del kwargs, logits, hist_logits, kv_fp8, histogram, ref_hist
+                torch.cuda.empty_cache()
     print()
 
 
@@ -813,4 +911,5 @@ if __name__ == '__main__':
     test_gemm_skip_head_mid()
     test_mqa_logits()
     test_paged_mqa_logits()
+    test_paged_mqa_logits_histogram()
     test_sparse_mqa_logits()
