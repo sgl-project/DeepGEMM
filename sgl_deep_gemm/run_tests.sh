@@ -183,6 +183,7 @@ MEGA_MOE_BLACKWELL=(
 )
 MEGA_MOE_HOPPER=(
   test_mega_moe_hopper.py
+  test_mega_moe_hopper_ring.py
   test_mega_moe_pre_dispatch_sm90.py
 )
 MEGA_MOE_ALL=(
@@ -235,6 +236,8 @@ else
   for t in "${MEGA_MOE_BLACKWELL[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "Blackwell-only, arch major ${ARCH_MAJOR}"
   done
+  # Accuracy layers 1-4 first; the benchmark run below only checks the output shape.
+  [ -f "${TESTS_DIR}/test_mega_moe_hopper.py" ] && run_test test_mega_moe_hopper.py --accuracy --layers 1 2 3 4 --num-processes "${NPROC}"
   for t in "${MEGA_MOE_HOPPER[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${NPROC}"
   done
