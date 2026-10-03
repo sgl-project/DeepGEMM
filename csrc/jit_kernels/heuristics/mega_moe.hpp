@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <format>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -112,9 +114,18 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const std::optional<int64_t>& global_num_tokens) {
+    // Experts receive tokens from every rank, so an idle or lightly loaded rank still computes remote load.
+    // Without a caller hint, assume all ranks match the local count.
+    DG_HOST_ASSERT(not global_num_tokens.has_value() or
+                   (*global_num_tokens >= 0 and
+                    *global_num_tokens <= static_cast<int64_t>(num_max_tokens_per_rank) * num_ranks));
+    const float num_total_tokens = global_num_tokens.has_value() ?
+        static_cast<float>(*global_num_tokens) : static_cast<float>(num_tokens) * num_ranks;
+
     // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
-    const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+    const float num_expected_tokens = num_total_tokens * num_topk / num_experts;
     const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
@@ -220,11 +231,13 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const std::optional<int64_t>& global_num_tokens) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
+                                      mma_kind, global_num_tokens);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
@@ -272,8 +285,9 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = std::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, global_num_tokens={}, num_topk={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens,
+            global_num_tokens.value_or(-1), num_topk);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
