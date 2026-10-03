@@ -179,6 +179,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_nvfp4_alphas.py
+  test_mega_moe_global_tokens.py
   test_mega_moe_pre_dispatch.py
 )
 MEGA_MOE_HOPPER=(
@@ -224,8 +225,10 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   done
   if [ "${NPROC}" -ge 2 ]; then
     run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
+    run_test test_mega_moe_global_tokens.py --num-processes "${NPROC}"
   else
     skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
+    skip_test test_mega_moe_global_tokens.py "requires at least 2 ranks"
   fi
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
   for t in "${MEGA_MOE_HOPPER[@]}"; do

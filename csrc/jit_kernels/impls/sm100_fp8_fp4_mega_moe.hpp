@@ -96,7 +96,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float* l2_act_scales,
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -109,7 +110,7 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        mma_kind);
+        mma_kind, global_num_tokens);
 
     if (use_trtllm_weights) {
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);

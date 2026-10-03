@@ -660,14 +660,16 @@ int64_t dg_get_token_alignment_for_mega_moe() {
 
 int64_t dg_get_block_m_for_mega_moe(int64_t num_ranks, int64_t num_experts,
                                     int64_t num_max_tokens_per_rank, int64_t num_tokens,
-                                    int64_t num_topk, std::string mma_type) {
+                                    int64_t num_topk, std::string mma_type,
+                                    Optional<int64_t> global_num_tokens) {
     return static_cast<int64_t>(mega::get_block_m_for_mega_moe(
         static_cast<int>(num_ranks),
         static_cast<int>(num_experts),
         static_cast<int>(num_max_tokens_per_rank),
         static_cast<int>(num_tokens),
         static_cast<int>(num_topk),
-        mma_type));
+        mma_type,
+        global_num_tokens.has_value() ? std::make_optional(global_num_tokens.value()) : std::nullopt));
 }
 
 using MegaSliceResult = Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -758,7 +760,7 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
                         Tuple<int64_t, int64_t, int64_t> recipe, std::string mma_type, std::string activation, Optional<double> activation_clamp_opt,
                         bool fast_math, bool use_x_scales, Optional<TensorView> l1_alphas,
                         Optional<TensorView> l2_alphas, Optional<TensorView> l2_act_scales,
-                        bool use_trtllm_weights) {
+                        bool use_trtllm_weights, Optional<int64_t> global_num_tokens) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -792,7 +794,8 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
         l1_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value())) : std::nullopt,
         l2_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_alphas.value())) : std::nullopt,
         l2_act_scales.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_act_scales.value())) : std::nullopt,
-        use_trtllm_weights
+        use_trtllm_weights,
+        global_num_tokens.has_value() ? std::make_optional(global_num_tokens.value()) : std::nullopt
     );
 }
 
@@ -802,7 +805,7 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
                       Array<int64_t> sym_buffer_ptrs, int64_t rank_idx,
                       int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                       std::string activation, Optional<double> activation_clamp_opt, bool fast_math,
-                      bool use_trtllm_weights) {
+                      bool use_trtllm_weights, Optional<int64_t> global_num_tokens) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -822,7 +825,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
         static_cast<int>(num_topk), activation, act_clamp_opt_val, fast_math,
-        use_trtllm_weights
+        use_trtllm_weights,
+        global_num_tokens.has_value() ? std::make_optional(global_num_tokens.value()) : std::nullopt
     );
 }
 
