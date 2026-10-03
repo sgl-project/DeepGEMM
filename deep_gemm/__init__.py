@@ -149,6 +149,18 @@ try:
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
         return _from_dlpack_if_needed(_C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices))
 
+    def get_paged_mqa_logits_bf16_metadata(context_lens, block_kv, num_sms, indices=None, tokens_per_request=1):
+        return _from_dlpack_if_needed(_C.get_paged_mqa_logits_bf16_metadata(
+            context_lens, block_kv, num_sms, indices, tokens_per_request))
+
+    def fp4_paged_mqa_logits_bf16(q, kv_cache, weights, context_lens, block_table,
+                                  schedule_meta, max_context_len, indices=None,
+                                  histogram=None, tokens_per_request=1):
+        q_data, q_sf = q
+        return _from_dlpack_if_needed(_C.fp4_paged_mqa_logits_bf16(
+            q_data, q_sf, kv_cache, weights, context_lens, block_table,
+            schedule_meta, max_context_len, indices, histogram, tokens_per_request))
+
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
