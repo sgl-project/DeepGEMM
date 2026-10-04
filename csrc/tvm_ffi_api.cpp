@@ -47,6 +47,27 @@ static std::optional<float> to_optional_float(Optional<double> value) {
     return value.has_value() ? std::make_optional(static_cast<float>(value.value())) : std::nullopt;
 }
 
+// Ownership guard: `convert_to_torch_tensor` wraps the caller's buffer with a
+// NON-OWNING `torch::from_blob` view. Several fast paths return their input
+// unchanged (e.g. the `check_sf_layout` pass-through in
+// `transform_sf_into_required_layout`, or the already-aligned fast path in
+// `get_mn_major_tma_aligned_tensor`), so `result` can alias a non-owning view.
+// Exporting such an alias through DLPack hands the caller a tensor that does
+// not keep the source allocation alive: once the caller drops its last
+// reference, the caching allocator may recycle the storage while the returned
+// tensor still points at it (use-after-free, observed as NaN weight scales
+// when loading FP8 checkpoints). Clone only when the result actually aliases
+// one of the non-owning inputs; every other path already returns fresh,
+// owned storage, so the common case stays zero-copy.
+static torch::Tensor own_if_aliasing(const torch::Tensor& result,
+                                     std::initializer_list<const torch::Tensor*> non_owning_inputs) {
+    for (const auto* input : non_owning_inputs) {
+        if (input != nullptr and result.data_ptr() == input->data_ptr())
+            return result.clone();
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------
@@ -127,13 +148,13 @@ tvm::ffi::Array<int64_t> dg_preprocess_sf(TensorView sf) {
 Tensor dg_get_mn_major_tma_aligned_tensor(TensorView sf) {
     auto sf_v = convert_to_torch_tensor(sf);
     auto result = get_mn_major_tma_aligned_tensor(sf_v);
-    return Tensor::FromDLPack(at::toDLPack(result));
+    return Tensor::FromDLPack(at::toDLPack(own_if_aliasing(result, {&sf_v})));
 }
 
 Tensor dg_get_mn_major_tma_aligned_packed_ue8m0_tensor(TensorView sf, Optional<TensorView> psum_layout) {
     auto sf_v = convert_to_torch_tensor(sf);
     auto result = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf_v, to_optional_tensor(psum_layout));
-    return Tensor::FromDLPack(at::toDLPack(result));
+    return Tensor::FromDLPack(at::toDLPack(own_if_aliasing(result, {&sf_v})));
 }
 
 Tensor dg_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
@@ -150,7 +171,7 @@ Tensor dg_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
         static_cast<int>(k_alignment),
         use_psum_layout, use_padded_sf_layout
     );
-    return Tensor::FromDLPack(at::toDLPack(result));
+    return Tensor::FromDLPack(at::toDLPack(own_if_aliasing(result, {&sf_v})));
 }
 
 Tensor dg_transform_sf_into_required_layout(
@@ -167,13 +188,13 @@ Tensor dg_transform_sf_into_required_layout(
         auto result = layout::transform_sf_into_required_layout(
             sf_v, static_cast<int>(mn), static_cast<int>(k),
             recipe, ng, is_sfa_val, disable_ue8m0_cast, to_optional_tensor(psum_layout));
-        return Tensor::FromDLPack(at::toDLPack(result));
+        return Tensor::FromDLPack(at::toDLPack(own_if_aliasing(result, {&sf_v})));
     } else {
         auto recipe = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b));
         auto result = layout::transform_sf_into_required_layout(
             sf_v, static_cast<int>(mn), static_cast<int>(k),
             recipe, ng, is_sfa_val, disable_ue8m0_cast, to_optional_tensor(psum_layout));
-        return Tensor::FromDLPack(at::toDLPack(result));
+        return Tensor::FromDLPack(at::toDLPack(own_if_aliasing(result, {&sf_v})));
     }
 }
 
