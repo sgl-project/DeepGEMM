@@ -21,11 +21,13 @@ static int get_token_alignment_for_mega_moe() {
 static int get_block_m_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
-    const std::string& mma_type) {
+    const std::string& mma_type,
+    const std::optional<int64_t>& global_num_tokens = std::nullopt) {
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
+                                      mma_kind, global_num_tokens);
     return block_m;
 }
 
@@ -201,7 +203,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& l1_alphas,
     const std::optional<torch::Tensor>& l2_alphas,
     const std::optional<torch::Tensor>& l2_act_scales,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -370,7 +373,7 @@ static void fp8_fp4_mega_moe(
                                l2_act_scales.has_value()
                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
                                mma_kind,
-                               use_fp8_combine, use_trtllm_weights);
+                               use_fp8_combine, use_trtllm_weights, global_num_tokens);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -395,7 +398,8 @@ static void bf16_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -479,7 +483,7 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math, use_trtllm_weights);
+                            activation_clamp, fast_math, use_trtllm_weights, global_num_tokens);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

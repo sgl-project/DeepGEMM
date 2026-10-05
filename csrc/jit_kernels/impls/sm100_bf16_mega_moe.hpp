@@ -49,7 +49,8 @@ static void sm100_bf16_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -60,7 +61,7 @@ static void sm100_bf16_mega_moe(
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
-        num_ring_tokens, 0, MmaKind::BF16);
+        num_ring_tokens, 0, MmaKind::BF16, global_num_tokens);
 
     if (use_trtllm_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
