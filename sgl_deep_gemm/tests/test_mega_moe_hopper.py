@@ -82,18 +82,22 @@ FP8_E4M3_MAX = 448.0
 # the plain float above.
 _FP8_E4M3_MAX_TL = tl.constexpr(448.0)
 L1_ACT_SF_GRAN = 128
-FUSED_L2_ACT_SF_GRAN = 64
 BASELINE_L2_ACT_SF_GRAN = 128
 WEIGHT_SF_GRAN_MN = 128
 WEIGHT_SF_GRAN_K = 128
+
+
+def _symm_buffer_kwargs(l2_act_sf_gran_k):
+    # None keeps the package default; the reference reads the granularity back from the buffer
+    return {} if l2_act_sf_gran_k is None else dict(l2_act_sf_gran_k=l2_act_sf_gran_k)
 
 
 # ============================================================================
 # Section 1: Triton SwiGLU + FP8 quantization kernel.
 # ----------------------------------------------------------------------------
 # The baseline L2 path uses DeepGEMM SM90 grouped FP8 GEMM, which accepts
-# per-128-K activation SF. The scale values still use the same power-of-two
-# rounding as the fused epilogue to avoid adding an exact-FP32-scale difference.
+# per-128-K activation SF. The scales are rounded to a power of two when
+# `use_ue8m0_scale` is set; the fused epilogue writes continuous FP32 scales.
 # Input  x        : (M, 2*H) bf16, laid out as [gate_part | up_part].
 # Input  topk_w   : (M,) fp32, optional.
 # Output y        : (M, H) fp8_e4m3fn.
@@ -303,6 +307,7 @@ def _reference_fused(
     hidden: int,
     intermediate_hidden: int,
     activation_clamp: float,
+    l2_act_sf_gran_k: int,
 ) -> torch.Tensor:
     """PyTorch BF16/FP32 reference for this rank's fused output."""
     num_experts_per_rank = num_experts // num_ranks
@@ -359,8 +364,8 @@ def _reference_fused(
 
             l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)
             s, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s, ih // 64, 64)
+            assert ih == intermediate_hidden and ih % l2_act_sf_gran_k == 0
+            l1_view = l1_y.view(s, ih // l2_act_sf_gran_k, l2_act_sf_gran_k)
             amax = l1_view.abs().amax(dim=-1).clamp(1e-4)
             sf2 = amax / FP8_E4M3_MAX
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
@@ -392,6 +397,7 @@ def _run_accuracy_scenario(
     num_ranks: int,
     group: dist.ProcessGroup,
     diff_tol: float,
+    l2_act_sf_gran_k,
 ):
     num_max = cfg["num_max_tokens_per_rank"]
     num_tokens = cfg.get("num_tokens", num_max)
@@ -460,6 +466,7 @@ def _run_accuracy_scenario(
         num_topk,
         hidden,
         intermediate_hidden,
+        **_symm_buffer_kwargs(l2_act_sf_gran_k),
     )
     cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
 
@@ -506,6 +513,7 @@ def _run_accuracy_scenario(
         hidden,
         intermediate_hidden,
         activation_clamp,
+        buffer.l2_act_sf_gran_k,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -707,7 +715,7 @@ def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Na
     failures: List[str] = []
     for name, cfg in layers:
         try:
-            _run_accuracy_scenario(name, cfg, rank_idx, num_ranks, group, args.diff_tol)
+            _run_accuracy_scenario(name, cfg, rank_idx, num_ranks, group, args.diff_tol, args.l2_act_sf_gran_k)
         except AssertionError as ex:
             dist_print(f"  [{name}] FAIL: {ex}", once_in_node=True)
             failures.append(name)
@@ -1040,6 +1048,7 @@ def _run_fused_only_config(
         num_topk,
         hidden,
         intermediate_hidden,
+        **_symm_buffer_kwargs(args.l2_act_sf_gran_k),
     )
 
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -1317,6 +1326,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk,
         hidden,
         intermediate_hidden,
+        **_symm_buffer_kwargs(args.l2_act_sf_gran_k),
     )
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
@@ -1353,7 +1363,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
     dist_print(
-        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} FP32 pow2, "
+        f" > Activation SF: fused L2 per-{sym_buffer.l2_act_sf_gran_k} FP32, "
         f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} FP32 pow2 "
         f"(SM90 grouped-GEMM constraint)",
         once_in_node=True,
@@ -1450,10 +1460,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
         # Triton SwiGLU + FP8 quantization, including topk weight scaling.
-        # The fused SM90 MegaMoE L2 activation SF is per-64-K. The current
-        # DeepGEMM SM90 grouped GEMM supports only per-128-K activation SF, so
-        # the baseline uses per-128-K FP32 scales with the same power-of-two
-        # rounding rule as the fused epilogue.
+        # The current DeepGEMM SM90 grouped GEMM supports only per-128-K
+        # activation SF, so the baseline uses per-128-K power-of-two scales;
+        # the fused epilogue writes continuous FP32 scales at the buffer's granularity.
         l1_y = swiglu_apply_weight_to_fp8_triton(
             x=l1_y,
             topk_weights=recv_topk_weights,
@@ -1695,7 +1704,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     l1_input_sf_bytes = num_recv_tokens * (hidden // L1_ACT_SF_GRAN) * 4
     l2_act_sf_bytes = (
-        num_recv_tokens * (intermediate_hidden // FUSED_L2_ACT_SF_GRAN) * 4
+        num_recv_tokens * (intermediate_hidden // sym_buffer.l2_act_sf_gran_k) * 4
     )
     num_hbm_bytes = (
         l1_weight_bytes
@@ -1907,6 +1916,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Whether fused SwiGLU uses fast math (0/1)",
+    )
+    parser.add_argument(
+        "--l2-act-sf-gran-k",
+        type=int,
+        choices=[64, 128],
+        default=None,
+        help="L2 activation-scale K granularity the symm buffer is built with; default: the package default",
     )
 
     # Timing.
