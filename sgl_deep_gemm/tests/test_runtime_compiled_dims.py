@@ -22,7 +22,7 @@ else:
     cache_dir = Path(os.environ['DG_JIT_CACHE_DIR']) / 'cache'
 
     def kernel_dirs(name):
-        return set(cache_dir.glob(f'kernel.{name}.*'))
+        return set(cache_dir.glob(f'{name}.*'))
 
     def assert_compiled_shape(kernel_dir, expected):
         source = (kernel_dir / 'kernel.cu').read_text()
