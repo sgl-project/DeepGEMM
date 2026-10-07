@@ -41,18 +41,20 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_clamp_up(float x) {
     return x;
 }
 
-template <bool kFastMath>
+template <bool kFastMath, float kActivationAlpha>
 __forceinline__ __device__ float sm90_fp8_mega_moe_silu(float x) {
-    const float e = kFastMath ? __expf(-x) : expf(-x);
+    const float e = kFastMath ? __expf(-kActivationAlpha * x) : expf(-kActivationAlpha * x);
     const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
     return x * sig;
 }
 
-template <bool kFastMath, float kActivationClamp>
+template <bool kFastMath, float kActivationClamp, float kActivationAlpha,
+          float kActivationUpBias>
 __forceinline__ __device__ float sm90_fp8_mega_moe_swiglu(float g, float u) {
     g = sm90_fp8_mega_moe_clamp_gate<kActivationClamp>(g);
     u = sm90_fp8_mega_moe_clamp_up<kActivationClamp>(u);
-    return sm90_fp8_mega_moe_silu<kFastMath>(g) * u;
+    return sm90_fp8_mega_moe_silu<kFastMath, kActivationAlpha>(g) *
+           (u + kActivationUpBias);
 }
 
 // Continuous FP32 activation scale. SM90 WGMMA has no hardware block-scale operand (the SF
@@ -140,6 +142,8 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    float kActivationAlpha,
+    float kActivationUpBias,
     bool kFastMath,
     uint32_t kEpilogueRegisterBudget,
     bool kReuseAccumAsFinal,
@@ -1627,7 +1631,7 @@ sm90_fp8_mega_moe_impl(void* y,
             if (block_phase == sched::BlockPhase::Linear1) {
                 if constexpr (kSwapABActive) {
                     auto silu = [](float x) -> float {
-                        const float e = kFastMath ? __expf(-x) : expf(-x);
+                        const float e = kFastMath ? __expf(-kActivationAlpha * x) : expf(-kActivationAlpha * x);
                         const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
                         return x * sig;
                     };
@@ -1654,7 +1658,7 @@ sm90_fp8_mega_moe_impl(void* y,
                                 .get_data_buffer(m_idx + token_0)
                                 .get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g0) * u0 * weight_0;
+                                silu(g0) * (u0 + kActivationUpBias) * weight_0;
                         }
                         if (token_1 < valid_m) {
                             float g1 = final_accum[i * 4 + 1];
@@ -1665,7 +1669,7 @@ sm90_fp8_mega_moe_impl(void* y,
                                 .get_data_buffer(m_idx + token_1)
                                 .get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g1) * u1 * weight_1;
+                                silu(g1) * (u1 + kActivationUpBias) * weight_1;
                         }
                     };
 
@@ -1774,7 +1778,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         x = cute::min(cute::max(x, -kActivationClamp), kActivationClamp);
                 };
                 auto silu = [](float x) -> float {
-                    const float e = kFastMath ? __expf(-x) : expf(-x);
+                    const float e = kFastMath ? __expf(-kActivationAlpha * x) : expf(-kActivationAlpha * x);
                     const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
                     return x * sig;
                 };
@@ -1801,16 +1805,16 @@ sm90_fp8_mega_moe_impl(void* y,
                     clamp_up(u_r1_c1);
 
                     if (valid_r0) {
-                        swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                        swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
+                        swiglu_r0[p][0] = silu(g_r0_c0) * (u_r0_c0 + kActivationUpBias);
+                        swiglu_r0[p][1] = silu(g_r0_c1) * (u_r0_c1 + kActivationUpBias);
                         amax_r0 = cute::max(amax_r0, cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
                     } else {
                         swiglu_r0[p][0] = 0.0f;
                         swiglu_r0[p][1] = 0.0f;
                     }
                     if (valid_r1) {
-                        swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                        swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                        swiglu_r1[p][0] = silu(g_r1_c0) * (u_r1_c0 + kActivationUpBias);
+                        swiglu_r1[p][1] = silu(g_r1_c1) * (u_r1_c1 + kActivationUpBias);
                         amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
                     } else {
                         swiglu_r1[p][0] = 0.0f;

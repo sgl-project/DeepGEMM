@@ -275,7 +275,12 @@ def _dequant_per_token_per_128_k(x_fp8: torch.Tensor, sf: torch.Tensor) -> torch
     return (x_view * sf.unsqueeze(-1)).view(m, k)
 
 
-def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
+def _swiglu_fp32(
+    gate_up: torch.Tensor,
+    clamp: float,
+    alpha: float = 1.0,
+    up_bias: float = 0.0,
+) -> torch.Tensor:
     """SwiGLU matching the fused SM90 path's clamp semantics."""
     n2 = gate_up.size(-1)
     half = n2 // 2
@@ -283,7 +288,7 @@ def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
     if math.isfinite(clamp):
         gate = gate.clamp(max=clamp)
         up = up.clamp(min=-clamp, max=clamp)
-    return torch.nn.functional.silu(gate) * up
+    return gate * torch.sigmoid(alpha * gate) * (up + up_bias)
 
 
 def _reference_fused(
@@ -303,6 +308,8 @@ def _reference_fused(
     hidden: int,
     intermediate_hidden: int,
     activation_clamp: float,
+    activation_alpha: float = 1.0,
+    activation_up_bias: float = 0.0,
 ) -> torch.Tensor:
     """PyTorch BF16/FP32 reference for this rank's fused output."""
     num_experts_per_rank = num_experts // num_ranks
@@ -357,7 +364,9 @@ def _reference_fused(
             l1_y = torch.einsum("sk,snk->sn", x_sel, l1_w_sel)
             del l1_w_sel
 
-            l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)
+            l1_y = _swiglu_fp32(
+                l1_y, activation_clamp, activation_alpha, activation_up_bias
+            ) * weights.unsqueeze(-1)
             s, ih = l1_y.shape
             assert ih == intermediate_hidden and ih % 64 == 0
             l1_view = l1_y.view(s, ih // 64, 64)
@@ -401,6 +410,9 @@ def _run_accuracy_scenario(
     num_topk = cfg["num_topk"]
     masked_ratio = cfg.get("masked_ratio", 0.0)
     activation_clamp = cfg.get("activation_clamp", 10.0)
+    activation = cfg.get("activation", "swiglu")
+    activation_alpha = cfg.get("activation_alpha", 1.0)
+    activation_up_bias = cfg.get("activation_up_bias", 0.0)
     fast_math = cfg.get("fast_math", True)
 
     assert num_experts % num_ranks == 0, (
@@ -460,6 +472,7 @@ def _run_accuracy_scenario(
         num_topk,
         hidden,
         intermediate_hidden,
+        activation=activation,
     )
     cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
 
@@ -479,7 +492,9 @@ def _run_accuracy_scenario(
             buffer,
             cumulative_local_expert_recv_stats=cum_stats,
             recipe=(128, 128, 128),
-            activation="swiglu",
+            activation=activation,
+            activation_alpha=activation_alpha,
+            activation_up_bias=activation_up_bias,
             activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
             fast_math=fast_math,
         )
@@ -506,6 +521,8 @@ def _run_accuracy_scenario(
         hidden,
         intermediate_hidden,
         activation_clamp,
+        activation_alpha,
+        activation_up_bias,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -575,7 +592,17 @@ _ACCURACY_SMOKE = dict(
 
 
 def _accuracy_layer1_smoke() -> List[Tuple[str, Dict[str, Any]]]:
-    return [("L1.smoke", dict(_ACCURACY_SMOKE))]
+    oai_swiglu = dict(
+        _ACCURACY_SMOKE,
+        activation="swigluoai",
+        activation_alpha=1.702,
+        activation_up_bias=1.0,
+        activation_clamp=7.0,
+    )
+    return [
+        ("L1.smoke", dict(_ACCURACY_SMOKE)),
+        ("L1.oai_swiglu", oai_swiglu),
+    ]
 
 
 def _accuracy_layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
