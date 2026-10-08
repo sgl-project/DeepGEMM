@@ -18,6 +18,44 @@
 
 namespace deep_gemm {
 
+// SiTU gate (Kimi-K3 / EB): beta * tanh(g / beta) * sigmoid(g), beta = 4.
+//
+// The fast path evaluates the exact identity
+//     sigmoid(g) = (1 + tanh(g/2)) / 2,   tanh(g/2) = 2T / (1 + T^2),   T = tanh(g/4)
+//   => 4 * tanh(g/4) * sigmoid(g) = 2T(1+T)^2 / (1 + T^2)
+template <bool kFastMath>
+__forceinline__ __device__ float2 sm100_fp8_fp4_mega_moe_situ_gate(float2 gate) {
+    const float2 one = {1.0f, 1.0f};
+    // Scaling by 0.25 is exact (power of two), so packing it is bit-identical to
+    // two scalar multiplies -- and saves one instruction per element pair.
+    const float2 q = __fmul2_rn(gate, make_float2(0.25f, 0.25f));
+    float2 t;
+    if constexpr (kFastMath) {
+        t = {__tanhf(q.x), __tanhf(q.y)};
+    } else {
+        t = {tanhf(q.x), tanhf(q.y)};
+    }
+    const float2 s = __fadd2_rn(t, one);                              // 1 + T
+    const float2 d = __ffma2_rn(t, t, one);                           // 1 + T^2
+    const float2 n = __fmul2_rn(__fadd2_rn(t, t), __fmul2_rn(s, s));  // 2T (1+T)^2
+    if constexpr (kFastMath) {
+        return __ffma2_rn(n, make_float2(math::fast_rcp(d.x), math::fast_rcp(d.y)), make_float2(0.0f, 0.0f));
+    } else {
+        return {n.x / d.x, n.y / d.y};
+    }
+}
+
+template <bool kFastMath>
+__forceinline__ __device__ float2 sm100_fp8_fp4_mega_moe_situ_up(float2 up) {
+    if constexpr (kFastMath) {
+        const float2 q = __fmul2_rn(up, make_float2(0.04f, 0.04f));
+        const float2 t = {__tanhf(q.x), __tanhf(q.y)};
+        return __ffma2_rn(t, make_float2(25.0f, 25.0f), make_float2(0.0f, 0.0f));
+    } else {
+        return {25.0f * tanhf(up.x / 25.0f), 25.0f * tanhf(up.y / 25.0f)};
+    }
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -1268,9 +1306,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // SiTU:
                         //   act = kSituBeta * tanh(gate/kSituBeta) * sigmoid(gate)
                         //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
-                        // K3 config constants baked in (activation_situ_{beta,linear_beta}).
-                        constexpr float kSituBeta = 4.0f;
-                        constexpr float kSituLinearBeta = 25.0f;
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         // TRT keeps `row ^ 8`, so up precedes gate
                         constexpr uint32_t kGateSlot = kUseTrtllmWeights ? 1u : 0u;
@@ -1293,26 +1328,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                             constexpr bool kIsOAISwiGLU = kSwiGLUAlpha != 0.0f;
                             auto gate = __bfloat1622float2(bf16_gate);
-                            const auto sigmoid_in = kIsOAISwiGLU ?
-                                __fmul2_rn(gate, {kSwiGLUAlpha, kSwiGLUAlpha}) : gate;
-                            auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-sigmoid_in.x) : expf(-sigmoid_in.x),
-                                kFastMath ? __expf(-sigmoid_in.y) : expf(-sigmoid_in.y));
-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
-                            float2 sig;
-                            if constexpr (kFastMath) {
-                                sig = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
-                            } else {
-                                sig = {1.0f / denom.x, 1.0f / denom.y};
-                            }
                             auto up = __bfloat1622float2(bf16_up);
                             if constexpr (kUseSitu) {
                                 // Tanh-bounded gate and soft-clipped up branch.
-                                gate = {kSituBeta * tanhf(gate.x / kSituBeta) * sig.x,
-                                        kSituBeta * tanhf(gate.y / kSituBeta) * sig.y};
-                                up = {kSituLinearBeta * tanhf(up.x / kSituLinearBeta),
-                                      kSituLinearBeta * tanhf(up.y / kSituLinearBeta)};
+                                gate = sm100_fp8_fp4_mega_moe_situ_gate<kFastMath>(gate);
+                                up = sm100_fp8_fp4_mega_moe_situ_up<kFastMath>(up);
                             } else {
+                                // SwiGLU: silu(gate) * up
+                                const auto sigmoid_in = kIsOAISwiGLU ?
+                                    __fmul2_rn(gate, {kSwiGLUAlpha, kSwiGLUAlpha}) : gate;
+                                const auto neg_gate_exp = make_float2(
+                                    kFastMath ? __expf(-sigmoid_in.x) : expf(-sigmoid_in.x),
+                                    kFastMath ? __expf(-sigmoid_in.y) : expf(-sigmoid_in.y));
+                                const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                float2 sig;
+                                if constexpr (kFastMath) {
+                                    sig = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
+                                } else {
+                                    sig = {1.0f / denom.x, 1.0f / denom.y};
+                                }
                                 gate = __fmul2_rn(gate, sig);
                                 if constexpr (kIsOAISwiGLU)
                                     up = __fadd2_rn(up, {1.0f, 1.0f});
