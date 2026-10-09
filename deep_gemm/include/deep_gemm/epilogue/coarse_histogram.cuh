@@ -1,14 +1,16 @@
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <type_traits>
 #include <cutlass/arch/barrier.h>
 
 namespace deep_gemm::epilogue {
 
-// Coarse score histogram of the paged MQA producers: int32 [rows, 1024], bins in descending score order (bin 0 holds
-// the largest), counting every live non-NaN score once. |x| < 16: FP16-RN exponent and 4 mantissa bits;
-// 16 <= |x| < 223: unit-width bins, lower-inclusive for negatives; one saturating bin at each end. -0 counts as +0.
+// Coarse score histogram of the paged MQA producers (FP32 `fp8_fp4_paged_mqa_logits` and BF16
+// `fp4_paged_mqa_logits_bf16`): int32 [rows, 1024], bins in descending score order (bin 0 holds the largest), counting
+// every live non-NaN score once. |x| < 16: FP16-RN exponent and 4 mantissa bits; 16 <= |x| < 223: unit-width bins,
+// lower-inclusive for negatives; one saturating bin at each end. -0 counts as +0.
 constexpr uint32_t kNumCoarseHistogramBins = 1024;
 
 // 1024-bin coarse key of a live, non-NaN FP32 score
@@ -25,6 +27,16 @@ CUTLASS_DEVICE uint32_t coarse_histogram_bin(float score) {
         code = max(304, __float2int_rd(bounded) + 288);
     }
     return negative ? 512 + code : 511 - code;
+}
+
+// The same key of a non-NaN BF16 score. For 2^-14 <= |x| < 16 (BF16 exponent 113..130) the FP16 conversion is exact,
+// so the FP16 code is the BF16 exponent and top mantissa bits: (|bits| >> 3) - (112 << 4)
+CUTLASS_DEVICE uint32_t coarse_histogram_bin(const __nv_bfloat16& score) {
+    const uint32_t bits = __bfloat16_as_ushort(score);
+    const uint32_t magnitude = bits & 0x7fffu;
+    if (magnitude - 0x3880u < 0x900u)
+        return (bits & 0x8000u) ? (magnitude >> 3) - 1280u : 2303u - (magnitude >> 3);
+    return coarse_histogram_bin(__bfloat162float(score));
 }
 
 // Empty default policy: no storage, initialization, cleanup or runtime branch.
