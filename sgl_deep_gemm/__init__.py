@@ -215,17 +215,17 @@ try:
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
-    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
-        return _from_dlpack_if_needed(_C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices))
+    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None, histogram=None):
+        return _from_dlpack_if_needed(_C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices, histogram))
 
     def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
         (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
         return _from_dlpack_if_needed(_C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k))
 
-    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
+    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None, histogram=None):
         logits_dtype_str = str(logits_dtype).split('.')[-1]
         (q, q_sf) = q if isinstance(q, (tuple, list)) else (q, None)
-        return _from_dlpack_if_needed(_C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str, indices))
+        return _from_dlpack_if_needed(_C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str, indices, histogram))
 
     def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float, schedule_meta=None):
         (q, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
@@ -234,6 +234,18 @@ try:
 
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
         return _from_dlpack_if_needed(_C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices))
+
+    def get_paged_mqa_logits_bf16_metadata(context_lens, block_kv, num_sms, indices=None, tokens_per_request=1):
+        return _from_dlpack_if_needed(_C.get_paged_mqa_logits_bf16_metadata(
+            context_lens, block_kv, num_sms, indices, tokens_per_request))
+
+    def fp4_paged_mqa_logits_bf16(q, kv_cache, weights, context_lens, block_table,
+                                  schedule_meta, max_context_len, indices=None,
+                                  histogram=None, tokens_per_request=1):
+        q_data, q_sf = q
+        return _from_dlpack_if_needed(_C.fp4_paged_mqa_logits_bf16(
+            q_data, q_sf, kv_cache, weights, context_lens, block_table,
+            schedule_meta, max_context_len, indices, histogram, tokens_per_request))
 
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)

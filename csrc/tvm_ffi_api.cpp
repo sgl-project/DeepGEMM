@@ -601,17 +601,44 @@ Tensor dg_get_paged_mqa_logits_metadata(TensorView context_lens, int64_t block_k
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
+Tensor dg_get_paged_mqa_logits_bf16_metadata(TensorView context_lens, int64_t block_kv,
+                                             int64_t num_sms, Optional<TensorView> indices,
+                                             int64_t tokens_per_request) {
+    auto result = attention::get_paged_mqa_logits_bf16_metadata(
+        convert_to_torch_tensor(context_lens), static_cast<int>(block_kv),
+        static_cast<int>(num_sms), to_optional_tensor(indices),
+        static_cast<int>(tokens_per_request));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
 Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
                               TensorView weights, TensorView context_lens,
                               TensorView block_table, TensorView schedule_meta,
                               int64_t max_context_len, bool clean_logits,
-                              Optional<TensorView> indices) {
+                              Optional<TensorView> indices, Optional<TensorView> histogram) {
     auto indices_val = indices.has_value()? std::optional(convert_to_torch_tensor(indices.value())) : std::nullopt;
     auto result = attention::fp8_paged_mqa_logits(
         convert_to_torch_tensor(q), convert_to_torch_tensor(fused_kv_cache),
         convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
         convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
-        static_cast<int>(max_context_len), clean_logits, indices_val);
+        static_cast<int>(max_context_len), clean_logits, indices_val, to_optional_tensor(histogram));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
+Tensor dg_fp4_paged_mqa_logits_bf16(TensorView q, TensorView q_sf,
+                                    TensorView fused_kv_cache, TensorView weights,
+                                    TensorView context_lens, TensorView block_table,
+                                    TensorView schedule_meta, int64_t max_context_len,
+                                    Optional<TensorView> indices,
+                                    Optional<TensorView> histogram,
+                                    int64_t tokens_per_request) {
+    auto result = attention::fp4_paged_mqa_logits_bf16(
+        std::make_pair(convert_to_torch_tensor(q), convert_to_torch_tensor(q_sf)),
+        convert_to_torch_tensor(fused_kv_cache), convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(context_lens), convert_to_torch_tensor(block_table),
+        convert_to_torch_tensor(schedule_meta), static_cast<int>(max_context_len),
+        to_optional_tensor(indices), to_optional_tensor(histogram),
+        static_cast<int>(tokens_per_request));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
@@ -633,7 +660,8 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
                               TensorView weights, TensorView context_lens,
                               TensorView block_table, TensorView schedule_meta,
                               int64_t max_context_len, bool clean_logits,
-                              std::string logits_dtype, Optional<TensorView> indices) {
+                              std::string logits_dtype, Optional<TensorView> indices,
+                              Optional<TensorView> histogram) {
     auto q_sf_val = q_sf.has_value()? std::make_optional(convert_to_torch_tensor(q_sf.value())) : std::nullopt;
     auto indices_val = indices.has_value()? std::optional(convert_to_torch_tensor(indices.value())) : std::nullopt;
     auto result = attention::fp8_fp4_paged_mqa_logits(
@@ -642,14 +670,16 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
         convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
         convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
         static_cast<int>(max_context_len), clean_logits,
-        string_to_dtype(logits_dtype), indices_val);
+        string_to_dtype(logits_dtype), indices_val, to_optional_tensor(histogram));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm_nt_skip_head_mid, dg_fp8_gemm_nt_skip_head_mid);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mqa_logits, dg_fp8_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata, dg_get_paged_mqa_logits_metadata);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_bf16_metadata, dg_get_paged_mqa_logits_bf16_metadata);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_logits, dg_fp8_paged_mqa_logits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_paged_mqa_logits_bf16, dg_fp4_paged_mqa_logits_bf16);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mqa_logits, dg_fp8_fp4_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_paged_mqa_logits, dg_fp8_fp4_paged_mqa_logits);
 

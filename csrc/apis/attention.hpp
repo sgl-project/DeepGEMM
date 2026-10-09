@@ -17,6 +17,7 @@
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 
+#include "attention_bf16.hpp"
 #include "layout.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
 
@@ -458,7 +459,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const int& max_context_len,
                                               const bool& clean_logits,
                                               const at::ScalarType& logits_dtype,
-                                              const std::optional<torch::Tensor>& indices) {
+                                              const std::optional<torch::Tensor>& indices,
+                                              const std::optional<torch::Tensor>& histogram = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
     const bool is_fp4 = qk_dtype == kPackedFP4;
@@ -556,6 +558,19 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(context_lens.is_contiguous());
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
 
+    // Check optional coarse histogram: live non-NaN FP32 scores accumulate into zero-at-entry int32[B, 1024].
+    // Bins are added as packed 64-bit pairs, so the tensor must be 8-byte aligned and hold non-negative counts.
+    if (histogram.has_value()) {
+        DG_HOST_ASSERT(arch_major == 10 and not is_mx_sf and num_heads == 32 and head_dim == 128);
+        // One row per query token; a verify step's tokens of one request share a Q block
+        DG_HOST_ASSERT(is_varlen ? next_n == 1 : next_n <= 128 / num_heads);
+        DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat and logits_dtype == torch::kFloat32 and not clean_logits);
+        DG_HOST_ASSERT(histogram->is_cuda() and histogram->device() == q_fp.device() and histogram->is_contiguous());
+        DG_HOST_ASSERT(histogram->scalar_type() == torch::kInt and histogram->dim() == 2);
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(histogram->data_ptr()) % 8 == 0);  // packed 64-bit adds
+        DG_HOST_ASSERT(histogram->size(0) == batch_size * next_n and histogram->size(1) == 1024);
+    }
+
     // Allocate output
     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
     const int split_kv = (arch_major == 12) ? 128 : 256;  // SM120: 2 groups × 64
@@ -572,7 +587,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         sm100_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk,
-                               is_mx_sf, qk_dtype);
+                               is_mx_sf, qk_dtype, histogram ? histogram->data_ptr<int>() : nullptr);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
         DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
@@ -616,14 +631,23 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const torch::Tensor& schedule_meta,
                                           const int& max_context_len,
                                           const bool& clean_logits,
-                                          const std::optional<torch::Tensor>& indices) {
+                                          const std::optional<torch::Tensor>& indices,
+                                          const std::optional<torch::Tensor>& histogram = std::nullopt) {
     return fp8_fp4_paged_mqa_logits(std::make_tuple(q, std::nullopt), fused_kv_cache, weights,
                                     context_lens, block_table, schedule_meta,
-                                    max_context_len, clean_logits, torch::kFloat, indices);
+                                    max_context_len, clean_logits, torch::kFloat, indices, histogram);
 }
 #ifndef DG_USE_TVM_FFI
 
 static void register_apis(pybind11::module_& m) {
+    m.def("get_paged_mqa_logits_bf16_metadata", &get_paged_mqa_logits_bf16_metadata,
+          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
+          py::arg("indices") = std::nullopt, py::arg("tokens_per_request") = 1);
+    m.def("fp4_paged_mqa_logits_bf16", &fp4_paged_mqa_logits_bf16,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+          py::arg("max_context_len"), py::arg("indices") = std::nullopt,
+          py::arg("histogram") = std::nullopt, py::arg("tokens_per_request") = 1);
     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
           py::arg("recipe") = std::nullopt,
@@ -662,7 +686,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_context_len"),
           py::arg("clean_logits") = false,
           py::arg("logits_dtype") = torch::kFloat32,
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt,
+          py::arg("histogram") = std::nullopt);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
@@ -673,7 +698,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"), py::arg("clean_logits") = false,
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt,
+          py::arg("histogram") = std::nullopt);
 }
 
 #endif

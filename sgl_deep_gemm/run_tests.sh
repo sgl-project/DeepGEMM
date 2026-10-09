@@ -150,7 +150,7 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
-for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py; do
+for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py test_mqa_bf16.py; do
   if [ "${ARCH_MAJOR}" -eq 10 ]; then
     run_test "${t}"
   else
