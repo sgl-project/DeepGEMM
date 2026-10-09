@@ -51,8 +51,8 @@ class SymmBuffer:
                  base: Optional['SymmBuffer'] = None):
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
-        assert activation != 'situ' or mma_type == 'fp8xfp4', \
-            '`situ` activation is supported only for `fp8xfp4` MegaMoE'
+        assert activation != 'situ' or mma_type in ('fp8xfp4', 'mxf4xmxf4'), \
+            '`situ` activation is supported only for `fp8xfp4` and `mxf4xmxf4` MegaMoE'
         _check_legacy_fp4_acts_env()
         self.group = group
         self.num_experts = num_experts

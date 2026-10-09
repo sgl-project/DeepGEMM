@@ -44,10 +44,13 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
-    // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
+    // SiTU is implemented by the SM100 FP8xFP4 MegaMoE kernel, which also serves
+    // the packed MXFP4 kind; the activation math runs in fp32 on the L1
+    // accumulator and is independent of the MMA kind.
     const auto mma_kind = parse_mma_kind(mma_type);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
+                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4) and
+                    activation == "situ"));
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -225,7 +228,8 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
+                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4) and
+                    activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
     const bool use_situ = activation == "situ";
     const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
