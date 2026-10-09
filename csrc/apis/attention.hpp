@@ -17,6 +17,7 @@
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 
+#include "attention_bf16.hpp"
 #include "layout.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
 
@@ -639,6 +640,14 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 #ifndef DG_USE_TVM_FFI
 
 static void register_apis(pybind11::module_& m) {
+    m.def("get_paged_mqa_logits_bf16_metadata", &get_paged_mqa_logits_bf16_metadata,
+          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
+          py::arg("indices") = std::nullopt, py::arg("tokens_per_request") = 1);
+    m.def("fp4_paged_mqa_logits_bf16", &fp4_paged_mqa_logits_bf16,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
+          py::arg("max_context_len"), py::arg("indices") = std::nullopt,
+          py::arg("histogram") = std::nullopt, py::arg("tokens_per_request") = 1);
     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
           py::arg("recipe") = std::nullopt,

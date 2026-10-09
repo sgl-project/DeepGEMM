@@ -10,7 +10,9 @@
 
 namespace deep_gemm {
 
-template <uint32_t kNumStages>
+// `kParityPhase`: keep `phase` as the parity of completed passes, so power-of-two rings may also advance by more than
+// one pass per call
+template <uint32_t kNumStages, bool kParityPhase = false>
 struct RingPipeline {
     DG_STATIC_ASSERT(kNumStages > 0, "Ring pipeline must contain at least one stage");
 
@@ -25,7 +27,7 @@ struct RingPipeline {
         // Modulo and division by a power of two lower to bit operations.
         if constexpr ((kNumStages & (kNumStages - 1)) == 0) {
             stage_idx = next_stage_idx % kNumStages;
-            phase ^= next_stage_idx / kNumStages;
+            phase ^= kParityPhase ? (next_stage_idx / kNumStages) & 1u : next_stage_idx / kNumStages;
         } else {
             stage_idx = next_stage_idx;
             if (stage_idx >= kNumStages) {
