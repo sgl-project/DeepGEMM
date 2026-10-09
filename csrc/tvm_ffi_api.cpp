@@ -605,13 +605,13 @@ Tensor dg_fp8_paged_mqa_logits(TensorView q, TensorView fused_kv_cache,
                               TensorView weights, TensorView context_lens,
                               TensorView block_table, TensorView schedule_meta,
                               int64_t max_context_len, bool clean_logits,
-                              Optional<TensorView> indices) {
+                              Optional<TensorView> indices, Optional<TensorView> histogram) {
     auto indices_val = indices.has_value()? std::optional(convert_to_torch_tensor(indices.value())) : std::nullopt;
     auto result = attention::fp8_paged_mqa_logits(
         convert_to_torch_tensor(q), convert_to_torch_tensor(fused_kv_cache),
         convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
         convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
-        static_cast<int>(max_context_len), clean_logits, indices_val);
+        static_cast<int>(max_context_len), clean_logits, indices_val, to_optional_tensor(histogram));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
@@ -633,7 +633,8 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
                               TensorView weights, TensorView context_lens,
                               TensorView block_table, TensorView schedule_meta,
                               int64_t max_context_len, bool clean_logits,
-                              std::string logits_dtype, Optional<TensorView> indices) {
+                              std::string logits_dtype, Optional<TensorView> indices,
+                              Optional<TensorView> histogram) {
     auto q_sf_val = q_sf.has_value()? std::make_optional(convert_to_torch_tensor(q_sf.value())) : std::nullopt;
     auto indices_val = indices.has_value()? std::optional(convert_to_torch_tensor(indices.value())) : std::nullopt;
     auto result = attention::fp8_fp4_paged_mqa_logits(
@@ -642,7 +643,7 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
         convert_to_torch_tensor(weights), convert_to_torch_tensor(context_lens),
         convert_to_torch_tensor(block_table), convert_to_torch_tensor(schedule_meta),
         static_cast<int>(max_context_len), clean_logits,
-        string_to_dtype(logits_dtype), indices_val);
+        string_to_dtype(logits_dtype), indices_val, to_optional_tensor(histogram));
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 

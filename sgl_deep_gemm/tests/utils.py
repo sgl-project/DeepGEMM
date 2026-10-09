@@ -77,3 +77,25 @@ def make_cublas_gemm(a: Tuple[torch.Tensor, torch.Tensor], b: Tuple[torch.Tensor
         return lambda: deep_gemm.cublaslt_nvfp4_gemm_nt(a_nvfp4, b_nvfp4, d, c=c)
     a_fp8, b_fp8 = convert_to_fp8(a), convert_to_fp8(b)
     return lambda: deep_gemm.cublaslt_gemm_nt(a_fp8[0], b_fp8[0], d, c=c)
+
+
+def ref_coarse_histogram(logits: torch.Tensor, context_lens: torch.Tensor, max_elems: int = 1 << 26) -> torch.Tensor:
+    """Reference of the paged MQA producers' optional coarse histogram: int32 [rows, 1024] over every live (column below
+    the row's context length) non-NaN score taken as FP32, bins in descending score order (bin 0 holds the largest).
+    |x| < 16: FP16-RN exponent and 4 mantissa bits; 16 <= |x| < 223: unit-width bins, lower-inclusive for negatives;
+    one saturating bin at each end; -0 counts as +0."""
+    rows, width = logits.shape
+    lens = context_lens.view(-1, 1)
+    hist = torch.zeros((rows, 1024), dtype=torch.int32, device=logits.device)
+    step = max(1, max_elems // max(width, 1))
+    for begin in range(0, rows, step):
+        x = logits[begin:begin + step].float()
+        bits = x.view(torch.int32).to(torch.int64) & 0xffffffff
+        magnitude = bits & 0x7fffffff
+        negative = ((bits >> 31) != 0) & (magnitude != 0)
+        code = (x.to(torch.float16).view(torch.int16).to(torch.int64) & 0x7fff) >> 6
+        bounded = torch.clamp(magnitude - negative.to(torch.int64), max=0x435f0000).to(torch.int32).view(torch.float32)
+        code = torch.where(code >= 304, torch.clamp(torch.floor(bounded).to(torch.int64) + 288, min=304), code)
+        live = (torch.arange(width, device=x.device)[None, :] < lens[begin:begin + step]) & ~torch.isnan(x)
+        hist[begin:begin + step].scatter_add_(1, torch.where(negative, 512 + code, 511 - code), live.int())
+    return hist
