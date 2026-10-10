@@ -229,6 +229,11 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
     const bool use_situ = activation == "situ";
     const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
+    // K3 SiTU config (activation_situ_{beta,linear_beta}). Passed to the kernel as template
+    // parameters: it only takes its equal-transform shortcut for this pair, and computes the
+    // literal SiTU for any other.
+    const float situ_beta = 4.0f;
+    const float situ_linear_beta = 25.0f;
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
@@ -373,7 +378,8 @@ static void fp8_fp4_mega_moe(
                                l2_act_scales.has_value()
                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
                                mma_kind,
-                               use_fp8_combine, use_trtllm_weights, global_num_tokens);
+                               use_fp8_combine, use_trtllm_weights, global_num_tokens,
+                               situ_beta, situ_linear_beta);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
