@@ -2,9 +2,70 @@
 ## Introduction
 
 sgl-deep-gemm is a pypi package built from SGLang's customized branch of DeepGemm. Comparing with origina DeepGemm, it supports the following features to better support SGLang:
-1. ABI support: with the help of tvm-ffi wrappers, a single wheel can run on different python versions.
+1. TVM FFI wrappers expose the kernels to Python; wheel compatibility depends on the build configuration.
 2. pypi support: easy installation with `pip install sgl-deep-gemm`. No need to manually search for wheel links.
 3. Fast iteration: add custom kernels and bump versions at no time.
+
+## AFD M2N extension
+
+`deep_gemm.mega.m2n` provides Mega MoE kernels for Attention-FFN Disaggregation (AFD). Attention-group (AG) ranks quantize and dispatch activations, then combine the expert outputs. Expert-group (EG) ranks run a persistent kernel that receives activations, computes the routed-expert MLPs, and returns the results. AG and EG can have different numbers of ranks.
+
+This extension is packaged as `sgl-deep-gemm==0.2.1.post1+afd.1`, based on SGLang DeepGEMM [v0.2.1.post1](https://github.com/sgl-project/DeepGEMM/commit/e885b74a23eb511c09a0c440e74f257d0e6b681f).
+
+### Requirements
+
+M2N requires SM100 or SM103 GPUs with peer-accessible memory. The allocator uses CUDA FABRIC handles when available and CUDA IPC otherwise. Cross-host execution requires a shared NVLink fabric with CUDA FABRIC access; the IPC path is limited to peers on the same host. M2N does not use DeepEP or NVSHMEM.
+
+The AG API accepts contiguous BF16 activations and produces BF16 outputs. Expert weights must use the Mega MoE layout:
+
+| Expert weights | Buffer `mma_type` | EG `use_fp8_weights` |
+| --- | --- | --- |
+| FP8 | `fp8xfp4` | `True` |
+| MXFP4 | `fp8xfp4` | `False` |
+| NVFP4 | `nvfp4xnvfp4` | `False` |
+
+`fp8xfp4` selects the FP8 activation-buffer format for both FP8 and MXFP4 weights. BF16 expert weights are not supported. Hidden and intermediate dimensions must be multiples of 128, or 256 for NVFP4. NVFP4 additionally requires activation scales and per-expert scaling tables; see the API docstrings in [`deep_gemm/mega/m2n.py`](../deep_gemm/mega/m2n.py).
+
+### Build and install
+
+Use a Linux Python environment with PyTorch and the [build requirements](#usage) installed. Build in an environment matching the target Python, platform, and PyTorch/CUDA ABI. Run from the repository root:
+
+```bash
+python3 -m pip install 'apache-tvm-ffi==0.1.11' ninja
+bash build_sgl_deep_gemm.sh
+python3 -m pip install dist/sgl_deep_gemm-0.2.1.post1+afd.1-*.whl
+```
+
+The build script initializes missing submodules and writes the wheel to `dist/`. It detects the GPU architecture automatically; set `TVM_FFI_CUDA_ARCH_LIST` when building for a different target or without a visible GPU. Keep the CUDA toolkit and C++ compiler available at runtime for DeepJIT compilation.
+
+From a directory outside the source checkout, check that the installed package exposes the M2N API:
+
+```bash
+python3 -c 'from deep_gemm.mega.m2n import get_symm_buffer_for_mega_moe_m2n, make_m2n_weight_descs, mega_moe_m2n_ag, mega_moe_m2n_eg'
+```
+
+### Interfaces
+
+Create one process group containing the AG ranks first, followed by the EG ranks. The number of experts must be divisible by the number of EG ranks.
+
+- `get_symm_buffer_for_mega_moe_m2n` allocates a communication buffer collectively across the group.
+- `make_m2n_weight_descs` builds one layer's weight descriptors from weights prepared with `deep_gemm.transform_weights_for_mega_moe`.
+- `mega_moe_m2n_ag` runs quantization, dispatch, combine, and output reduction for one layer on an AG rank.
+- `mega_moe_m2n_eg` runs the expert layers on an EG rank. It accepts one to four buffer lanes, all with the same layout and process group.
+
+All ranks must construct buffers in the same order and keep them alive through kernel execution and CUDA graph replay. Call `buffer.destroy()` collectively before destroying the process group. A failed buffer construction requires restarting the whole group.
+
+For a complete distributed example, see [`test_mega_moe_m2n.py`](tests/test_mega_moe_m2n.py), which uses two AG ranks and two EG ranks with eager execution and CUDA graph replay.
+
+### Attribution
+
+The M2N implementation was adapted from [FastAFD](https://github.com/hao-ai-lab/FastAFD/tree/3c7161949310b6d59d6b4cf9bf997a4935c8113b/python/minisgl/kernel/csrc/deepgemm). Files derived from that implementation include:
+
+- [`deep_gemm/include/deep_gemm/impls/sm100_mega_moe_m2n.cuh`](../deep_gemm/include/deep_gemm/impls/sm100_mega_moe_m2n.cuh)
+- [`deep_gemm/include/deep_gemm/layout/mega_moe_m2n.cuh`](../deep_gemm/include/deep_gemm/layout/mega_moe_m2n.cuh)
+- [`csrc/jit_kernels/impls/sm100_mega_moe_m2n.hpp`](../csrc/jit_kernels/impls/sm100_mega_moe_m2n.hpp)
+
+The symmetric Mega MoE implementation originates in DeepGEMM. The [packaged license](LICENSE) retains the DeepSeek and sgl-project MIT notices for the derived M2N code alongside the SGLang package license.
 
 ## Usage
 Build requirements include CUDA 12.9 or newer, a C++20 compiler with `std::format` support (for example GCC 13), and the elfutils development headers (`apt-get install libdw-dev` on Debian/Ubuntu). Initialize the CUTLASS and DeepJIT submodules with `git submodule update --init --recursive`.
