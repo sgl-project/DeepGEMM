@@ -30,7 +30,9 @@ if [[ ! -f "setup.py" || ! -d "sgl_deep_gemm" || ! -d "deep_gemm" || ! -d "csrc"
 fi
 
 echo "--- Initialising submodules ---"
-git submodule update --init --recursive
+if [[ ! -f third-party/cutlass/include/cutlass/cutlass.h || ! -f third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp ]]; then
+    git submodule update --init --recursive
+fi
 
 echo "--- Linking CUTLASS headers into deep_gemm/include ---"
 ln -sfn "${ROOT_DIR}/third-party/cutlass/include/cutlass" "${ROOT_DIR}/deep_gemm/include/cutlass"
@@ -40,7 +42,7 @@ echo "--- Preparing build directory ---"
 rm -rf "$BUILD_DIR"
 mkdir -p "$PKG_DIR"
 
-cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml "$BUILD_DIR/"
+cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml sgl_deep_gemm/setup.py "$BUILD_DIR/"
 cp sgl_deep_gemm/__init__.py sgl_deep_gemm/cuda_helpers.py "$PKG_DIR/"
 
 # `__init__.py` imports `.utils`, `.testing`, `.legacy`, `.mega` — pulled from

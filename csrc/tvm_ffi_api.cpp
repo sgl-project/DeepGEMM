@@ -1181,3 +1181,5 @@ void dg_k_grouped_fp4_gemm_nt_contiguous(TensorView a, TensorView a_sf,
     );
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_fp4_gemm_nt_contiguous, dg_k_grouped_fp4_gemm_nt_contiguous);
+
+#include "bindings/mega_m2n.hpp"
