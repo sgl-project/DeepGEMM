@@ -23,7 +23,8 @@ struct WorkspaceM2N {
     uint32_t num_max_pool_tokens;
     uint32_t num_max_pool_blocks;
 
-    // M2N has no in-kernel task counters and keeps its compact barrier layout.
+    // The last two reserved grid-sync slots hold EG task counters. Keep the
+    // header size and NVLink signal offsets identical on AG and EG ranks.
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
@@ -91,8 +92,18 @@ struct WorkspaceM2N {
     template <uint32_t kIndex = 0>
     CUTLASS_DEVICE
     uint32_t* get_grid_sync_count_ptr() const {
-        DG_STATIC_ASSERT(kIndex < kNumMaxGridSyncCounters, "Grid sync index out of bounds");
+        DG_STATIC_ASSERT(kIndex < 2, "Grid sync index overlaps task counters");
         return static_cast<uint32_t*>(base) + kIndex;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l1_task_count_ptr() const {
+        return static_cast<uint32_t*>(base) + 2;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_task_count_ptr() const {
+        return static_cast<uint32_t*>(base) + 3;
     }
 
     CUTLASS_DEVICE

@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe.cuh>
 
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
@@ -30,9 +31,6 @@ struct MegaMoEM2NConfig {
     // Swizzle modes for TMA descriptors
     int swizzle_acts_mode, swizzle_weights_mode;
 
-    // Number of experts to process per wave
-    int num_experts_per_wave;
-
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -49,7 +47,6 @@ struct MegaMoEM2NConfig {
            << ", num_max_pool_tokens=" << config.num_max_pool_tokens
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
-           << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -70,6 +67,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_m2n(
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
+    constexpr int kNumScheduleStages = 2;
     DG_HOST_ASSERT(num_dispatch_pull_stages >= 1);
 
     // Always multicast on A
@@ -93,10 +91,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_m2n(
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = std::max(smem_cd_l1, smem_cd_l2);
 
-    // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
+    // Barriers (stage-independent): dispatch, tensor memory, combine and task publication.
     const int smem_barriers = (
         num_dispatch_warps * num_dispatch_pull_stages +
-        kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+        kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
+    const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<false>));
 
     // Amax reduction
     const int smem_amax_reduction = store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float));
@@ -114,7 +113,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_m2n(
     const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_task_info + smem_barriers + smem_tmem_ptr;
 
     // Select maximum num_stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_per_stage;
@@ -129,8 +128,8 @@ static MegaMoEM2NConfig get_mega_moe_m2n_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
     const bool& use_nvfp4) {
-    // M2N keeps its full-pool scheduler and activation pipeline independent
-    // of the native MegaMoE ring-buffer configuration.
+    // Keep the existing M2N tiling and full activation pool while scheduling
+    // L1/L2 tasks dynamically.
     const int block_m = 64;
     const int store_block_m = 32;
     const int num_epilogue_threads = 128;
@@ -145,9 +144,6 @@ static MegaMoEM2NConfig get_mega_moe_m2n_config(
     // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
-
-    // Waves
-    const int num_experts_per_wave = num_experts_per_rank;
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -168,7 +164,6 @@ static MegaMoEM2NConfig get_mega_moe_m2n_config(
         sf_block_m, sf_block_n,
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
-        num_experts_per_wave,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
         num_dispatch_pull_stages

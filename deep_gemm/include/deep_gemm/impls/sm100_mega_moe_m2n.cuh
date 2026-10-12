@@ -492,7 +492,6 @@ template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
     uint32_t kNumExperts, uint32_t kNumTopk,
-    uint32_t kNumExpertsPerWave,
     uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t STORE_BLOCK_M,
     uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N,
@@ -661,6 +660,9 @@ sm100_mega_moe_m2n_eg_impl(
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
+    constexpr uint32_t kNumScheduleStages = 2;
+    constexpr uint32_t kNumScheduleConsumerThreads = 2 * kNumEpilogueThreads;
+    using task_info_t = sched::TaskInfo<false>;
 
     // Shared memory
     constexpr uint32_t kSharedMemoryAlignment = 1024;
@@ -729,14 +731,17 @@ sm100_mega_moe_m2n_eg_impl(
 
     auto smem_amax_reduction = reinterpret_cast<float2*>(smem_sfb[kNumStages]);
 
-    // Barriers and tensor memory pointer
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_amax_reduction + STORE_BLOCK_M * kNumEpilogueWarps / 2);
+    // Task payloads, barriers and tensor memory pointer
+    auto task_infos = reinterpret_cast<task_info_t*>(smem_amax_reduction + STORE_BLOCK_M * kNumEpilogueWarps / 2);
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(task_infos + kNumScheduleStages);
     auto dispatch_barriers      = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto full_barriers          = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + i); });
     auto empty_barriers         = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + kNumStages + i); });
     auto tmem_full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + kNumStages * 2 + i); });
     auto tmem_empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + kNumStages * 2 + kNumEpilogueStages + i); });
-    auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchBarrierSlots + kNumStages * 2 + kNumEpilogueStages * 2);
+    auto task_info_full_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + kNumStages * 2 + kNumEpilogueStages * 2 + i); });
+    auto task_info_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchBarrierSlots + kNumStages * 2 + kNumEpilogueStages * 2 + kNumScheduleStages + i); });
+    auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(task_info_empty_barriers[kNumScheduleStages]);
 
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();
@@ -762,6 +767,11 @@ sm100_mega_moe_m2n_eg_impl(
                 tmem_full_barriers[i]->init(1);
                 tmem_empty_barriers[i]->init(2 * kNumEpilogueThreads);
             }
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumScheduleStages; ++ i) {
+                task_info_full_barriers[i]->init(1);
+                task_info_empty_barriers[i]->init(kNumScheduleConsumerThreads);
+            }
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -781,6 +791,7 @@ sm100_mega_moe_m2n_eg_impl(
     // across the lane loop; resetting them would deadlock the pipelines)
     uint32_t pull_mbarrier_phase[kNumDispatchPullStages] = {};
     uint32_t mma_iter_idx = 0, epi_iter_idx = 0;
+    uint32_t sched_stage_idx = 0, sched_phase = 0;
 
     // ---- layer loop: ONE launch serves the whole step ---------------------
     // Per-launch costs (smem barrier init, cluster syncs, TMEM alloc,
@@ -846,39 +857,43 @@ sm100_mega_moe_m2n_eg_impl(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
 
     // Task scheduler: experts of this EG rank; sources are the AG ranks
-    auto scheduler = sched::LegacyMegaMoEScheduler<
+    auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
-        kNumExpertsPerWave,
         kNumSMs, kNumAGRanks,
+        kNumMaxPoolTokens / BLOCK_M,
+        /* kNumSharedExperts = */ 0,
         math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
         L1_SHAPE_N / BLOCK_N,
         L2_SHAPE_N / BLOCK_N,
-        L1_SHAPE_K / BLOCK_K,
-        L2_SHAPE_K / BLOCK_K,
+        L1_SHAPE_N / (BLOCK_N * 2),
+        L2_SHAPE_N / (BLOCK_N * 2),
         layout::WorkspaceM2N,
-        /* kRecvCountHighTarget = */ kNumAGRanks>(workspace);
+        /* kRecvCountHighTarget = */ kNumAGRanks>(
+            workspace, task_info_full_barriers[0], task_info_empty_barriers[0], task_infos);
+    scheduler.sched_stage_idx = sched_stage_idx;
+    scheduler.sched_phase = sched_phase;
 
     // Intra-SM Barrier indices
     constexpr uint32_t kDispatchBarrierIdx = 0;
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
-    // Gates the free-running GEMM warps' (TMA-A/TMA-B/MMA) per-iteration
+    // Gates the GEMM and scheduler warps' per-iteration
     // scheduler fetch on the dispatch warps' per-iteration release point.
     // Without it they can read the PREVIOUS layer's expert counts, since the
     // count spin target is already satisfied before cleanup zeroes the sums.
     constexpr uint32_t kSchedFetchBarrierIdx = 8;
-    constexpr uint32_t kNumSchedFetchThreads = kNumDispatchThreads + 3 * 32;
+    constexpr uint32_t kNumSchedFetchThreads = kNumDispatchThreads + 4 * 32;
 
     using namespace m2n_detail;
 
     // Adjust registers
-    constexpr uint32_t kNumDispatchRegisters = 48;
-    constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters = 208;
+    constexpr uint32_t kNumDispatchRegisters = 128;
+    constexpr uint32_t kNumNonEpilogueRegisters = 128;
+    constexpr uint32_t kNumEpilogueRegisters = 240;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -1121,7 +1136,10 @@ sm100_mega_moe_m2n_eg_impl(
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
-        if (sm_idx != 0) {
+        if (sm_idx == 0 and thread_idx == 0) {
+            *workspace.get_l1_task_count_ptr() = 0;
+            *workspace.get_l2_task_count_ptr() = 0;
+        } else if (sm_idx != 0) {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
@@ -1165,30 +1183,30 @@ sm100_mega_moe_m2n_eg_impl(
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                     const uint32_t& local_expert_idx,
-                                     const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+        task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
+            const auto block_phase = task_info.block_phase;
+            const auto num_k_blocks = task_info.shape_k / BLOCK_K;
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
 
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
+            const uint32_t pool_block_idx = task_info.pool_block_idx;
 
             // Wait the entire token arrival for linear 1
             if (block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                const auto expected = scheduler.template get_valid_m<false>();
+                const auto expected = task_info.valid_m;
                 while (ptx::ld_acq(ptr) != expected);
-            } else {
-                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                constexpr uint32_t kNumL1Blocks = L1_SHAPE_N / BLOCK_N;
-                const uint64_t expected = ~0ull >> (64 - kNumL1Blocks);
-                while (ptx::ld_acq_gpu(ptr) != expected);
             }
 
+            // The full pool starts from a cleared mask on every layer/lane.
+            sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K> l2_k_block_dependency(
+                workspace.get_l2_arrival_mask_ptr(pool_block_idx), 0);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                if (block_phase == sched::BlockPhase::Linear2)
+                    l2_k_block_dependency.wait(k_block_idx);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -1197,7 +1215,7 @@ sm100_mega_moe_m2n_eg_impl(
                 uint32_t sfa_k_idx = k_block_idx * (BLOCK_K / kSFChunkK);
 
                 if (not is_leader_cta)
-                    m_idx += scheduler.template get_valid_m<true>() / 2;
+                    m_idx += task_info.get_umma_aligned_valid_m() / 2;
 
                 if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
@@ -1212,7 +1230,7 @@ sm100_mega_moe_m2n_eg_impl(
                 }
                 __syncwarp();
             }
-        });
+        }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1230,17 +1248,19 @@ sm100_mega_moe_m2n_eg_impl(
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                     const uint32_t& local_expert_idx,
-                                     const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+        task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
+            const auto block_phase = task_info.block_phase;
+            const auto local_expert_idx = task_info.local_expert_idx;
+            const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
+            const auto num_k_blocks = task_info.shape_k / BLOCK_K;
             const auto tensor_map_b_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? tensor_map_l2_weights : tensor_map_l1_weights;
             const auto tensor_map_sfb_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? tensor_map_l2_weights_sf : tensor_map_l1_weights_sf;
 
-            const auto shape_n = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
-            const auto shape_k = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K;
+            const auto shape_n = task_info.shape_n;
+            const auto shape_k = task_info.shape_k;
             const auto shape_sfb_k = math::ceil_div(shape_k, kGranK * 4u);
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1269,7 +1289,7 @@ sm100_mega_moe_m2n_eg_impl(
                 }
                 __syncwarp();
             }
-        });
+        }
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Wait until dispatch warps have reached the scheduler-fetch point.
         ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
@@ -1298,11 +1318,10 @@ sm100_mega_moe_m2n_eg_impl(
                              "Invalid MMA instruction shape");
 
             auto& current_iter_idx = mma_iter_idx;
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                mma::sm100::update_instr_desc_with_umma_n(instr_desc, scheduler.template get_valid_m<true>());
+            task_info_t task_info;
+            while (scheduler.get_next_task(task_info)) {
+                const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+                mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
 
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
@@ -1372,7 +1391,7 @@ sm100_mega_moe_m2n_eg_impl(
 
                     empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
                 }
-            });
+            }
 
             // To safely deconstruct barriers, we need another round of waits
             if (current_iter_idx > 0) {
@@ -1381,8 +1400,13 @@ sm100_mega_moe_m2n_eg_impl(
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
+        ptx::sync_unaligned(kNumSchedFetchThreads, kSchedFetchBarrierIdx);
+
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+
+        if (is_leader_cta)
+            scheduler.mainloop(0);
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
@@ -1412,18 +1436,20 @@ sm100_mega_moe_m2n_eg_impl(
 
         // Persistently schedule over blocks
         auto& current_iter_idx = epi_iter_idx;
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                     const uint32_t& local_expert_idx,
-                                     const uint32_t& num_k_blocks,
-                                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+        task_info_t task_info;
+        while (scheduler.get_next_task(task_info)) {
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
+            scheduler.release_task_info();
 
-            const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
+            const auto block_phase = task_info.block_phase;
+            const auto local_expert_idx = task_info.local_expert_idx;
+            const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
+            const uint32_t valid_m = ptx::exchange(task_info.valid_m, 0);
+            const uint32_t pool_block_idx = task_info.pool_block_idx;
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
@@ -1584,8 +1610,8 @@ sm100_mega_moe_m2n_eg_impl(
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
                             const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                             __builtin_assume(token_base_idx < BLOCK_M);
-                            const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
-                                + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
+                            const auto sf_pool_token_idx = pool_block_idx * SF_BLOCK_M
+                                + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
                             sf_base_ptr[sf_addr] = static_cast<uint8_t>(sf_bits.x);
                             sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
@@ -1711,7 +1737,10 @@ sm100_mega_moe_m2n_eg_impl(
 
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
-        });
+        }
+        // Unlike a one-layer kernel, the next lane reuses these schedule slots.
+        // Other consumers reach the next fetch barrier before publication resumes.
+        scheduler.release_task_info();
 
         // Deallocate tensor memory (only at the very END: last layer, last lane)
         if (layer_i == num_layers - 1 and lane_i == kNumLanes - 1 and epilogue_warp_idx == 0)
@@ -1728,6 +1757,8 @@ sm100_mega_moe_m2n_eg_impl(
         // No local combine reduction on EG ranks.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
     }
+    sched_stage_idx = scheduler.sched_stage_idx;
+    sched_phase = scheduler.sched_phase;
     }  // lane loop
     }  // layer loop
 #else

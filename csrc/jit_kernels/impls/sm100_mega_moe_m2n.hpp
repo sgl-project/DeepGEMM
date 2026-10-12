@@ -219,7 +219,6 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {},
         {}, {}, {},
         {},
         {}, {},
@@ -239,7 +238,6 @@ static void __instantiate_kernel() {{
 )", args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
-    args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.store_block_m,
     args.config.sf_block_m, args.config.sf_block_n,
@@ -373,7 +371,7 @@ static void sm100_mega_moe_m2n_eg(
         : jit->device.get_num_sms();
     num_sms = std::max(num_sms / 2 * 2, 4);
 
-    // Fixed M64 and full expert waves avoid routing-sensitive small-block regressions.
+    // Keep fixed M64 while the task scheduler interleaves L1 and L2.
     const auto config = get_mega_moe_m2n_config(
         num_ag_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, expected_num_tokens_per_rank, num_topk,

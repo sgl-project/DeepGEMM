@@ -208,7 +208,9 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
-          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
+          uint32_t kNumL2Clusters = kNumL2BlockNs / 2,
+          typename WorkspaceT = layout::Workspace,
+          uint32_t kRecvCountHighTarget = kNumSMs * kNumRanks>
 struct MegaMoEScheduler {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
@@ -232,7 +234,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumRingBlocks > 0, "Invalid ring buffer config");
 
     // Workspace
-    const layout::Workspace& workspace;
+    const WorkspaceT& workspace;
 
     // Scheduler configs
     static constexpr uint32_t kNumScheduleStages = 2;
@@ -252,10 +254,10 @@ struct MegaMoEScheduler {
     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
     uint32_t num_sched_l1_waves = 0;
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace):
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace):
         workspace(workspace) {}
 
-    CUTLASS_DEVICE MegaMoEScheduler(const layout::Workspace& workspace,
+    CUTLASS_DEVICE MegaMoEScheduler(const WorkspaceT& workspace,
                                     Barrier* task_info_full_barriers,
                                     Barrier* task_info_empty_barriers,
                                     task_info_t* task_infos):
@@ -315,7 +317,7 @@ struct MegaMoEScheduler {
             if (expert_idx < kNumExpertsPerRank) {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
