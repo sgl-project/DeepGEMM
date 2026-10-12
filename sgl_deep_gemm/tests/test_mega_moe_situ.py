@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import deep_gemm
+from deep_gemm.testing import calc_diff
 from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist
 
@@ -100,7 +101,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         raise AssertionError("SiTU must reject BF16 symmetric-buffer allocation")
     cumulative_recv_stats = torch.zeros((num_experts,), dtype=torch.int, device="cuda")
 
-    def run(activation: str, activation_clamp=None):
+    def run(activation: str, activation_clamp=None, fast_math: bool = True):
         buffer.x[:num_tokens].copy_(x_fp8[0])
         buffer.x_sf[:num_tokens].copy_(x_fp8[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -115,16 +116,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_recv_stats,
             activation=activation,
             activation_clamp=activation_clamp,
-            fast_math=True,
+            fast_math=fast_math,
         )
         torch.cuda.synchronize()
         return y
 
     situ = run("situ")
+    situ_accurate = run("situ", fast_math=False)
     clamped_swiglu = run("swiglu", activation_clamp=0.03125)
 
     assert torch.isfinite(situ).all()
+    assert torch.isfinite(situ_accurate).all()
     assert torch.isfinite(clamped_swiglu).all()
+
+    # SiTU precision: the fast path only swaps `tanhf` for `__tanhf` and re-associates the
+    # identity above, so it has to land on the same bf16 output as the accurate path. The
+    # remaining `__tanhf` error (~1.6e-04 relative on the gate) is far below bf16's ~4e-03
+    # relative resolution, hence the bit-identical result measured here.
+    situ_diff = calc_diff(situ, situ_accurate)
+    assert situ_diff < 1e-6, f"fast-math SiTU diverged from the accurate path: {situ_diff}"
 
     kernel_sources = [
         path.read_text()
@@ -132,7 +142,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "cache/sm100_fp8_fp4_mega_moe.*/kernel.cu"
         )
     ]
-    assert len(kernel_sources) == 2
+    assert len(kernel_sources) == 3
     assert any(
         re.search(
             r"cute::numeric_limits<float>::infinity\(\),\s+0x0p[+-]\d+f,\s+true,\s+true",
@@ -140,6 +150,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         for source in kernel_sources
     ), "explicit SiTU did not instantiate kUseSitu=true"
+    assert any(
+        re.search(
+            r"cute::numeric_limits<float>::infinity\(\),\s+0x0p[+-]\d+f,\s+true,\s+false",
+            source,
+        )
+        for source in kernel_sources
+    ), "fast_math=False SiTU did not instantiate kFastMath=false"
     assert any(
         re.search(r"0x1p-5f,\s+0x0p[+-]\d+f,\s+false,\s+true", source) for source in kernel_sources
     ), "activation_clamp=0.03125 still instantiated kUseSitu=true"

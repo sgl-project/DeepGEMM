@@ -176,6 +176,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe.py
   test_mega_moe_sgl.py
   test_mega_moe_situ.py
+  test_mega_moe_situ_equal_transform.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_nvfp4_alphas.py
@@ -216,6 +217,8 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
     run_test test_mega_moe_sgl.py --num-processes "${NPROC}"
   fi
   [ -f "${TESTS_DIR}/test_mega_moe_situ.py" ] && run_test test_mega_moe_situ.py --num-processes 1
+  # Pure-torch identity check for the SiTU rewrite: no GPU, no distributed setup.
+  [ -f "${TESTS_DIR}/test_mega_moe_situ_equal_transform.py" ] && run_test test_mega_moe_situ_equal_transform.py
   L1_NPROC="${NPROC}"
   if [ "${L1_NPROC}" -gt 2 ]; then
     L1_NPROC=2

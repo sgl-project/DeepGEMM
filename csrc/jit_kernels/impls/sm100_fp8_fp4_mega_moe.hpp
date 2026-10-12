@@ -97,7 +97,9 @@ static void sm100_fp8_fp4_mega_moe(
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
     const bool& use_trtllm_weights = false,
-    const std::optional<int64_t>& global_num_tokens = std::nullopt
+    const std::optional<int64_t>& global_num_tokens = std::nullopt,
+    const float& situ_beta = 4.0f,
+    const float& situ_linear_beta = 25.0f
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -272,6 +274,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {}, {}, {}, {},
+        {}, {},
         {}
     >);
 }};
@@ -298,6 +301,7 @@ static void __instantiate_kernel() {{
     (l2_act_scales != nullptr) ? "true" : "false",
     use_fp8_combine ? "true" : "false",
     to_string(l1_weights.scalar_type()),
+    to_string(situ_beta), to_string(situ_linear_beta),
     use_trtllm_weights ? "true" : "false"));
     // Launch
     jit->launch(
