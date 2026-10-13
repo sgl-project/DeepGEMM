@@ -8,10 +8,6 @@
 #   --release selects bounded attention coverage and focused sanitizer functions.
 set -uo pipefail
 
-# TVM FFI probes CUDA availability while loading Torch's DLPack fast path.
-# NVML discovery avoids creating a CUDA context before fork-based tests.
-export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK-1}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEEPGEMM_SRC="$(cd "${SCRIPT_DIR}/.." && pwd)"
 if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then

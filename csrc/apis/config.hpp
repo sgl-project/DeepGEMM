@@ -5,7 +5,7 @@
 
 namespace deep_gemm::config {
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
     m.def("init", [&](const std::string& library_root_path) {

@@ -621,7 +621,7 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                     context_lens, block_table, schedule_meta,
                                     max_context_len, clean_logits, torch::kFloat, indices);
 }
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,

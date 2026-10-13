@@ -58,7 +58,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
 }
 
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,

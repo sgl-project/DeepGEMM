@@ -258,7 +258,7 @@ static void mega_mhc(const torch::Tensor& x,
         shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
 }
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 static void register_apis(pybind11::module_& m) {
     m.def(
         "mega_mhc",
