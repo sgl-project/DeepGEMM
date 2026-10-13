@@ -211,7 +211,7 @@ static std::map<std::string, int64_t> get_bf16_mega_gate_config(const int& num_t
     return result;
 }
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 static void register_apis(pybind11::module_& m) {
     m.def("get_bf16_mega_gate_config", &get_bf16_mega_gate_config,
           py::arg("num_tokens"), py::arg("hidden"),

@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import os
-import shutil
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
-import tvm_ffi
 
-from .cuda_helpers import find_cuda_home, get_cuda_arch
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+from .cuda_helpers import find_cuda_home
 
 # Set some default environment provided at setup
 try:
@@ -22,91 +17,33 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# Build & load the tvm-ffi _C module
+# Build & load the TORCH_LIBRARY _C module
 # ---------------------------------------------------------------------------
-def _build_module(pkg_dir: str, cuda_home: str) -> str:
-    """Build the _C shared library using tvm_ffi.cpp.build()."""
-    import tvm_ffi.cpp
+class _TorchOps:
+    """`_C.<name>` is `torch.ops.deep_gemm.<name>.default`, bound once to skip per-call overload resolution."""
 
-    root_dir = os.path.dirname(pkg_dir)
-    cxx_abi = int(torch.compiled_with_cxx11_abi())
+    def __getattr__(self, name: str):
+        op = getattr(torch.ops.deep_gemm, name).default
+        setattr(self, name, op)
+        return op
 
-    os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', get_cuda_arch())
 
-    extra_cflags = [
-        '-std=c++20', '-O3', '-fPIC',
-        '-Wno-psabi', '-Wno-deprecated-declarations',
-        f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
-    ]
-    if int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')):
-        extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
-
-    # Torch include/lib paths
-    torch_dir = os.path.dirname(torch.__file__)
-    torch_include = os.path.join(torch_dir, 'include')
-    torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
-    torch_lib = os.path.join(torch_dir, 'lib')
-
-    import sysconfig
-    python_include = sysconfig.get_path('include')
-
-    extra_include_paths = [
-        f'{cuda_home}/include',
-        python_include,
-        torch_include,
-        torch_include_csrc,
-        os.path.join(root_dir, 'deep_gemm', 'include'),
-        os.path.join(root_dir, 'third-party', 'cutlass', 'include'),
-        os.path.join(root_dir, 'third-party', 'deep_jit', 'include'),
-    ]
-    cccl_path = f'{cuda_home}/include/cccl'
-    if os.path.exists(cccl_path):
-        extra_include_paths.append(cccl_path)
-
-    extra_ldflags = [
-        f'-L{cuda_home}/lib64',
-        f'-L{torch_lib}',
-        '-lcudart',
-        '-lnvrtc',
-        '-lcublasLt',
-        '-lcublas',
-        '-ltorch',
-        '-ltorch_cpu',
-        '-lc10',
-        '-lc10_cuda',
-        '-ltorch_cuda',
-    ]
-
-    build_dir = os.path.join(pkg_dir, '_C_build')
-    os.makedirs(build_dir, exist_ok=True)
-
-    lib_path = tvm_ffi.cpp.build(
-        name='_C',
-        cpp_files=[os.path.join(root_dir, 'csrc', 'tvm_ffi_api.cpp')],
-        extra_cflags=extra_cflags,
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=extra_include_paths,
-        build_directory=build_dir,
-    )
-    # Copy the .so into the package directory for easy loading
-    target = os.path.join(pkg_dir, '_C.so')
-    shutil.copy2(lib_path, target)
-    return target
-
-def _load_module() -> Module:
-    """Load (or build then load) the compiled tvm-ffi module."""
+def _load_module() -> _TorchOps:
+    """Load (or build then load) the compiled TORCH_LIBRARY module."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     lib_path = os.path.join(pkg_dir, '_C.so')
 
     if not os.path.exists(lib_path):
+        from .build_ext import build_extension
         cuda_home = find_cuda_home()
-        print(f'[DeepGEMM] Building _C module with tvm-ffi (CUDA_HOME={cuda_home})...')
-        lib_path = _build_module(pkg_dir, cuda_home)
+        print(f'[DeepGEMM] Building _C module (CUDA_HOME={cuda_home})...')
+        build_extension(os.path.dirname(pkg_dir), lib_path, cuda_home)
         print(f'[DeepGEMM] Built _C module: {lib_path}')
 
-    return tvm_ffi.load_module(lib_path)
+    torch.ops.load_library(lib_path)
+    return _TorchOps()
 
-_C: Module = _load_module()
+_C = _load_module()
 
 # ---------------------------------------------------------------------------
 # Runtime config
@@ -216,31 +153,29 @@ try:
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
 
     def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
-        return _from_dlpack_if_needed(_C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices))
+        return _C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices)
 
     def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
         (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
-        return _from_dlpack_if_needed(_C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k))
+        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
     def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
-        logits_dtype_str = str(logits_dtype).split('.')[-1]
         (q, q_sf) = q if isinstance(q, (tuple, list)) else (q, None)
-        return _from_dlpack_if_needed(_C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype_str, indices))
+        return _C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype, indices)
 
     def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float, schedule_meta=None):
         (q, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
-        logits_dtype_str = str(logits_dtype).split('.')[-1]
-        return _from_dlpack_if_needed(_C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype_str, schedule_meta))
+        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype, schedule_meta)
 
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
-        return _from_dlpack_if_needed(_C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices))
+        return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
 
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
     def transform_sf_into_required_layout(sf, mn, k, recipe, num_groups=None, is_sfa=None, disable_ue8m0_cast=False, psum_layout=None):
         (recipe_a, recipe_b, recipe_c) = recipe if len(recipe) == 3 else (recipe[0], recipe[1], None)
-        return _from_dlpack_if_needed(_C.transform_sf_into_required_layout(sf, mn, k, recipe_a, recipe_b, recipe_c, num_groups, is_sfa, disable_ue8m0_cast, psum_layout))
+        return _C.transform_sf_into_required_layout(sf, mn, k, recipe_a, recipe_b, recipe_c, num_groups, is_sfa, disable_ue8m0_cast, psum_layout)
 
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
@@ -301,38 +236,38 @@ def k_grouped_fp4_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None,
 
 
 def get_mqa_logits_metadata(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
-    return _from_dlpack_if_needed(_C.get_mqa_logits_metadata(
-        cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads))
+    return _C.get_mqa_logits_metadata(
+        cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads)
 
 
 def get_sparse_mqa_logits_metadata(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens,
                                     sparse_kv_block_indices, qk_dtype, sparse_block_kv,
                                     use_unaligned_ks=False):
-    return _from_dlpack_if_needed(_C.get_sparse_mqa_logits_metadata(
+    return _C.get_sparse_mqa_logits_metadata(
         cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, sparse_kv_block_indices,
-        str(qk_dtype).split('.')[-1], sparse_block_kv, use_unaligned_ks))
+        qk_dtype, sparse_block_kv, use_unaligned_ks)
 
 
 def get_paged_sparse_mqa_logits_metadata(context_lens, block_table, indices, page_kv,
                                           sparse_kv_block_indices, qk_dtype, sparse_block_kv):
-    return _from_dlpack_if_needed(_C.get_paged_sparse_mqa_logits_metadata(
+    return _C.get_paged_sparse_mqa_logits_metadata(
         context_lens, block_table, indices, page_kv, sparse_kv_block_indices,
-        str(qk_dtype).split('.')[-1], sparse_block_kv))
+        qk_dtype, sparse_block_kv)
 
 
 def fp8_fp4_sparse_mqa_logits(q, kv, weights, metadata, num_max_sparse_blocks,
                                sparse_block_kv, use_unaligned_ks=False):
     (q_data, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
-    return _from_dlpack_if_needed(_C.fp8_fp4_sparse_mqa_logits(
+    return _C.fp8_fp4_sparse_mqa_logits(
         q_data, q_sf, kv_data, kv_sf, weights, metadata, num_max_sparse_blocks,
-        sparse_block_kv, use_unaligned_ks))
+        sparse_block_kv, use_unaligned_ks)
 
 
 def fp8_fp4_paged_sparse_mqa_logits(q, kv_cache, weights, metadata,
                                      num_max_sparse_blocks, sparse_block_kv):
     q_data, q_sf = q if isinstance(q, (tuple, list)) else (q, None)
-    return _from_dlpack_if_needed(_C.fp8_fp4_paged_sparse_mqa_logits(
-        q_data, q_sf, kv_cache, weights, metadata, num_max_sparse_blocks, sparse_block_kv))
+    return _C.fp8_fp4_paged_sparse_mqa_logits(
+        q_data, q_sf, kv_cache, weights, metadata, num_max_sparse_blocks, sparse_block_kv)
 
 
 def get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk):
@@ -350,10 +285,7 @@ def bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts
         routed_scaling_factor, ep_rank, scoring_func, mask, bias, image_bias,
         image_token_mask, fix_routing_mask, to_physical_map, logical_count,
         unmapped_topk_idx, force_random, out_idx, out_weights)
-    if out_idx is not None:
-        # FFI returns borrowed views of supplied outputs; retain their owners.
-        return out_idx, out_weights
-    return tuple(_from_dlpack_if_needed(tensor) for tensor in result)
+    return (out_idx, out_weights) if out is not None else result
 
 
 def mega_mhc(x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales,
@@ -362,20 +294,12 @@ def mega_mhc(x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scal
                 new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
                 y_bf16=None, y_fp8=None, y_gemm_sf=None, y_routed_sf=None,
                 y_shared_sf=None, shared_sf_block_m=0):
-    # DLPack describes the logical view, not the full allocation. Shared SF
-    # stores also write padded rows, so carry a bounds-checked storage view.
-    shared_sf_storage = None
-    if y_shared_sf is not None:
-        available = (y_shared_sf.untyped_storage().nbytes() // y_shared_sf.element_size()
-                     - y_shared_sf.storage_offset())
-        shared_sf_storage = y_shared_sf.as_strided((available,), (1,))
     _C.mega_mhc(
         x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales,
         mix_bases, hc_mult, hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps,
         num_sinkhorn_iters, rmsnorm_weight, rmsnorm_eps, rmsnorm_scale,
         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
-        y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m,
-        shared_sf_storage)
+        y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m)
 
 # Mega kernels
 from . import mega
@@ -390,14 +314,6 @@ from .mega import (
     mega_moe_pre_dispatch_sm90,
     get_block_m_for_mega_moe,
 )
-
-
-def _from_dlpack_if_needed(tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-    if not isinstance(tensor, torch.Tensor):
-        tensor = torch.utils.dlpack.from_dlpack(tensor)
-    if dtype is not None and tensor.dtype != dtype:
-        tensor = tensor.view(dtype)
-    return tensor
 
 
 class SM90SymmBuffer:
@@ -416,12 +332,11 @@ class SM90SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
 
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            use_fp8_dispatch, activation
-        )
+        layout_args = (group.size(), num_experts,
+                       num_max_tokens_per_rank, num_topk,
+                       hidden, intermediate_hidden,
+                       use_fp8_dispatch, activation)
+        num_bytes = _C.get_symm_buffer_size_for_sm90_mega_moe(*layout_args)
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
         self.buffer.zero_()
@@ -429,15 +344,15 @@ class SM90SymmBuffer:
         torch.cuda.synchronize()
 
         (x, x_sf, topk_idx, topk_weights,
-         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = slice_input_buffers(self.buffer)
-        self.x = _from_dlpack_if_needed(x, torch.float8_e4m3fn)
-        self.x_sf = _from_dlpack_if_needed(x_sf)
-        self.topk_idx = _from_dlpack_if_needed(topk_idx)
-        self.topk_weights = _from_dlpack_if_needed(topk_weights)
-        self.l1_acts = _from_dlpack_if_needed(l1_acts, torch.float8_e4m3fn)
-        self.l1_acts_sf = _from_dlpack_if_needed(l1_acts_sf)
-        self.l2_acts = _from_dlpack_if_needed(l2_acts, torch.float8_e4m3fn)
-        self.l2_acts_sf = _from_dlpack_if_needed(l2_acts_sf)
+         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = _C.slice_symm_buffer_for_sm90_mega_moe(self.buffer, *layout_args)
+        self.x = x
+        self.x_sf = x_sf
+        self.topk_idx = topk_idx
+        self.topk_weights = topk_weights
+        self.l1_acts = l1_acts
+        self.l1_acts_sf = l1_acts_sf
+        self.l2_acts = l2_acts
+        self.l2_acts_sf = l2_acts_sf
 
     def destroy(self):
         self.handle = None

@@ -116,7 +116,7 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     DG_HOST_UNREACHABLE("Unknown cases");
 }
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,

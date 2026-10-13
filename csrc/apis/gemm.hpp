@@ -930,7 +930,7 @@ static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_batched_gemm(a_3d, b_transposed, d_3d, m, k, m, num_batches, major_a, major_b);
 }
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
 

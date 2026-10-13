@@ -314,7 +314,7 @@ static void fp8_einsum(const std::string& expr,
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }
 }
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 
 static void register_apis(pybind11::module_& m) {
     m.def("einsum", &einsum,

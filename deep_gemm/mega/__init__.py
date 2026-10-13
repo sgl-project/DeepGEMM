@@ -65,13 +65,12 @@ class SymmBuffer:
         self.activation = activation
 
         # Allocate or reuse a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
-        )
+        layout_args = (group.size(), num_experts,
+                       num_max_tokens_per_rank, num_topk,
+                       hidden, intermediate_hidden,
+                       mma_type, activation,
+                       num_shared_experts)
+        num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -92,24 +91,14 @@ class SymmBuffer:
             self.buffer = base.buffer
             self.handle = base.handle
 
-        # Create input buffer views (as torch tensors, not tvm-ffi tensors).
+        # Create input buffer views; absent ones (BF16 SFs, no shared experts) are empty byte tensors
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf,
-         self.x_scales) = map(
-            torch.from_dlpack, slice_input_buffers(self.buffer))
-
-        # Restore activation types after the FFI transports unsupported DLPack dtypes as bytes.
-        activation_dtype = (torch.bfloat16 if mma_type == 'bf16xbf16' else
-                            torch.uint8 if mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4') else
-                            torch.float8_e4m3fn)
-        for name in ('x', 'shared_l1_acts', 'shared_l2_acts', 'l1_acts', 'l2_acts'):
-            value = getattr(self, name)
-            if value.numel():
-                setattr(self, name, value.view(activation_dtype))
+         self.x_scales) = _C.slice_symm_buffer_for_mega_moe(self.buffer, *layout_args)
 
     def destroy(self):
         self.handle = None
