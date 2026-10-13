@@ -9,7 +9,7 @@
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_sm90_mega_moe() {
-    return layout::kLCMCandidateBlockM;
+    return layout::kSM90LCMBlockM;
 }
 
 static void mega_moe_pre_dispatch_sm90(
@@ -35,19 +35,25 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool& use_fp8_dispatch, const std::string& activation,
+    const int& num_ring_tokens, const int& l2_act_sf_gran_k) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(l2_act_sf_gran_k == 64 or l2_act_sf_gran_k == 128);
+    // also asserted at launch; here so a shape this kernel cannot serve is reported before a buffer is allocated for it
+    DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
 
     const auto workspace = layout::SM90Workspace(
-        nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
+        nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_ring_tokens);
 
     const auto fp8_token_layout = layout::Data(hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
-    const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden / 16);
+    // L2 act SF pool: one float per l2_act_sf_gran_k K per token, slot-major (`[k_sf_idx][pool token]`); the per-token byte count only
+    // sizes it, so it need not be a multiple of 16, and the pool's total size is a multiple of 1024 bytes
+    const auto fp8_intermediate_sf_layout = layout::Data(intermediate_hidden * 4 / l2_act_sf_gran_k, false);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
     const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -66,26 +72,22 @@ get_symm_buffer_size_for_sm90_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
-    int num_max_padded_sf_pool_tokens = 0;
-    for (int block_m: layout::kCandidateBlockM) {
-        num_max_padded_sf_pool_tokens = std::max(
-            num_max_padded_sf_pool_tokens,
-            layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m)
-        );
-    }
+    // 0 means "no ring": data pools sized by the full pool (legacy behavior).
+    const int num_data_pool_tokens = num_ring_tokens == 0 ? num_max_pool_tokens : num_ring_tokens;
+    const int num_max_padded_sf_pool_tokens = get_num_padded_sf_pool_tokens_sm90(num_data_pool_tokens);
 
     const auto l1_token_buffer = layout::Buffer(
-        fp8_token_layout, 1, num_max_pool_tokens,
+        fp8_token_layout, 1, num_data_pool_tokens,
         input_topk_weights_buffer.get_end_ptr());
     const auto l1_sf_buffer = layout::Buffer(
         fp8_sf_layout, 1, num_max_padded_sf_pool_tokens,
         l1_token_buffer.get_end_ptr());
     const auto l1_topk_weights_buffer = layout::Buffer(
-        l1_topk_weights_layout, 1, num_max_pool_tokens,
+        l1_topk_weights_layout, 1, num_data_pool_tokens,
         l1_sf_buffer.get_end_ptr());
 
     const auto l2_token_buffer = layout::Buffer(
-        fp8_intermediate_token_layout, 1, num_max_pool_tokens,
+        fp8_intermediate_token_layout, 1, num_data_pool_tokens,
         l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer = layout::Buffer(
         fp8_intermediate_sf_layout, 1, num_max_padded_sf_pool_tokens,
@@ -116,7 +118,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_max_pool_tokens, hidden},
+            {num_data_pool_tokens, hidden},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
@@ -125,11 +127,11 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, intermediate_hidden},
+            {num_data_pool_tokens, intermediate_hidden},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, intermediate_hidden / 64},
+            {num_max_padded_sf_pool_tokens, intermediate_hidden / l2_act_sf_gran_k},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
@@ -149,7 +151,13 @@ static void fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    // `num_ring_tokens`, `l2_lag_encoded` and `l2_act_sf_gran_k` are the values `get_symm_buffer_size_for_sm90_mega_moe` sized
+    // `sym_buffer` with; `num_tokens_bound` is the caller's bound on this call's per-rank token count on every rank (0 = capacity)
+    const int& num_ring_tokens,
+    const int& num_tokens_bound,
+    const int& l2_lag_encoded,
+    const int& l2_act_sf_gran_k
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -198,9 +206,15 @@ static void fp8_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation, num_ring_tokens, l2_act_sf_gran_k);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
+    // 0 means the buffer capacity. A bound is the per-rank token count every rank's schedule is sized for, so it must
+    // be the same on every rank: this checks only the local count, and a bound below a peer's count sizes this rank's
+    // single-wave pool for fewer rows than arrive, which reuses a ring slot inside one wave and hangs.
+    DG_HOST_ASSERT(num_tokens_bound >= 0);
+    DG_HOST_ASSERT(num_tokens_bound == 0 or num_tokens_bound >= num_tokens);
+    DG_HOST_ASSERT(num_tokens_bound <= num_max_tokens_per_rank);
 
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
@@ -215,7 +229,9 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     num_ring_tokens, l2_act_sf_gran_k,
+                     activation_clamp, fast_math,
+                     num_tokens_bound, l2_lag_encoded);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
