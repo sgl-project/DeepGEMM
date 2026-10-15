@@ -425,12 +425,15 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
+                float combine_weights[2];
 
                 uint32_t mask = total_mask;
                 const auto move_mask_and_load = [&](const uint32_t& i) {
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        if constexpr (kUseNVFP4)
+                            combine_weights[i] = __ldg(topk_weights_in + token_idx * kNumTopk + slot_idx);
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
@@ -455,8 +458,18 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                         const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
                         const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                            if constexpr (kUseNVFP4) {
+                                // Weight after FC2 BF16 conversion, without shrinking the FP4 activation.
+                                const auto weight = combine_weights[load_stage_idx];
+                                const auto weighted = __fmul2_rn(
+                                    __bfloat1622float2(bf16_values[l]), {weight, weight});
+                                reduced[j * kNumElemsPerUint4 + l] = __fadd2_rn(
+                                    reduced[j * kNumElemsPerUint4 + l], weighted);
+                            } else {
+                                ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                            }
+                        }
                     }
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
@@ -1482,19 +1495,18 @@ sm100_mega_moe_m2n_eg_impl(
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
-                            stored_cached_weight = *l1_topk_weights_buffer
-                                .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
-                                .get_base_ptr<float>();
+                        float2 weights = {l2_act_scale, l2_act_scale};
+                        if constexpr (not kUseNVFP4) {
+                            if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                stored_cached_weight = *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                    .get_base_ptr<float>();
+                            }
+                            weights = {
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
                         }
-
-                        float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
-                        };
-
-                        if constexpr (kUseNVFP4)
-                            weights = __fmul2_rn(weights, {l2_act_scale, l2_act_scale});
 
                         // Load from TMEM
                         uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
@@ -1541,7 +1553,12 @@ sm100_mega_moe_m2n_eg_impl(
                                 gate = {gate.x / denom.x, gate.y / denom.y};
                             }
                             const auto up = __bfloat1622float2(bf16_up);
-                            swiglu_values[i * 2 + k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                            auto activated = __fmul2_rn(gate, up);
+                            if constexpr (kUseNVFP4) {
+                                // CuTeDSL quantizes the BF16 SiLU output before applying routing weights.
+                                activated = __bfloat1622float2(__float22bfloat162_rn(activated));
+                            }
+                            swiglu_values[i * 2 + k] = __fmul2_rn(activated, weights);
                         }
 
                         amax_values[i].x = math::warp_reduce<4, true>(

@@ -192,7 +192,7 @@ def _reference(
         route_weights = weights[rows, slots, None]
         if nvfp4_scales is not None:
             activation = _nvfp4_roundtrip(
-                activation * (route_weights * l2_act_scales[expert])
+                activation.bfloat16().float() * l2_act_scales[expert]
             )
         else:
             activation = _fp8_roundtrip(activation * route_weights)
@@ -200,6 +200,8 @@ def _reference(
         if nvfp4_scales is not None:
             expert_output *= (l2_scales[expert] * l2_act_scales[expert]).reciprocal()
         expert_output = expert_output.bfloat16().float()
+        if nvfp4_scales is not None:
+            expert_output *= route_weights
         output.index_add_(0, rows, expert_output)
     return (output * output_scale).bfloat16()
 
