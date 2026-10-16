@@ -33,6 +33,10 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kWithPostExpertNorm = false,
+    bool kPostNormWeightFirst = false,
+    bool kPostNormHasWeight = false,
+    float kPostNormEps = 1e-6f,
     bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -52,6 +56,7 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
+                         const float* post_expert_norm_weight,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -79,6 +84,11 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kUseTrtllmWeights or
                      (kHidden % 64 == 0 and kIntermediateHidden % 64 == 0 and BLOCK_K % 64 == 0),
                      "TRTLLM BF16 weights require complete 128-byte K blocks");
+
+    DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0,
+                     "Post-expert norm does not support shared experts");
+    DG_STATIC_ASSERT(not kPostNormHasWeight or kWithPostExpertNorm,
+                     "Post-expert norm weight requires normalization");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -972,7 +982,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                        if (not kWithPostExpertNorm and not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
@@ -1294,6 +1304,42 @@ sm100_bf16_mega_moe_impl(void* y,
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
+            // Every lane joins each full-row reduction, two-chunk combine included.
+            float slot_norm_scale = 1.0f;
+            if constexpr (kWithPostExpertNorm) {
+                const float my_topk_weight = lane_idx < kNumTopk ?
+                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                          token_idx * kNumTopk + lane_idx) : 0.0f;
+                #pragma unroll 1
+                for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                    if (not (total_mask >> slot_idx & 1))
+                        continue;
+                    const auto row_ptr = buffer.combine_token_buffer.get_rank_buffer(slot_idx)
+                                         .get_data_buffer(token_idx).get_base_ptr<uint4>();
+                    float sum_sq = 0.0f;
+                    #pragma unroll 4
+                    for (uint32_t j = 0; j < kNumHiddenBytes / sizeof(uint4) / 32; ++ j) {
+                        const uint32_t elem_idx = (j * 32 + lane_idx) * 8;
+                        const uint4 raw = __ldg(row_ptr + j * 32 + lane_idx);
+                        const auto values = reinterpret_cast<const nv_bfloat162*>(&raw);
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kNumElemsPerUint4; ++ k) {
+                            float2 value = __bfloat1622float2(values[k]);
+                            if constexpr (kPostNormHasWeight and kPostNormWeightFirst)
+                                value = __fmul2_rn(value, __ldg(reinterpret_cast<const float2*>(
+                                    post_expert_norm_weight + elem_idx + k * 2)));
+                            sum_sq = __fmaf_rn(value.x, value.x, sum_sq);
+                            sum_sq = __fmaf_rn(value.y, value.y, sum_sq);
+                        }
+                    }
+                    const float inv_rms = rsqrtf(
+                        math::warp_reduce_sum(sum_sq) / static_cast<float>(kHidden) + kPostNormEps);
+                    if (lane_idx == slot_idx)
+                        slot_norm_scale = my_topk_weight * inv_rms;
+                }
+            }
+
+
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 
             // Move mask and load
@@ -1314,33 +1360,60 @@ sm100_bf16_mega_moe_impl(void* y,
                         ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
                     }
                     __syncwarp();
-                    return true;
+                    return static_cast<int>(slot_idx);
                 }
-                return false;
+                return -1;
             };
 
             // Load the first selection
-            bool do_reduce = move_mask_and_load(load_stage_idx);
+            int active_slot = move_mask_and_load(load_stage_idx);
 
             // Accumulate all top-k contributions for this chunk in float registers
             float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-            while (do_reduce) {
+            while (active_slot >= 0) {
                 // Prefetch next top-k into the buffer while current is being accumulated
-                do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                const int next_slot = move_mask_and_load(load_stage_idx ^ 1);
 
                 // Accumulate
                 combine_load_barriers[load_stage_idx]->wait(combine_phase);
+                float slot_scale = 1.0f;
+                if constexpr (kWithPostExpertNorm)
+                    slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
+                                             static_cast<uint32_t>(active_slot));
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
                     const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
                     #pragma unroll
-                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                        ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                        auto& acc = reduced[j * kNumElemsPerUint4 + l];
+                        if constexpr (kWithPostExpertNorm) {
+                            const float2 pair = __bfloat1622float2(bf16_values[l]);
+                            acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
+                            acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
+                        } else {
+                            ptx::accumulate(acc, bf16_values[l]);
+                        }
+                    }
                 }
                 cutlass::arch::fence_view_async_shared();
                 combine_phase ^= load_stage_idx;
                 load_stage_idx ^= 1;
+                active_slot = next_slot;
+            }
+
+            if constexpr (kPostNormHasWeight) {
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                    const uint32_t elem_idx = chunk_idx * kNumChunkBytes / sizeof(nv_bfloat16) +
+                                              (j * 32 + lane_idx) * 8;
+                    #pragma unroll
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                        auto& acc = reduced[j * kNumElemsPerUint4 + l];
+                        acc = __fmul2_rn(acc, __ldg(reinterpret_cast<const float2*>(
+                            post_expert_norm_weight + elem_idx + l * 2)));
+                    }
+                }
             }
 
             // Cast

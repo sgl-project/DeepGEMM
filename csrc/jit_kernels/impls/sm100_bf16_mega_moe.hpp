@@ -49,6 +49,10 @@ static void sm100_bf16_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
+    const float* post_expert_norm_weight,
+    const bool& post_expert_norm,
+    const bool& post_expert_norm_weight_first,
+    const float& post_expert_norm_eps,
     const bool& use_trtllm_weights = false,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
@@ -160,7 +164,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -176,6 +180,10 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
+        post_expert_norm ? "true" : "false",
+        post_expert_norm_weight_first ? "true" : "false",
+        post_expert_norm_weight != nullptr ? "true" : "false",
+        to_string(post_expert_norm_eps),
         use_trtllm_weights ? "true" : "false"));
 
     // Launch
@@ -187,6 +195,7 @@ static void __instantiate_kernel() {{
             .cluster_dim = dim3(2, 1, 1),
         },
         y.data_ptr(),
+        post_expert_norm_weight,
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),

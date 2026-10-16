@@ -96,6 +96,7 @@ struct Workspace {
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
+    uint32_t num_topk;
     uint32_t num_shared_l2_pool_blocks;
 
     // Full-pool span used by non-ring token metadata
@@ -112,7 +113,7 @@ struct Workspace {
               const uint32_t& num_ring_tokens):
         signals(static_cast<MegaMoESignals*>(base)),
         num_ranks(num_ranks), num_experts(num_experts),
-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
+        num_max_tokens_per_rank(num_max_tokens_per_rank), num_topk(num_topk) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
@@ -138,6 +139,10 @@ struct Workspace {
 
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+
+        // Post-expert-norm partial sums of squares, one per (token, top-k slot). Sized
+        // unconditionally so the layout does not depend on a kernel template flag.
+        num_bytes += num_max_tokens_per_rank * num_topk * sizeof(float);
 
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
@@ -261,6 +266,13 @@ struct Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // Each L2 N tile accumulates its partial sum of squares here for the combine.
+    CUTLASS_DEVICE
+    float* get_post_norm_sum_sq_ptr(const uint32_t& token_idx = 0, const uint32_t& topk_idx = 0) const {
+        const auto base = reinterpret_cast<float*>(get_token_src_metadata_ptr(num_max_pool_tokens));
+        return base + token_idx * num_topk + topk_idx;
     }
 };
 

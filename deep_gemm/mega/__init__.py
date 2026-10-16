@@ -255,7 +255,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l2_alphas: Optional[torch.Tensor] = None,
                      l2_act_scales: Optional[torch.Tensor] = None,
                      weight_layout: str = 'megamoe',
-                     global_num_tokens: Optional[int] = None):
+                     global_num_tokens: Optional[int] = None,
+                     post_expert_norm: bool = False,
+                     post_expert_norm_weight: Optional[torch.Tensor] = None,
+                     post_expert_norm_eps: float = 1e-6,
+                     post_expert_norm_weight_first: bool = False):
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
@@ -284,6 +288,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
+        post_expert_norm, post_expert_norm_weight,
+        post_expert_norm_eps, post_expert_norm_weight_first,
         weight_layout == 'trtllm', global_num_tokens
     )
 
@@ -302,7 +308,11 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    l2_alphas: Optional[torch.Tensor] = None,
                    l2_act_scales: Optional[torch.Tensor] = None,
                    weight_layout: str = 'megamoe',
-                   global_num_tokens: Optional[int] = None):
+                   global_num_tokens: Optional[int] = None,
+                   post_expert_norm: bool = False,
+                   post_expert_norm_weight: Optional[torch.Tensor] = None,
+                   post_expert_norm_eps: float = 1e-6,
+                   post_expert_norm_weight_first: bool = False):
     fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights,
@@ -311,6 +321,10 @@ def nvfp4_mega_moe(y: torch.Tensor,
         activation=activation, activation_clamp=activation_clamp,
         fast_math=fast_math, use_x_scales=use_x_scales,
         l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales,
+        post_expert_norm=post_expert_norm,
+        post_expert_norm_weight=post_expert_norm_weight,
+        post_expert_norm_eps=post_expert_norm_eps,
+        post_expert_norm_weight_first=post_expert_norm_weight_first,
         weight_layout=weight_layout, global_num_tokens=global_num_tokens
     )
 
@@ -326,7 +340,11 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True,
                   weight_layout: str = 'megamoe',
-                  global_num_tokens: Optional[int] = None):
+                  global_num_tokens: Optional[int] = None,
+                  post_expert_norm: bool = False,
+                  post_expert_norm_weight: Optional[torch.Tensor] = None,
+                  post_expert_norm_eps: float = 1e-6,
+                  post_expert_norm_weight_first: bool = False):
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     _C.bf16_mega_moe(
@@ -343,7 +361,8 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math,
+        fast_math, post_expert_norm, post_expert_norm_weight,
+        post_expert_norm_eps, post_expert_norm_weight_first,
         weight_layout == 'trtllm', global_num_tokens
     )
 

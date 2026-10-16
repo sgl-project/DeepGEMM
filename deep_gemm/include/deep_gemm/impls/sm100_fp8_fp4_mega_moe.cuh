@@ -119,6 +119,10 @@ template <
     typename weight_dtype_t,
     float kSituBeta = 4.0f,
     float kSituLinearBeta = 25.0f,
+    bool kWithPostExpertNorm = false,
+    bool kPostNormWeightFirst = false,
+    bool kPostNormHasWeight = false,
+    float kPostNormEps = 0.0f,
     bool kUseTrtllmWeights = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -143,6 +147,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const float* __restrict__ l1_alphas,
                             const float* __restrict__ l2_alphas,
                             const float* __restrict__ l2_act_scales,
+                            const float* __restrict__ post_expert_norm_weight,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -172,6 +177,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0,
+                     "Post-expert norm does not support shared experts");
+    DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
+                     "Post-expert norm weight without the post-expert norm");
     DG_STATIC_ASSERT(not kUseTrtllmWeights or
                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
                      "TRT weight layout requires routed NVFP4 experts");
@@ -350,6 +359,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
+        float nvfp4_sf_inv_lut[kIsNVFP4 ? math::kNumNVFP4SFInvLutEntries : 1];
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -416,6 +426,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == 3) {
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, &shared_storage.tmem_ptr_in_smem);
+    } else if (warp_idx == 4) {
+        if constexpr (kIsNVFP4)
+            math::init_nvfp4_sf_inv_lut(shared_storage.nvfp4_sf_inv_lut, lane_idx);
     }
     cute::cluster_sync();
 
@@ -471,6 +484,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+    // Weight-first folds the producing rank's `post_expert_norm_weight` into the sum of
+    // squares, so that weight must be identical on every rank.
+    // ponytail: BF16 combine only; the FP8 combine would have to fold in its per-tile SF
+    constexpr bool kFusedPostNormPartials = kWithPostExpertNorm and not kUseFp8Combine;
+
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
         // Adjust registers
@@ -497,6 +515,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         };
+
+        // Ordered before any adder: locally by the grid sync below, across ranks by the
+        // `kBeforeDispatchPullBarrierTag` barrier every rank enters after it.
+        if constexpr (kFusedPostNormPartials) {
+            const auto sum_sq_ptr = workspace.get_post_norm_sum_sq_ptr();
+            for (uint32_t i = sm_idx * kNumDispatchThreads + thread_idx;
+                 i < num_tokens * kNumTopk; i += kNumSMs * kNumDispatchThreads)
+                sum_sq_ptr[i] = 0.0f;
+        }
 
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1283,8 +1310,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
                         // Load weights from global into register cache per 32 tokens
+                        // NOTES: the post-expert norm applies the top-k weight in the combine
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                        if (not kWithPostExpertNorm and not task_info.is_shared() and
+                            (j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
@@ -1313,10 +1342,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             __fmul2_rn(x_scales, {l1_alpha.y, l1_alpha.y}) : x_scales;
 
                         // Load weights from register cache
-                        float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
-                        };
+                        float2 weights = {1.0f, 1.0f};
+                        if constexpr (not kWithPostExpertNorm) {
+                            weights = {
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
+                        }
                         if constexpr (kWithL2ActScales)
                             weights = __fmul2_rn(weights, {l2_act_gs, l2_act_gs});
 
@@ -1420,7 +1452,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         float2 sf, sf_inv;
                         uint2 sf_bits;
                         if constexpr (kIsNVFP4) {
-                            math::get_nvfp4_sf_and_sf_inv(amax_values[i], sf, sf_inv, sf_bits);
+                            math::get_nvfp4_sf_inv_from_lut(amax_values[i], shared_storage.nvfp4_sf_inv_lut,
+                                                            sf_inv, sf_bits);
                         } else {
                             // Reduce amax (warp-pair-level)
                             const float2 wp_amax =
@@ -1722,6 +1755,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 dst_token.get_base_ptr(),
                                 n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
                             *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+
+                            // Squares the values just stored, so the norm sees what the
+                            // combine would have read back.
+                            if constexpr (kFusedPostNormPartials) {
+                                if (not task_info.is_shared()) {
+                                    const uint32_t elem_base = n_idx + (lane_idx % 16) * 8;
+                                    const auto bf_pairs = reinterpret_cast<const nv_bfloat162*>(&packed);
+                                    float partial = 0.0f;
+                                    #pragma unroll
+                                    for (uint32_t q = 0; q < 4; ++ q) {
+                                        const float2 vf = __bfloat1622float2(bf_pairs[q]);
+                                        float a = vf.x, b = vf.y;
+                                        // Weight-first normalizes `w * x`
+                                        if constexpr (kPostNormHasWeight and kPostNormWeightFirst) {
+                                            a *= __ldg(post_expert_norm_weight + elem_base + q * 2 + 0);
+                                            b *= __ldg(post_expert_norm_weight + elem_base + q * 2 + 1);
+                                        }
+                                        partial = __fmaf_rn(a, a, partial);
+                                        partial = __fmaf_rn(b, b, partial);
+                                    }
+                                    // 16-lane mask: the `valid_m` break can retire the other half-warp
+                                    const uint32_t row_mask = 0x0000ffffu << (16u * (lane_idx / 16));
+                                    #pragma unroll
+                                    for (uint32_t d = 1; d < 16; d <<= 1)
+                                        partial += __shfl_xor_sync(row_mask, partial, d);
+                                    if ((lane_idx & 15u) == 0) {
+                                        const auto sum_sq_ptr = workspace.get_post_norm_sum_sq_ptr(
+                                            dst_token_idx, dst_topk_idx);
+                                        if constexpr (kNumRanks == 1) {
+                                            atomicAdd(sum_sq_ptr, partial);
+                                        } else {
+                                            // System scope: the accumulator is in a peer's workspace
+                                            ptx::red_add_sys(
+                                                sym_buffer.map(sum_sq_ptr, dst_rank_idx), partial);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1758,6 +1829,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");
         DG_STATIC_ASSERT(kNumTopk + (kNumSharedExperts > 0 ? 1u : 0u) <= 32u, "Top-k + shared must fit in a single warp");
+
+        constexpr uint32_t kNumElemsPerLoadUint4 = kUseFp8Combine ? 16u : 8u;
+        constexpr uint32_t kNumRowLoadBytes = kUseFp8Combine ? kNumHiddenBytes / 2 : kNumHiddenBytes;
+        constexpr uint32_t kNumRowLoadUint4PerLane = kNumRowLoadBytes / sizeof(uint4) / 32;
+        DG_STATIC_ASSERT(not kWithPostExpertNorm or
+                         kNumRowLoadUint4PerLane * 32 * sizeof(uint4) == kNumRowLoadBytes,
+                         "Hidden is not a whole number of 16-byte vectors per lane");
 
         // Verify combined shared memory budget at runtime
         DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= kNumReusableSmemBytes);
@@ -1813,6 +1891,84 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
+            // The RMS spans the full hidden dim, of which the L2 epilogue holds only
+            // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
+            // scale-invariant norm would otherwise erase.
+            float slot_norm_scale = 1.0f;
+            if constexpr (kFusedPostNormPartials) {
+                // Lane `s` reads slot `s`'s total, already accumulated by the L2 tiles.
+                const float my_topk_weight = lane_idx < kNumTopk ?
+                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                          token_idx * kNumTopk + lane_idx) : 0.0f;
+                // Not `__ldg`: peers write this over NVLink, the read-only path is not coherent
+                float sum_sq = 0.0f;
+                if (lane_idx < kNumTopk and (total_mask >> lane_idx & 1))
+                    sum_sq = *workspace.get_post_norm_sum_sq_ptr(token_idx, lane_idx);
+                const float inv_rms = rsqrtf(sum_sq / static_cast<float>(kHidden) + kPostNormEps);
+                slot_norm_scale = my_topk_weight * inv_rms;
+                __syncwarp();
+            } else if constexpr (kWithPostExpertNorm) {
+                const float my_topk_weight = lane_idx < kNumTopk ?
+                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                          token_idx * kNumTopk + lane_idx) : 0.0f;
+                #pragma unroll 1
+                for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                    // Warp-uniform: `total_mask` is a ballot result
+                    if (not (total_mask >> slot_idx & 1))
+                        continue;
+                    const auto row_ptr = buffer.combine_token_buffer.get_rank_buffer(slot_idx)
+                                         .get_data_buffer(token_idx).get_base_ptr<uint4>();
+                    const uint8_t* sf_row_ptr = nullptr;
+                    if constexpr (kUseFp8Combine)
+                        sf_row_ptr = buffer.combine_sf_buffer.get_rank_buffer(slot_idx)
+                                           .get_data_buffer(token_idx).get_base_ptr<uint8_t>();
+
+                    float sum_sq = 0.0f;
+                    #pragma unroll 4
+                    for (uint32_t j = 0; j < kNumRowLoadUint4PerLane; ++ j) {
+                        const uint32_t elem_idx = (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
+                        const uint4 raw = __ldg(row_ptr + j * 32 + lane_idx);
+                        float values[kNumElemsPerLoadUint4];
+                        if constexpr (kUseFp8Combine) {
+                            const auto bytes = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
+                            #pragma unroll
+                            for (uint32_t k = 0; k < kNumElemsPerLoadUint4; ++ k)
+                                values[k] = static_cast<float>(bytes[k]);
+                        } else {
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&raw);
+                            #pragma unroll
+                            for (uint32_t k = 0; k < kNumElemsPerLoadUint4 / 2; ++ k) {
+                                const float2 pair = __bfloat1622float2(bf16_values[k]);
+                                values[k * 2 + 0] = pair.x;
+                                values[k * 2 + 1] = pair.y;
+                            }
+                        }
+
+                        float partial = 0.0f;
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kNumElemsPerLoadUint4; ++ k) {
+                            float value = values[k];
+                            // Weight-first normalizes `w * x`, so `w` is inside the RMS
+                            if constexpr (kPostNormHasWeight and kPostNormWeightFirst)
+                                value *= __ldg(post_expert_norm_weight + elem_idx + k);
+                            partial = __fmaf_rn(value, value, partial);
+                        }
+                        if constexpr (kUseFp8Combine) {
+                            // All 16 elements share one SF, so it factors out of the square
+                            const float sf = math::fast_pow2(
+                                static_cast<int>(__ldg(sf_row_ptr + elem_idx / kCombineGranK)) - 127);
+                            partial *= sf * sf;
+                        }
+                        sum_sq += partial;
+                    }
+
+                    const float inv_rms = rsqrtf(
+                        math::warp_reduce_sum(sum_sq) / static_cast<float>(kHidden) + kPostNormEps);
+                    if (lane_idx == slot_idx)
+                        slot_norm_scale = my_topk_weight * inv_rms;
+                }
+            }
 
             // Stream B: FP8 path loads kNumChunkBytes / 2 per slot (FP8 = 1 byte/elem)
             // and reads a per-(slot, token, n_block) UE8M0 SF byte to dequant
@@ -1870,6 +2026,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait for current slot's load.
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
 
+                    float slot_scale = 1.0f;
+                    if constexpr (kWithPostExpertNorm)
+                        slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
+                                                 static_cast<uint32_t>(active_slot));
+
                     if constexpr (kUseFp8Combine) {
                         // Per-slot SF base for this token.
                         const uint8_t* sf_token_ptr =
@@ -1883,7 +2044,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint32_t sf_idx =
                                 (chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 16) / kCombineGranK;
                             const uint8_t sf_byte = __ldg(sf_token_ptr + sf_idx);
-                            const float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
+                            float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
+                            if constexpr (kWithPostExpertNorm)
+                                sf *= slot_scale;
                             const uint32_t* w = reinterpret_cast<const uint32_t*>(&uint4_values);
                             #pragma unroll
                             for (uint32_t l = 0; l < 4; ++ l) {
@@ -1912,14 +2075,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
                             const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
                             #pragma unroll
-                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                                ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                                auto& acc = reduced[j * kNumElemsPerUint4 + l];
+                                if constexpr (kWithPostExpertNorm) {
+                                    const float2 pair = __bfloat1622float2(bf16_values[l]);
+                                    acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
+                                    acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
+                                } else {
+                                    ptx::accumulate(acc, bf16_values[l]);
+                                }
+                            }
                         }
                     }
                     cutlass::arch::fence_view_async_shared();
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
                     active_slot = next_slot;
+                }
+
+                // Both norm forms reduce to `w * sum_k(inv_rms_k * topk_weight_k * x_k)`.
+                if constexpr (kPostNormHasWeight) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
+                        const uint32_t base_elem_idx = chunk * kNumLoadElemsPerChunk +
+                                                       (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumF32PairsPerLoadUint4; ++ l) {
+                            auto& acc = reduced[j * kNumF32PairsPerLoadUint4 + l];
+                            acc = __fmul2_rn(acc, __ldg(reinterpret_cast<const float2*>(
+                                post_expert_norm_weight + base_elem_idx + l * 2)));
+                        }
+                    }
                 }
 
                 // Cast & write to smem store-buffer.

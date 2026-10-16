@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <format>
 #include <iostream>
@@ -142,8 +143,23 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
                 break;
         }
     }
-    const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
-    const int block_k = 128 * 8 / get_element_bits(mma_kind);
+    // Must divide `WG_BLOCK_M` (= block_m / 2), which pins each arm: 240 -> 120 and
+    // 128 -> 64 cannot take 48, 192 -> 96 can and halves its store iterations.
+    int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 :
+                        block_m <= 128 ? 32 : block_m <= 192 ? 48 : 40;
+    int block_k = 128 * 8 / get_element_bits(mma_kind);
+    int cluster_size = 2, num_epilogue_warpgroups = 2;
+
+    // Offline tuning hook: "cluster,block_m,store_block_m,block_k,epilogue_warpgroups",
+    // `block_k` in the pre-scaling 8-bit units above.
+    if (const auto override_str = deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES"); not override_str.empty()) {
+        int v[5];
+        const int n = std::sscanf(override_str.c_str(), "%d,%d,%d,%d,%d",
+                                  v + 0, v + 1, v + 2, v + 3, v + 4);
+        DG_HOST_ASSERT(n == 5 and "DG_MEGA_MOE_TILES needs 5 comma-separated ints");
+        cluster_size = v[0], block_m = v[1], store_block_m = v[2];
+        block_k = v[3] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[4];
+    }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -151,8 +167,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         [=](const auto& candidate) { return candidate == block_m; })
     );
 
-    // Return configs: 2-CTA clusters and 2 epilogue warpgroups
-    return {2, block_m, store_block_m, block_k, 2 * 128};
+    return {cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups * 128};
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -200,6 +215,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
 
+    const int smem_sf_inv_lut = mma_kind == MmaKind::NVFP4 ?
+        256 * static_cast<int>(sizeof(float)) : 0;
+
     // SF is aligned to UTCCP 128-element granularity
     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
@@ -216,7 +234,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
-        smem_task_info + smem_tmem_ptr;
+        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;

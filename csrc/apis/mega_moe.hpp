@@ -203,6 +203,10 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& l1_alphas,
     const std::optional<torch::Tensor>& l2_alphas,
     const std::optional<torch::Tensor>& l2_act_scales,
+    const bool& post_expert_norm = false,
+    const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
+    const float& post_expert_norm_eps = 1e-6f,
+    const bool& post_expert_norm_weight_first = false,
     const bool& use_trtllm_weights = false,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
@@ -345,6 +349,17 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(l2_act_scales->size(0) == num_experts_per_rank);
     }
 
+    // `[hidden]` FP32 gain, optional; `weight_first` picks `rms_norm(w * x)`.
+    DG_HOST_ASSERT(post_expert_norm or not post_expert_norm_weight.has_value());
+    DG_HOST_ASSERT(not post_expert_norm or num_shared_experts == 0);
+    DG_HOST_ASSERT(not post_expert_norm or post_expert_norm_eps >= 0.0f);
+    if (post_expert_norm_weight.has_value()) {
+        DG_HOST_ASSERT(post_expert_norm_weight->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(post_expert_norm_weight->is_contiguous());
+        DG_HOST_ASSERT(post_expert_norm_weight->dim() == 1);
+        DG_HOST_ASSERT(post_expert_norm_weight->size(0) == hidden);
+    }
+
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
@@ -377,6 +392,11 @@ static void fp8_fp4_mega_moe(
                                    ? l2_alphas->const_data_ptr<float>() : nullptr,
                                l2_act_scales.has_value()
                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
+                               post_expert_norm_weight.has_value()
+                                   ? post_expert_norm_weight->const_data_ptr<float>() : nullptr,
+                               post_expert_norm,
+                               post_expert_norm_weight_first,
+                               post_expert_norm_eps,
                                mma_kind,
                                use_fp8_combine, use_trtllm_weights, global_num_tokens,
                                situ_beta, situ_linear_beta);
@@ -404,6 +424,10 @@ static void bf16_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
+    const bool& post_expert_norm = false,
+    const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
+    const float& post_expert_norm_eps = 1e-6f,
+    const bool& post_expert_norm_weight_first = false,
     const bool& use_trtllm_weights = false,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
@@ -470,6 +494,17 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
+    DG_HOST_ASSERT(post_expert_norm or not post_expert_norm_weight.has_value());
+    DG_HOST_ASSERT(not post_expert_norm or num_shared_experts == 0);
+    DG_HOST_ASSERT(not post_expert_norm or post_expert_norm_eps >= 0.0f);
+    if (post_expert_norm_weight.has_value()) {
+        DG_HOST_ASSERT(post_expert_norm_weight->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(post_expert_norm_weight->is_contiguous());
+        DG_HOST_ASSERT(post_expert_norm_weight->dim() == 1);
+        DG_HOST_ASSERT(post_expert_norm_weight->size(0) == hidden);
+        DG_HOST_ASSERT(post_expert_norm_weight->device() == y.device());
+    }
+
     // Already registered tensors
     const auto [x, _x_sf, topk_idx, topk_weights,
                 shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, _shared_l2_acts_sf,
@@ -489,7 +524,11 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math, use_trtllm_weights, global_num_tokens);
+                            activation_clamp, fast_math,
+                            post_expert_norm_weight.has_value()
+                                ? post_expert_norm_weight->const_data_ptr<float>() : nullptr,
+                            post_expert_norm, post_expert_norm_weight_first,
+                            post_expert_norm_eps, use_trtllm_weights, global_num_tokens);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

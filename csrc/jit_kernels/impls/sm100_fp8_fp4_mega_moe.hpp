@@ -94,6 +94,10 @@ static void sm100_fp8_fp4_mega_moe(
     const float* l1_alphas,
     const float* l2_alphas,
     const float* l2_act_scales,
+    const float* post_expert_norm_weight,
+    const bool& with_post_expert_norm,
+    const bool& post_norm_weight_first,
+    const float& post_norm_eps,
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
     const bool& use_trtllm_weights = false,
@@ -275,7 +279,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {}, {}, {}, {},
         {}, {},
-        {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -302,6 +306,10 @@ static void __instantiate_kernel() {{
     use_fp8_combine ? "true" : "false",
     to_string(l1_weights.scalar_type()),
     to_string(situ_beta), to_string(situ_linear_beta),
+    with_post_expert_norm ? "true" : "false",
+    post_norm_weight_first ? "true" : "false",
+    post_expert_norm_weight != nullptr ? "true" : "false",
+    to_string(post_norm_eps),
     use_trtllm_weights ? "true" : "false"));
     // Launch
     jit->launch(
@@ -314,6 +322,7 @@ static void __instantiate_kernel() {{
         y.data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
         l1_alphas, l2_alphas, l2_act_scales,
+        post_expert_norm_weight,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         tensor_map_l1_acts,

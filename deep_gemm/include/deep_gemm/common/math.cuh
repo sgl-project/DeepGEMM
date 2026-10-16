@@ -193,6 +193,26 @@ CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, floa
     sf_inv.y = sf.y > 0.0f ? __frcp_rn(sf.y) : 0.0f;
 }
 
+// Built with `__frcp_rn`, so a lookup is bit-identical to computing the reciprocal.
+constexpr uint32_t kNumNVFP4SFInvLutEntries = 256;
+
+CUTLASS_DEVICE void init_nvfp4_sf_inv_lut(float* lut, const uint32_t& lane_idx) {
+    #pragma unroll
+    for (uint32_t b = lane_idx; b < kNumNVFP4SFInvLutEntries; b += 32) {
+        __nv_fp8_e4m3 q;
+        q.__x = static_cast<__nv_fp8_storage_t>(b);
+        const float sf = static_cast<float>(q);
+        lut[b] = sf > 0.0f ? __frcp_rn(sf) : 0.0f;
+    }
+}
+
+CUTLASS_DEVICE void get_nvfp4_sf_inv_from_lut(const float2& amax, const float* lut,
+                                              float2& sf_inv, uint2& sf_bits) {
+    constexpr float kInvMax = 1.0f / 6.0f;
+    const __nv_fp8_e4m3 qx(amax.x * kInvMax), qy(amax.y * kInvMax);
+    sf_bits = {qx.__x, qy.__x};
+    sf_inv = {lut[qx.__x], lut[qy.__x]};
+}
 
 CUTLASS_DEVICE uint32_t cast_into_e2m1x2_pairs(const float2& lower, const float2& upper) {
     uint32_t packed;
