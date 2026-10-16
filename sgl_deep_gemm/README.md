@@ -10,8 +10,6 @@ sgl-deep-gemm is a pypi package built from SGLang's customized branch of DeepGem
 
 `deep_gemm.mega.m2n` provides Mega MoE kernels for Attention-FFN Disaggregation (AFD). Attention-group (AG) ranks quantize and dispatch activations, then combine the expert outputs. Expert-group (EG) ranks run a persistent kernel that receives activations, computes the routed-expert MLPs, and returns the results. AG and EG can have different numbers of ranks.
 
-This extension is packaged as `sgl-deep-gemm==0.2.1.post1+afd.1`, based on SGLang DeepGEMM [v0.2.1.post1](https://github.com/sgl-project/DeepGEMM/commit/e885b74a23eb511c09a0c440e74f257d0e6b681f).
-
 ### Requirements
 
 M2N requires SM100 or SM103 GPUs with peer-accessible memory. The allocator uses CUDA FABRIC handles when available and CUDA IPC otherwise. Cross-host execution requires a shared NVLink fabric with CUDA FABRIC access; the IPC path is limited to peers on the same host. M2N does not use DeepEP or NVSHMEM.
@@ -33,10 +31,10 @@ Use a Linux Python environment with PyTorch and the [build requirements](#usage)
 ```bash
 python3 -m pip install 'apache-tvm-ffi==0.1.11' ninja
 bash build_sgl_deep_gemm.sh
-python3 -m pip install dist/sgl_deep_gemm-0.2.1.post1+afd.1-*.whl
+python3 -m pip install dist/sgl_deep_gemm-*.whl
 ```
 
-The build script initializes missing submodules and writes the wheel to `dist/`. It detects the GPU architecture automatically; set `TVM_FFI_CUDA_ARCH_LIST` when building for a different target or without a visible GPU. Keep the CUDA toolkit and C++ compiler available at runtime for DeepJIT compilation.
+The build script initializes missing submodules and writes the wheel to `dist/`. It detects the GPU architecture automatically; set `TVM_FFI_CUDA_ARCH_LIST` when building for a different target or without a visible GPU. Set `SGL_DEEP_GEMM_VERSION` to override the wheel version without changing `sgl_deep_gemm/VERSION`. Keep the CUDA toolkit and C++ compiler available at runtime for DeepJIT compilation.
 
 From a directory outside the source checkout, check that the installed package exposes the M2N API:
 

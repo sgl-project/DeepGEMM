@@ -10,7 +10,7 @@
 #   2. Stages the package layout under build/deep_gemm/ with the Python
 #      sub-modules pulled from the source deep_gemm/ tree (utils, testing,
 #      legacy, mega).
-#   3. Reads the version string from sgl_deep_gemm/VERSION.
+#   3. Reads the version from SGL_DEEP_GEMM_VERSION or sgl_deep_gemm/VERSION.
 #   4. Pre-compiles the tvm-ffi `_C.so` extension and bundles it into the wheel.
 #   5. Invokes `python -m build` to produce dist/*.whl.
 
@@ -58,13 +58,12 @@ cp -r "${ROOT_DIR}/third-party/cutlass/include/cute" "$PKG_DIR/include/cute"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cutlass" "$PKG_DIR/include/cutlass"
 cp -r "${ROOT_DIR}/third-party/deep_jit/include/deep_jit" "$PKG_DIR/include/deep_jit"
 
-echo "--- Reading version from sgl_deep_gemm/VERSION ---"
-if [[ ! -f "sgl_deep_gemm/VERSION" ]]; then
-    echo "Error: sgl_deep_gemm/VERSION is missing — create it with the desired version (e.g. 0.0.1)." >&2
-    exit 1
+echo "--- Setting package version ---"
+if [[ -n "${SGL_DEEP_GEMM_VERSION:-}" ]]; then
+    printf '%s\n' "$SGL_DEEP_GEMM_VERSION" > "$PKG_DIR/VERSION"
+else
+    tr -d '[:space:]' < sgl_deep_gemm/VERSION > "$PKG_DIR/VERSION"
 fi
-# Strip surrounding whitespace; the file is the single source of truth.
-tr -d '[:space:]' < sgl_deep_gemm/VERSION > "$PKG_DIR/VERSION"
 echo "Version: $(cat "$PKG_DIR/VERSION")"
 
 echo "--- Compiling _C.so ---"
