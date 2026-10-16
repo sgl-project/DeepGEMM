@@ -7,7 +7,6 @@
 #include "../../utils/exception.hpp"
 #include "../heuristics/sm90.hpp"
 
-#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -18,8 +17,6 @@ public:
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions options;
-        // TODO: move this into `gemm_desc`
-        const std::optional<std::string>& epilogue_type;
 
         cute::UMMA::Major major_sfb;
         void *sfb, *grouped_layout;
@@ -56,7 +53,6 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {},
         {}, {}
     >);
 }};
@@ -72,8 +68,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype),
-        get_default_epilogue_type(args.epilogue_type), args.sf_granularity));
+        to_string(args.gemm_desc.cd_dtype), args.sf_granularity));
 
         // Launch
         jit->launch(
@@ -93,7 +88,6 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, const cute::UMMA::Major& major_sfb,
                                const std::string& compiled_dims,
-                               const std::optional<std::string>& epilogue_type = std::nullopt,
                                const int sf_granularity = 128) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(sf_granularity == 128 or sf_granularity == 32);
@@ -146,7 +140,6 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .epilogue_type = epilogue_type,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,
@@ -225,7 +218,6 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = m_indices.data_ptr(),
@@ -293,7 +285,6 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
@@ -365,7 +356,6 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
-        .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
         .sfb = sfb.data_ptr(),
         .grouped_layout = nullptr,

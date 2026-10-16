@@ -9,7 +9,6 @@
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
-#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 #include "../../runtime/launch.hpp"
 
@@ -29,7 +28,6 @@ public:
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions launch_args;
-        const std::optional<std::string> epilogue_type;
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
@@ -82,7 +80,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -100,7 +97,6 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
-        get_default_epilogue_type(args.epilogue_type),
         args.is_fp4 ? "true" : "false",
         args.b_is_fp4 ? "true" : "false",
         args.a_is_fp4 ? "true" : "false",
@@ -204,7 +200,6 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                     const int& gran_k_a, const int& gran_k_b,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const std::string& compiled_dims,
-                                    const std::optional<std::string>& epilogue_type = std::nullopt,
                                     const bool swap_ab = false) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
@@ -270,7 +265,6 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = epilogue_type,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
@@ -385,7 +379,6 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
@@ -484,7 +477,6 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
@@ -575,7 +567,6 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
@@ -666,7 +657,6 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,

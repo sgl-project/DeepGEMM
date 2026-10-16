@@ -146,7 +146,7 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
-for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py; do
+for t in test_mega_gate.py test_mega_mhc.py test_locality_domain.py; do
   if [ "${ARCH_MAJOR}" -eq 10 ]; then
     run_test "${t}"
   else
@@ -249,10 +249,7 @@ if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
     skip_test test_sanitizer.py "--skip-sanitizer"
   elif [ "${TEST_PROFILE}" = release ]; then
     # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
-    SANITIZER_FUNCS=test_attention.test_gemm_skip_head_mid
-    if [ "${ARCH_MAJOR}" -eq 10 ]; then
-      SANITIZER_FUNCS+=,test_clean_logits_bounds.test_clean_logits_bounds
-    fi
+    SANITIZER_FUNCS=test_attention.test_paged_mqa_logits
     run_test test_sanitizer.py --funcs "${SANITIZER_FUNCS}" --tools memcheck,synccheck
   else
     run_test test_sanitizer.py

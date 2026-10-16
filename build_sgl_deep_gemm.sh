@@ -42,6 +42,7 @@ mkdir -p "$PKG_DIR"
 
 cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml "$BUILD_DIR/"
 cp sgl_deep_gemm/__init__.py sgl_deep_gemm/cuda_helpers.py sgl_deep_gemm/build_ext.py "$PKG_DIR/"
+cp deep_gemm/epilogue.py deep_gemm/locality_domain.py "$PKG_DIR/"
 
 # `__init__.py` imports `.utils`, `.testing`, `.legacy`, `.mega` — pulled from
 # the existing deep_gemm/ tree.

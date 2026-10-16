@@ -43,7 +43,8 @@ if __name__ == '__main__':
         # every excluded distributed entrypoint instead of calling it as test().
         funcs = []
         files = sorted(f for f in os.listdir(script_dir)
-                       if f.startswith('test_') and f.endswith('.py') and f != 'test_sanitizer.py')
+                       if f.startswith('test_') and f.endswith('.py')
+                       and f not in ('test_sanitizer.py', 'test_locality_domain.py'))
         arch_major = deep_gemm.testing.get_arch_major()
         for filename in files:
             if ((arch_major == 12 and filename in
