@@ -364,12 +364,30 @@ Tensor dg_get_paged_mqa_logits_metadata(const Tensor& context_lens, int64_t bloc
                                                     static_cast<int>(num_sms), indices);
 }
 
+Tensor dg_get_paged_mqa_logits_bf16_metadata(const Tensor& context_lens, int64_t block_kv, int64_t num_sms,
+                                             const OptTensor& indices, int64_t tokens_per_request) {
+    return attention::get_paged_mqa_logits_bf16_metadata(context_lens, static_cast<int>(block_kv),
+                                                         static_cast<int>(num_sms), indices,
+                                                         static_cast<int>(tokens_per_request));
+}
+
 Tensor dg_fp8_paged_mqa_logits(const Tensor& q, const Tensor& fused_kv_cache,
                                const Tensor& weights, const Tensor& context_lens,
                                const Tensor& block_table, const Tensor& schedule_meta,
-                               int64_t max_context_len, bool clean_logits, const OptTensor& indices) {
+                               int64_t max_context_len, bool clean_logits, const OptTensor& indices,
+                               const OptTensor& histogram) {
     return attention::fp8_paged_mqa_logits(q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-                                           static_cast<int>(max_context_len), clean_logits, indices);
+                                           static_cast<int>(max_context_len), clean_logits, indices, histogram);
+}
+
+Tensor dg_fp4_paged_mqa_logits_bf16(const Tensor& q, const Tensor& q_sf, const Tensor& fused_kv_cache,
+                                    const Tensor& weights, const Tensor& context_lens,
+                                    const Tensor& block_table, const Tensor& schedule_meta,
+                                    int64_t max_context_len, const OptTensor& indices,
+                                    const OptTensor& histogram, int64_t tokens_per_request) {
+    return attention::fp4_paged_mqa_logits_bf16(
+        std::make_pair(q, q_sf), fused_kv_cache, weights, context_lens, block_table, schedule_meta,
+        static_cast<int>(max_context_len), indices, histogram, static_cast<int>(tokens_per_request));
 }
 
 Tensor dg_fp8_fp4_mqa_logits(const Tensor& q, const OptTensor& q_sf, const Tensor& kv_data, const Tensor& kv_sf,
@@ -385,10 +403,11 @@ Tensor dg_fp8_fp4_paged_mqa_logits(const Tensor& q, const OptTensor& q_sf, const
                                    const Tensor& weights, const Tensor& context_lens,
                                    const Tensor& block_table, const Tensor& schedule_meta,
                                    int64_t max_context_len, bool clean_logits,
-                                   at::ScalarType logits_dtype, const OptTensor& indices) {
+                                   at::ScalarType logits_dtype, const OptTensor& indices,
+                                   const OptTensor& histogram) {
     return attention::fp8_fp4_paged_mqa_logits(
         std::make_pair(q, q_sf), fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-        static_cast<int>(max_context_len), clean_logits, logits_dtype, indices);
+        static_cast<int>(max_context_len), clean_logits, logits_dtype, indices, histogram);
 }
 
 Tensor dg_get_mqa_logits_metadata(const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
@@ -749,14 +768,20 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_mqa_logits(Tensor q, Tensor kv_data, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, "
           "Tensor cu_seq_len_k_end, bool clean_logits, int max_seqlen_k) -> Tensor");
     m.def("get_paged_mqa_logits_metadata(Tensor context_lens, int block_kv, int num_sms, Tensor? indices) -> Tensor");
+    m.def("get_paged_mqa_logits_bf16_metadata(Tensor context_lens, int block_kv, int num_sms, Tensor? indices, "
+          "int tokens_per_request) -> Tensor");
     m.def("fp8_paged_mqa_logits(Tensor q, Tensor fused_kv_cache, Tensor weights, Tensor context_lens, "
-          "Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits, Tensor? indices) -> Tensor");
+          "Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits, Tensor? indices, "
+          "Tensor(a!)? histogram) -> Tensor");
+    m.def("fp4_paged_mqa_logits_bf16(Tensor q, Tensor q_sf, Tensor fused_kv_cache, Tensor weights, "
+          "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, Tensor? indices, "
+          "Tensor(a!)? histogram, int tokens_per_request) -> Tensor");
     m.def("fp8_fp4_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_data, Tensor kv_sf, Tensor weights, "
           "Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits, int max_seqlen_k, "
           "ScalarType logits_dtype, Tensor? schedule_meta) -> Tensor");
     m.def("fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor fused_kv_cache, Tensor weights, "
           "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits, "
-          "ScalarType logits_dtype, Tensor? indices) -> Tensor");
+          "ScalarType logits_dtype, Tensor? indices, Tensor(a!)? histogram) -> Tensor");
     m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
           "int num_heads) -> Tensor");
     m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
@@ -851,7 +876,9 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("fp8_gemm_nt_skip_head_mid", &dg_fp8_gemm_nt_skip_head_mid);
     m.impl("fp8_mqa_logits", &dg_fp8_mqa_logits);
     m.impl("get_paged_mqa_logits_metadata", &dg_get_paged_mqa_logits_metadata);
+    m.impl("get_paged_mqa_logits_bf16_metadata", &dg_get_paged_mqa_logits_bf16_metadata);
     m.impl("fp8_paged_mqa_logits", &dg_fp8_paged_mqa_logits);
+    m.impl("fp4_paged_mqa_logits_bf16", &dg_fp4_paged_mqa_logits_bf16);
     m.impl("fp8_fp4_mqa_logits", &dg_fp8_fp4_mqa_logits);
     m.impl("fp8_fp4_paged_mqa_logits", &dg_fp8_fp4_paged_mqa_logits);
     m.impl("get_mqa_logits_metadata", &dg_get_mqa_logits_metadata);
