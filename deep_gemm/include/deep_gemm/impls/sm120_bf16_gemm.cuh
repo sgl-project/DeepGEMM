@@ -17,7 +17,6 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/mma/sm120.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -36,7 +35,6 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
-          typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
           bool kBKMajor = true,
           uint32_t kNWarps_ = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -381,8 +379,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         if constexpr (kWithAccumulation) {
                             const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
-                            const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
-                                n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
+                            const uint32_t gc = n_base + (n_tile_base + nt) * MMA_N + thread_id * 2;
                             if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
                                 v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
@@ -417,8 +414,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
                         auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * BLOCK_M;
-                        const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
-                            n_base + ts * kTMAStoreInnerDim);
+                        const uint32_t n_store = n_base + ts * kTMAStoreInnerDim;
                         if constexpr (kIsBatchedEpilogue) {
                             if constexpr (kWithAccumulation)
                                 cute::SM90_TMA_REDUCE_ADD_3D::copy(
@@ -452,7 +448,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                         const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t nt_global_base = n_base + (n_tile_base + nt) * MMA_N;
-                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(nt_global_base) + thread_id * 2;
+                        const uint32_t col = nt_global_base + thread_id * 2;
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 

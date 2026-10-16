@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import os
 from typing import Optional, Tuple, Union
 
@@ -58,6 +59,11 @@ get_pdl = _C.get_pdl
 use_deterministic_algorithms = _C.use_deterministic_algorithms
 get_deterministic_algorithms = _C.get_deterministic_algorithms
 set_ignore_compile_dims = _C.set_ignore_compile_dims
+shutdown = _C.shutdown
+
+# Epilogue classes
+from . import epilogue
+from .epilogue import encode as _encode_epilogue
 
 
 def set_block_size_multiple_of(value: Union[int, Tuple[int, int]]):
@@ -94,21 +100,21 @@ def _parse_tensor_or_tuple(input):
 # GEMM / Attention / Einsum wrappers (handle optional params in Python)
 # ---------------------------------------------------------------------------
 try:
-    def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
+    def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, *_encode_epilogue(epilogue))
 
-    def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
+    def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, *_encode_epilogue(epilogue))
 
-    def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
+    def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, *_encode_epilogue(epilogue))
 
-    def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
+    def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, *_encode_epilogue(epilogue))
 
     fp4_gemm_nt = fp8_fp4_gemm_nt
     fp8_gemm_nt = fp8_fp4_gemm_nt
@@ -116,56 +122,45 @@ try:
     fp8_gemm_tn = fp8_fp4_gemm_tn
     fp8_gemm_tt = fp8_fp4_gemm_tt
 
-    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
+    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
+        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout, *_encode_epilogue(epilogue))
 
-    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True):
+    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True, epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding)
+        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, *_encode_epilogue(epilogue))
 
     m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
     m_grouped_fp8_gemm_nn_contiguous = m_grouped_fp8_fp4_gemm_nn_contiguous
 
-    def bf16_gemm_nt(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_nt(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_nt(a, b, d, c=None, compiled_dims='', alpha=None, epilogue=None):
+        _C.bf16_gemm_nt(a, b, d, c, compiled_dims, alpha, *_encode_epilogue(epilogue))
 
-    def bf16_gemm_nn(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_nn(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_nn(a, b, d, c=None, compiled_dims='', alpha=None, epilogue=None):
+        _C.bf16_gemm_nn(a, b, d, c, compiled_dims, alpha, *_encode_epilogue(epilogue))
 
-    def bf16_gemm_tn(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_tn(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_tn(a, b, d, c=None, compiled_dims='', alpha=None, epilogue=None):
+        _C.bf16_gemm_tn(a, b, d, c, compiled_dims, alpha, *_encode_epilogue(epilogue))
 
-    def bf16_gemm_tt(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_tt(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_tt(a, b, d, c=None, compiled_dims='', alpha=None, epilogue=None):
+        _C.bf16_gemm_tt(a, b, d, c, compiled_dims, alpha, *_encode_epilogue(epilogue))
 
-    def einsum(expr, a, b, d, c=None, use_cublaslt=False):
-        _C.einsum(expr, a, b, d, c, use_cublaslt)
+    def einsum(expr, a, b, d, c=None, use_cublaslt=False, epilogue=None):
+        _C.einsum(expr, a, b, d, c, use_cublaslt, *_encode_epilogue(epilogue))
 
-    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128)):
+    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         d_data, d_sf = d if isinstance(d, (tuple, list)) else (d, None)
-        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d_data, d_sf, c, recipe)
+        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d_data, d_sf, c, recipe, *_encode_epilogue(epilogue))
 
-    def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
-
-    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
-        return _C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices)
-
-    def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
-        (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
-        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
-
-    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
+    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices=None):
         (q, q_sf) = q if isinstance(q, (tuple, list)) else (q, None)
-        return _C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype, indices)
+        return _C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices)
 
-    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float, schedule_meta=None):
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
         (q, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
-        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype, schedule_meta)
+        return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta)
 
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
         return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
@@ -179,35 +174,35 @@ try:
 
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
-    def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False):
+    def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, epilogue=None):
         (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+        return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, *_encode_epilogue(epilogue))
 
     m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
-    def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False):
+    def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False, epilogue=None):
         """Use compact per-group SF by default; opt in to padded SF with use_padded_sf_layout."""
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.k_grouped_fp8_gemm_tn_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout)
+        _C.k_grouped_fp8_gemm_tn_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout, *_encode_epilogue(epilogue))
 
-    def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False):
+    def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False, epilogue=None):
         """Use compact per-group SF by default; opt in to padded SF with use_padded_sf_layout."""
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.k_grouped_fp8_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout)
+        _C.k_grouped_fp8_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout, *_encode_epilogue(epilogue))
 
-    def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
-        _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
+    def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None, epilogue=None):
+        _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout, *_encode_epilogue(epilogue))
 
-    def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True):
-        _C.m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding)
+    def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True, epilogue=None):
+        _C.m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, *_encode_epilogue(epilogue))
 
-    def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims='nk'):
-        _C.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims)
+    def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims='nk', epilogue=None):
+        _C.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims, *_encode_epilogue(epilogue))
 
-    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, compiled_dims='mn', use_psum_layout=False):
-        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c, compiled_dims, use_psum_layout)
+    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, compiled_dims='mn', use_psum_layout=False, epilogue=None):
+        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c, compiled_dims, use_psum_layout, *_encode_epilogue(epilogue))
 
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
@@ -229,10 +224,10 @@ def batched_symm(a, b, d):
 
 
 def k_grouped_fp4_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None,
-                                      recipe=(1, 1, 32), compiled_dims='mn', use_psum_layout=False):
+                                      recipe=(1, 1, 32), compiled_dims='mn', use_psum_layout=False, epilogue=None):
     (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
     _C.k_grouped_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout,
-                                       c, recipe, compiled_dims, use_psum_layout)
+                                       c, recipe, compiled_dims, use_psum_layout, *_encode_epilogue(epilogue))
 
 
 def get_mqa_logits_metadata(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
@@ -270,12 +265,8 @@ def fp8_fp4_paged_sparse_mqa_logits(q, kv_cache, weights, metadata,
         q_data, q_sf, kv_cache, weights, metadata, num_max_sparse_blocks, sparse_block_kv)
 
 
-def get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk):
-    return dict(_C.get_bf16_mega_gate_config(num_tokens, hidden, num_routed_experts, num_topk))
-
-
 def bf16_mega_gate(x, weight, num_topk, use_shared_as_routed, num_shared_experts,
-                     routed_scaling_factor, ep_rank, scoring_func='identity', mask=None,
+                     routed_scaling_factor, ep_rank, scoring_func='sqrtsoftplus', mask=None,
                      bias=None, image_bias=None, image_token_mask=None, fix_routing_mask=None,
                      to_physical_map=None, logical_count=None, unmapped_topk_idx=None,
                      force_random=None, out=None):
@@ -466,6 +457,16 @@ def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
         num_tokens, group_size, float(routed_scaling_factor),
     )
 
+# Locality domain helpers
+from . import locality_domain
+from .locality_domain import (
+    get_num_locality_domains,
+    is_localization_available,
+    localize,
+    is_localized,
+    destroy_localizer,
+)
+
 # Some utils
 from . import testing
 from . import utils
@@ -476,6 +477,9 @@ _C.init(
     os.path.dirname(os.path.abspath(__file__)),
     find_cuda_home()
 )
+# Native cuBLASLt exit callbacks can free handle storage before C++ static destructors.
+# Release handles and workspaces while Python, PyTorch and CUDA are still available.
+atexit.register(shutdown)
 
 def _read_version() -> str:
     version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')

@@ -150,8 +150,7 @@ static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>&
     if (swap_ab) {
         sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
                                 eff_m, eff_n, k, gran_k_a, gran_k_b,
-                                k_major, k_major, compiled_dims,
-                                std::nullopt, true);
+                                k_major, k_major, compiled_dims, true);
     } else {
         sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 k_major, k_major, compiled_dims);
@@ -167,7 +166,8 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             std::optional<std::tuple<int, int>> recipe_b,
                             const std::string& compiled_dims,
                             const bool& disable_ue8m0_cast,
-                            const std::optional<float>& alpha) {
+                            const std::optional<float>& alpha,
+                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -199,6 +199,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
         if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
             DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+            DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
             // SM90 kernels read one activation scale per row.
             const int gran_m = recipe.has_value() ? std::get<0>(recipe.value()) : std::get<0>(recipe_a.value());
             const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
@@ -209,16 +210,17 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                 sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
             } else {
                 const auto major_sfb = get_major_type_ab(sfb);
-                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, std::nullopt, gran_k_a);
+                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, gran_k_a);
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
             sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                    major_a, major_b, compiled_dims, std::nullopt, alpha);
+                                    major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
         }
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         fp8_fp4_gemm_nt_sm120(a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast,
                               major_a, major_b, m, n, k);
     } else {
@@ -235,9 +237,10 @@ static void fp8_fp4_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
                             const bool& disable_ue8m0_cast,
-                            const std::optional<float>& alpha) {
+                            const std::optional<float>& alpha,
+                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt(a, {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
 }
 
 static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -249,10 +252,11 @@ static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
                             const bool& disable_ue8m0_cast,
-                            const std::optional<float>& alpha) {
+                            const std::optional<float>& alpha,
+                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)},
                     {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
 }
 
 static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -264,9 +268,10 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
                             const bool& disable_ue8m0_cast,
-                            const std::optional<float>& alpha) {
+                            const std::optional<float>& alpha,
+                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha, epilogue_class);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -280,7 +285,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
                                                  const bool& ensure_zero_padding,
-                                                 const std::optional<int>& expected_m_for_psum_layout) {
+                                                 const std::optional<int>& expected_m_for_psum_layout,
+                                                 const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -326,14 +332,17 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                                                     compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
+                                                     compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
+                                                     resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         const auto b_data = sm120_to_k_major(b.first, major_b, n);
         const bool is_mixed_fp4 = (a.first.scalar_type() != b_data.scalar_type()) and
                                   (a.first.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
@@ -356,10 +365,11 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                                  const std::string& compiled_dims,
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
-                                                 const bool& ensure_zero_padding) {
+                                                 const bool& ensure_zero_padding,
+                                                 const std::shared_ptr<EpilogueClass>& epilogue_class) {
     m_grouped_fp8_fp4_gemm_nt_contiguous(a, {b.first.transpose(1, 2), b.second.transpose(1, 2)},
                                          d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast,
-                                         use_psum_layout, ensure_zero_padding, std::nullopt);
+                                         use_psum_layout, ensure_zero_padding, std::nullopt, epilogue_class);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -371,7 +381,8 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
                                              std::optional<std::tuple<int, int>> recipe_a,
                                              std::optional<std::tuple<int, int>> recipe_b,
                                              const std::string& compiled_dims,
-                                             const bool& disable_ue8m0_cast) {
+                                             const bool& disable_ue8m0_cast,
+                                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -401,13 +412,15 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         const auto major_sfb = get_major_type_ab(sfb);
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
-                                                 major_a, major_b, compiled_dims);
+                                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);
@@ -425,7 +438,8 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims,
                                              const bool& use_psum_layout,
-                                             const bool& use_padded_sf_layout) {
+                                             const bool& use_padded_sf_layout,
+                                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Must be 1D1D kernel
     DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
 
@@ -462,7 +476,8 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
         const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout, use_padded_sf_layout);
         const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout, use_padded_sf_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
-                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout, use_padded_sf_layout);
+                                      cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout, use_padded_sf_layout,
+                                      resolve_epilogue_class(epilogue_class, c, d));
     } else if (arch_major == 12) {
         // TODO(sm120-port, stage 2): k-grouped GEMM needs adaptation to dev's psum SF-layout API
         DG_HOST_UNREACHABLE("SM120 k-grouped FP8 GEMM not yet ported");
@@ -480,11 +495,13 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims,
                                              const bool& use_psum_layout,
-                                             const bool& use_padded_sf_layout) {
+                                             const bool& use_padded_sf_layout,
+                                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Must be 1D1D kernel
     DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
     const int gran_k = std::get<2>(recipe);
     DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
+    DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
 
     // No psum on FP8 NT
     DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
@@ -539,7 +556,8 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                              const std::optional<torch::Tensor>& c,
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims,
-                                             const bool& use_psum_layout) {
+                                             const bool& use_psum_layout,
+                                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Must be 1D1D kernel
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 32));
     DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
@@ -583,7 +601,8 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     // Dispatch implementation
     if (arch_major == 10) {
         sm100_k_grouped_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, sum_k, grouped_layout,
-                                      k_alignment, major_a, major_b, compiled_dims, use_psum_layout);
+                                      k_alignment, major_a, major_b, compiled_dims, use_psum_layout,
+                                      resolve_epilogue_class(epilogue_class, c, d));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -593,7 +612,8 @@ static void bf16_gemm_nt(const torch::Tensor& a,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims,
-                         const std::optional<float>& alpha) {
+                         const std::optional<float>& alpha,
+                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -614,20 +634,26 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     if (early_return(m, n, k, d, c))
         return;
 
-    // Dispatch into different implements
-    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()) {
-        cublaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value(), alpha.value_or(1.0f));
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);
+    const auto epilogue_alpha = resolved_epilogue_class->get_alpha();
+
+    // Dispatch into different implements; cuBLASLt only covers a plain store, optionally alpha-scaled
+    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()
+        and epilogue_alpha.has_value()) {
+        cublaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value(), epilogue_alpha.value());
         return;
     }
 
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
-        sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, alpha);
+        sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, resolved_epilogue_class);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm120_bf16_gemm(sm120_to_k_major(a, major_a, m), sm120_to_k_major(b, major_b, n),
                         c, d, m, n, k, cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else {
@@ -640,8 +666,9 @@ static void bf16_gemm_nn(const torch::Tensor& a,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims,
-                         const std::optional<float>& alpha) {
-    bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims, alpha);
+                         const std::optional<float>& alpha,
+                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
+    bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims, alpha, epilogue_class);
 }
 
 static void bf16_gemm_tn(const torch::Tensor& a,
@@ -649,8 +676,9 @@ static void bf16_gemm_tn(const torch::Tensor& a,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims,
-                         const std::optional<float>& alpha) {
-    bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims, alpha);
+                         const std::optional<float>& alpha,
+                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
+    bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims, alpha, epilogue_class);
 }
 
 static void bf16_gemm_tt(const torch::Tensor& a,
@@ -658,8 +686,9 @@ static void bf16_gemm_tt(const torch::Tensor& a,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
                          const std::string& compiled_dims,
-                         const std::optional<float>& alpha) {
-    bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims, alpha);
+                         const std::optional<float>& alpha,
+                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
+    bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims, alpha, epilogue_class);
 }
 
 static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
@@ -667,7 +696,8 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
                                               const bool& ensure_zero_padding,
-                                              const std::optional<int>& expected_m_for_psum_layout) {
+                                              const std::optional<int>& expected_m_for_psum_layout,
+                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -705,14 +735,17 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
                                             use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
-                                             use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
+                                             use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
+                                             resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 12) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm120_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, expected_m_for_psum_layout);
@@ -725,14 +758,16 @@ static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torc
                                               const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
-                                              const bool& ensure_zero_padding) {
+                                              const bool& ensure_zero_padding,
+                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
     m_grouped_bf16_gemm_nt_contiguous(a, b.transpose(1, 2),
-                                      d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, std::nullopt);
+                                      d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, std::nullopt, epilogue_class);
 }
 
 static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                           const torch::Tensor& d, const torch::Tensor& masked_m,
-                                          const int& expected_m, const std::string& compiled_dims) {
+                                          const int& expected_m, const std::string& compiled_dims,
+                                          const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -758,12 +793,15 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_m_grouped_gemm_masked(a, b, d, masked_m,
                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
-                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims,
+                                         resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 12) {
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm120_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else {
@@ -778,7 +816,8 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const torch::Tensor& grouped_layout,
                                               const std::optional<torch::Tensor>& c,
                                               const std::string& compiled_dims,
-                                              const bool& use_psum_layout) {
+                                              const bool& use_psum_layout,
+                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Shape checks
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [sum_k_ , m_] = get_shape<2>(a);
@@ -806,11 +845,13 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
         // No direct output or psum on SM90
         DG_HOST_ASSERT(c.has_value());
         DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else if (arch_major == 10) {
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
-                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
+                                  resolve_epilogue_class(epilogue_class, c, d));
     } else if (arch_major == 12) {
         // TODO(sm120-port, stage 2): k-grouped BF16 GEMM needs adaptation to dev's psum layout API
         DG_HOST_UNREACHABLE("SM120 k-grouped BF16 GEMM not yet ported");
@@ -941,28 +982,32 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("fp8_fp4_gemm_nn", &fp8_fp4_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("fp8_fp4_gemm_tn", &fp8_fp4_gemm_tn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false,
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("fp8_fp4_gemm_tt", &fp8_fp4_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false,
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
@@ -971,7 +1016,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
-          py::arg("expected_m_for_psum_layout") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
@@ -979,12 +1025,14 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
-          py::arg("ensure_zero_padding") = true);
+          py::arg("ensure_zero_padding") = true,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_fp8_fp4_gemm_nt_masked", &m_grouped_fp8_fp4_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
-          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
+          py::arg("epilogue") = nullptr);
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),
@@ -992,7 +1040,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe") = std::make_tuple(1, 1, 128),
           py::arg("compiled_dims") = "mn",
           py::arg("use_psum_layout") = false,
-          py::arg("use_padded_sf_layout") = false);
+          py::arg("use_padded_sf_layout") = false,
+          py::arg("epilogue") = nullptr);
     m.def("k_grouped_fp8_gemm_nt_contiguous", &k_grouped_fp8_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),
@@ -1000,14 +1049,16 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe") = std::make_tuple(1, 1, 128),
           py::arg("compiled_dims") = "mn",
           py::arg("use_psum_layout") = false,
-          py::arg("use_padded_sf_layout") = false);
+          py::arg("use_padded_sf_layout") = false,
+          py::arg("epilogue") = nullptr);
     m.def("k_grouped_fp4_gemm_nt_contiguous", &k_grouped_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt,
           py::arg("recipe") = std::make_tuple(1, 1, 32),
           py::arg("compiled_dims") = "mn",
-          py::arg("use_psum_layout") = false);
+          py::arg("use_psum_layout") = false,
+          py::arg("epilogue") = nullptr);
 
     // FP4 and FP8 GEMM alias names
     m.attr("fp4_gemm_nt") = m.attr("fp8_fp4_gemm_nt");
@@ -1025,42 +1076,50 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "nk",
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("bf16_gemm_nn", &bf16_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "nk",
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("bf16_gemm_tn", &bf16_gemm_tn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("bf16_gemm_tt", &bf16_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("alpha") = std::nullopt);
+          py::arg("alpha") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
-          py::arg("expected_m_for_psum_layout") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_bf16_gemm_nn_contiguous", &m_grouped_bf16_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",
           py::arg("use_psum_layout") = false,
-          py::arg("ensure_zero_padding") = true);
+          py::arg("ensure_zero_padding") = true,
+          py::arg("epilogue") = nullptr);
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
-          py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+          py::arg("expected_m"), py::arg("compiled_dims") = "nk",
+          py::arg("epilogue") = nullptr);
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("use_psum_layout") = false);
+          py::arg("use_psum_layout") = false,
+          py::arg("epilogue") = nullptr);
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
