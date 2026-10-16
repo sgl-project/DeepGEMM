@@ -105,6 +105,28 @@ def test_localize() -> None:
     print()
 
 
+def test_localize_rows() -> None:
+    print('Testing `localize_rows`:')
+    granularity, num_domains = locality_domain.get_granularity(), deep_gemm.get_num_locality_domains()
+    assert deep_gemm.is_localization_available()
+    for dtype, shape in ((torch.int8, (64, 8192, 4096)), (torch.int8, (4, 8192, 2048)), (torch.int32, (8, 4096, 256)), (torch.int8, (4096, 1024))):
+        plain = random_bytes(shape, dtype)
+        localized = deep_gemm.localize_rows(plain)
+        assert localized.shape == plain.shape and localized.stride() == plain.stride() and localized.dtype == dtype
+        assert not deep_gemm.is_localized(localized)
+        assert_bitwise_equal(localized, plain)
+        # Every batch index splits into per-domain row slices
+        for b in localized.view(-1, *shape[-2:]):
+            assert deep_gemm.is_localized(b.unflatten(0, (num_domains, -1)))
+        num_slice_bytes = shape[-2] // num_domains * shape[-1] * localized.element_size()
+        assert num_slice_bytes % granularity == 0
+        print(f' > {dtype} {shape}: {num_slice_bytes >> 20} MB per row slice')
+    for dtype, shape in ((torch.int8, (4, 8192, 1)), (torch.int8, (4, 8191, 4096))):
+        assert_raises(lambda: deep_gemm.localize_rows(random_bytes(shape, dtype)))
+    deep_gemm.destroy_localizer()
+    print()
+
+
 def test_mlopart() -> None:
     print('Testing the MPS MLOPart processes:')
     # On their own: start, serve a descriptor per domain and quit
@@ -163,5 +185,6 @@ if __name__ == '__main__':
     test_sm_locality_domains()
     test_empty()
     test_localize()
+    test_localize_rows()
     test_mlopart()
     test_without_mlopart()

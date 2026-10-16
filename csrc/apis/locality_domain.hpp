@@ -57,6 +57,21 @@ static torch::Tensor empty_per_domain(const at::IntArrayRef& sizes, const torch:
     return torch::from_blob(ptr, full_sizes, strides, release, torch::dtype(dtype).device(torch::kCUDA));
 }
 
+// `torch.empty(sizes, dtype=dtype)` for `(*B, N, K)`, with rows `[d * N / num_domains, (d + 1) * N / num_domains)` of every `B` index in domain `d`
+static torch::Tensor empty_split_rows(const at::IntArrayRef& sizes, const torch::ScalarType& dtype) {
+    auto& allocator = locality_domain_allocator;
+    DG_HOST_ASSERT(sizes.size() >= 2);
+    const int64_t num_domains = get_num_locality_domains(), num_rows = sizes[sizes.size() - 2];
+    DG_HOST_ASSERT(num_rows % num_domains == 0);
+    const int64_t num_batches = c10::multiply_integers(sizes.begin(), sizes.end() - 2);
+    const int64_t num_chunk_bytes = num_rows / num_domains * sizes.back() * static_cast<int64_t>(c10::elementSize(dtype));
+    DG_HOST_ASSERT(num_chunk_bytes > 0 and num_chunk_bytes % static_cast<int64_t>(allocator.get_granularity()) == 0);
+    const auto ptr = static_cast<char*>(allocator.reserve(num_chunk_bytes * num_domains * num_batches));
+    for (int64_t i = 0; i < num_domains * num_batches; ++ i)
+        allocator.map(ptr + i * num_chunk_bytes, num_chunk_bytes, static_cast<int>(i % num_domains));
+    return torch::from_blob(ptr, sizes, release, torch::dtype(dtype).device(torch::kCUDA));
+}
+
 /// Locality domain of the SMs
 
 static constexpr int kNumSMsPerTPC = 2;
@@ -162,6 +177,7 @@ static void register_apis(pybind11::module_& m) {
     submodule.def("is_localization_available", &is_localization_available);
     submodule.def("empty", &empty, pybind11::arg("sizes"), pybind11::arg("dtype"), pybind11::arg("domain_idx"));
     submodule.def("empty_per_domain", &empty_per_domain, pybind11::arg("sizes"), pybind11::arg("dtype"));
+    submodule.def("empty_split_rows", &empty_split_rows, pybind11::arg("sizes"), pybind11::arg("dtype"));
     submodule.def("is_localized", &is_localized);
     submodule.def("get_sm_locality_domains", &get_sm_locality_domains);
     submodule.def("get_balanced_sm_locality_domains", &get_balanced_sm_locality_domains);
