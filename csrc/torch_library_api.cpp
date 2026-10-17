@@ -122,6 +122,9 @@ Tensor dg_locality_domain_empty(at::IntArrayRef sizes, at::ScalarType dtype, int
 Tensor dg_locality_domain_empty_per_domain(at::IntArrayRef sizes, at::ScalarType dtype) {
     return locality_domain::empty_per_domain(sizes, dtype);
 }
+Tensor dg_locality_domain_empty_split_rows(at::IntArrayRef sizes, at::ScalarType dtype) {
+    return locality_domain::empty_split_rows(sizes, dtype);
+}
 Tensor dg_get_sm_locality_domains() { return locality_domain::get_sm_locality_domains(); }
 Tensor dg_get_balanced_sm_locality_domains() { return locality_domain::get_balanced_sm_locality_domains(); }
 
@@ -719,6 +722,7 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("set_mlopart_callbacks(int is_available, int create_memory, int release) -> ()", &dg_set_mlopart_callbacks);
     m.def("locality_domain_empty(int[] sizes, ScalarType dtype, int domain_idx) -> Tensor", &dg_locality_domain_empty);
     m.def("locality_domain_empty_per_domain(int[] sizes, ScalarType dtype) -> Tensor", &dg_locality_domain_empty_per_domain);
+    m.def("locality_domain_empty_split_rows(int[] sizes, ScalarType dtype) -> Tensor", &dg_locality_domain_empty_split_rows);
     m.def("get_sm_locality_domains() -> Tensor", &dg_get_sm_locality_domains);
     m.def("get_balanced_sm_locality_domains() -> Tensor", &dg_get_balanced_sm_locality_domains);
     m.def("is_localized(Tensor t) -> bool");

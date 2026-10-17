@@ -451,6 +451,7 @@ from .locality_domain import (
     get_num_locality_domains,
     is_localization_available,
     localize,
+    localize_rows,
     is_localized,
     destroy_localizer,
 )

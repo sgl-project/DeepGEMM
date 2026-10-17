@@ -62,6 +62,16 @@ def sf_to_trtllm(sf: torch.Tensor, is_l1: bool) -> torch.Tensor:
     return out.reshape(e, mn, k_words)
 
 
+def localize_rows_if_aligned(t: torch.Tensor) -> torch.Tensor:
+    """Tensors whose row halves are not whole allocation granules stay in plain memory."""
+    num_half_bytes = t[0].nbytes // deep_gemm.get_num_locality_domains()
+    return deep_gemm.localize_rows(t) if num_half_bytes % deep_gemm.locality_domain.get_granularity() == 0 else t
+
+
+def layout_of(arm: str) -> str:
+    return arm.split('#')[0].split('-')[0]
+
+
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     assert num_ranks == 1, 'one rank stands in for one EP rank of a larger MoE'
@@ -98,6 +108,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         'megamoe': ((mm_l1, mm_l1_sf), (mm_l2, mm_l2_sf)),
         'trtllm': ((trt_l1, trt_l1_sf), (trt_l2, trt_l2_sf)),
     }
+    if deep_gemm.is_localization_available():
+        arms['trtllm-local'] = tuple((localize_rows_if_aligned(w), localize_rows_if_aligned(sf))
+                                     for w, sf in arms['trtllm'])
+        assert all(not deep_gemm.is_localized(w) for w, _ in arms['trtllm-local'])
 
     def run(weights, layout: str) -> torch.Tensor:
         buffer.x[:num_tokens].copy_(x_packed)
@@ -136,6 +150,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         'trtllm layout differs from megamoe layout: '
         f'max |delta| {(y_trt.float() - y_mm.float()).abs().max().item():.3e}')
     dist_print(' > trtllm weights + scales == megamoe layout, bitwise', once_in_node=True)
+    if 'trtllm-local' in arms:
+        assert torch.equal(run(arms['trtllm-local'], 'trtllm'), y_mm), 'row-localized trtllm weights differ from megamoe layout'
+        localized = [t is not plain for local, trt in zip(arms['trtllm-local'], arms['trtllm']) for t, plain in zip(local, trt)]
+        dist_print(f' > row-localized trtllm (L1 w/sf, L2 w/sf localized: {localized}) == megamoe layout, bitwise', once_in_node=True)
 
     # Incorrect weights or scale packing must change the output.
     assert not torch.equal(run(((mm_l1, trt_l1_sf), arms['trtllm'][1]), 'trtllm'), y_mm), \
@@ -146,14 +164,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(' > sf control: incorrect SF packing read as TRT diverges', once_in_node=True)
 
     if args.bench:
-        order = [(name, name, w) for name, w in arms.items()]
+        order = [(name, layout_of(name), w) for name, w in arms.items()]
         if args.aa:
             # A/A control for allocation-placement effects.
             order.append(('megamoe#2', 'megamoe',
                           ((mm_l1.clone(), mm_l1_sf.clone()), (mm_l2.clone(), mm_l2_sf.clone()))))
-        for label, name, weights in order:
+        for label, layout, weights in order:
             for _ in range(5):
-                run(weights, name)
+                run(weights, layout)
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
             buffer.x[:num_tokens].copy_(x_packed)
@@ -166,7 +184,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 deep_gemm.fp8_fp4_mega_moe(
                     y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
                     recipe=(1, 1, GRAN_K), activation='swiglu',
-                    fast_math=bool(args.fast_math), weight_layout=name)
+                    fast_math=bool(args.fast_math), weight_layout=layout)
                 end.record()
                 torch.cuda.synchronize()
                 times.append(start.elapsed_time(end) * 1e3)

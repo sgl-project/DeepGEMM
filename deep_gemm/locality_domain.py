@@ -83,6 +83,23 @@ def localize(t: torch.Tensor, dim: int = -2) -> torch.Tensor:
     return localized
 
 
+def empty_split_rows(sizes, dtype: torch.dtype) -> torch.Tensor:
+    """`torch.empty(sizes, dtype=dtype)` for `(*B, N, K)`, with row slice `d` of every `B` index in domain `d`"""
+    return _allocate(_C.locality_domain_empty_split_rows, list(sizes), dtype)
+
+
+def localize_rows(t: torch.Tensor) -> torch.Tensor:
+    """
+    Copy `(*B, N, K)` weights into localized memory without changing their layout: shape and strides stay,
+    and rows `[d * N / num_domains, (d + 1) * N / num_domains)` of every `B` index land in domain `d`.
+    Mega MoE gives those rows to domain `d`'s SMs, so layouts shared with other kernels (e.g. TRT-LLM) can be localized.
+    """
+    assert t.dim() >= 2 and t.is_contiguous(), f'Weights `{tuple(t.shape)}` must be contiguous with at least 2 dims'
+    localized = empty_split_rows(t.shape, t.dtype)
+    localized.copy_(t)
+    return localized
+
+
 def destroy_localizer() -> None:
     """
     Quit the allocator backed by MLOPart. The allocated tensors stay valid.

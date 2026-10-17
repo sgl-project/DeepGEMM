@@ -1003,7 +1003,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if constexpr (kUseTrtllmWeights) {
-                    // TRT weights are 2D `[E * N, K]` rows (no shared experts, no localization)
+                    // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
                     // L1's row swap is handled in the epilogue; L2's shuffle in the descriptor.
