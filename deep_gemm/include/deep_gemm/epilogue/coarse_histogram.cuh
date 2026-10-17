@@ -45,9 +45,14 @@ struct NoHistogram {
     static constexpr uint32_t kNumSlots = 1;
 };
 
-// Adds this thread's bins to a global row. Thread t owns the bin pairs (2t, 2t + 1) + i * 2 * kMathThreads: one warp
-// add covers two full 128B lines, and a packed 64-bit add is exact while every bin stays a non-negative int32 (no carry
-// between the lanes), which the zero-at-entry contract guarantees. The loads are issued back to back, so a flush costs one shared-memory round trip.
+// Two adjacent int32 bins (even bin in the low word) as one 64-bit addend. The add is exact while every bin stays a
+// non-negative int32 (no carry between the words), which the zero-at-entry contract guarantees.
+CUTLASS_DEVICE unsigned long long pack_bin_pair(const uint32_t& even, const uint32_t& odd) {
+    return static_cast<unsigned long long>(even) | (static_cast<unsigned long long>(odd) << 32);
+}
+
+// Adds this thread's bins to a global row. Thread t owns the bin pairs (2t, 2t + 1) + i * 2 * kMathThreads, so one warp
+// add covers two full 128B lines. The loads are issued back to back, so a flush costs one shared-memory round trip.
 template <uint32_t kBins, uint32_t kMathThreads, bool kClear>
 CUTLASS_DEVICE void flush_coarse_histogram(int* local, int* global, const int& row) {
     constexpr uint32_t kPairsPerThread = kBins / (2 * kMathThreads);
@@ -58,9 +63,9 @@ CUTLASS_DEVICE void flush_coarse_histogram(int* local, int* global, const int& r
     int* row_bins = global + static_cast<uint64_t>(row) * kBins + 2 * threadIdx.x;
     #pragma unroll
     for (uint32_t i = 0; i < kPairsPerThread; ++ i) {
-        if ((counts[i].x | counts[i].y) != 0) {
+        if (counts[i].x != 0 or counts[i].y != 0) {
             atomicAdd(reinterpret_cast<unsigned long long*>(row_bins + i * 2 * kMathThreads),
-                      static_cast<unsigned long long>(counts[i].x) | (static_cast<unsigned long long>(counts[i].y) << 32));
+                      pack_bin_pair(counts[i].x, counts[i].y));
             if constexpr (kClear)
                 *reinterpret_cast<uint2*>(local + 2 * threadIdx.x + i * 2 * kMathThreads) = make_uint2(0u, 0u);
         }

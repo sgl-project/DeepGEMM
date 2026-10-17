@@ -595,7 +595,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
 
     // Optional coarse histogram of the stored scores: one int32 `[num_q_tokens_total, 1024]` row per query token
     using Histogram = cute::conditional_t<kWithHistogram,
-                                          CoarseHistogram<kNumMathThreads, BLOCK_Q, 2 * BLOCK_Q, kSwizzleHistogram>,
+                                          RowWindowHistogram<kNumMathThreads, BLOCK_Q, 2 * BLOCK_Q, kSwizzleHistogram>,
                                           epilogue::NoHistogram>;
     Histogram emit{};
     if constexpr (kWithHistogram)

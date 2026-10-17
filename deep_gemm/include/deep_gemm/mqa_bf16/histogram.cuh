@@ -23,18 +23,20 @@ CUTLASS_DEVICE void red_add(const uint32_t& smem_addr, const uint32_t& value) {
 }  // namespace coarse_histogram_detail
 
 // Counts the live (stored) non-NaN BF16 scores of every logits row into int32 `global[rows, 1024]` (added; the caller
-// zeroes it). Shared memory keeps a window of kWindowRows consecutive rows as 16-bit counters, four rows per 8-byte cell
-// (cell = bin, row r of a group at bytes 2 * (r % 4)), groups of four rows 8 KiB apart. A CTA's tasks visit rows in
-// increasing order and the Q blocks of one request alternate every chunk, so the window publishes (named barrier 1 of
-// the math threads, packed 64-bit global atomics, clear) only at a task that leaves it or would take the splits counted
-// since the last publish past kMaxSplits (no 16-bit counter can wrap: a split adds at most one score per math thread to
-// a row; tasks are capped at kMaxTaskSplits splits by the scheduler), and at exit.
+// zeroes it), with the bin encoding of `epilogue::CoarseHistogram` but its own storage: the window of two Q blocks (up
+// to 12 rows) needs 16-bit counters to fit in shared memory next to the KV ring. Shared memory keeps a window of
+// kWindowRows consecutive rows as 16-bit counters, four rows per 8-byte cell (cell = bin, row r of a group at
+// bytes 2 * (r % 4)), groups of four rows 8 KiB apart. A CTA's tasks visit rows in increasing order and the Q blocks of
+// one request alternate every chunk, so the window publishes (named barrier 1 of the math threads, packed 64-bit global
+// atomics, clear) only at a task that leaves it or would take the splits counted since the last publish past kMaxSplits
+// (no 16-bit counter can wrap: a split adds at most one score per math thread to a row; tasks are capped at
+// kMaxTaskSplits splits by the scheduler), and at exit.
 // Per split the tokens are counted in pairs: the two BF16 scores share one 32-bit register, and for 2^-14 <= |x| < 16
 // (the whole range of real indexer scores) the byte offset 8 * bin + row offset of both is computed with packed integer
 // operations (8 * bin = 0x47f8 - (bits & 0xfff8) for positive, (bits & 0xfff8) - 0xa800 for negative scores); a split
 // where some lane of the warp holds another value (NaN, +-Inf, 0, |x| < 2^-14 or >= 16) takes the exact scalar path.
 template <uint32_t kMathThreads, uint32_t kBlockQ, uint32_t kWindowRows, bool kSwizzle = false>
-struct CoarseHistogram {
+struct RowWindowHistogram {
     static constexpr bool kEnabled = true;
     static constexpr uint32_t kBins = epilogue::kNumCoarseHistogramBins;
     static constexpr uint32_t kNumGroups = kWindowRows / 4;
@@ -88,7 +90,7 @@ struct CoarseHistogram {
                 uint4 cells;
                 asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
                              : "=r"(cells.x), "=r"(cells.y), "=r"(cells.z), "=r"(cells.w) : "r"(addr));
-                if ((cells.x | cells.y | cells.z | cells.w) == 0)
+                if (cells.x == 0 and cells.y == 0 and cells.z == 0 and cells.w == 0)
                     continue;
                 if (kSwizzle and (pair & 8u)) {
                     uint32_t tmp = cells.x; cells.x = cells.y; cells.y = tmp;
@@ -99,10 +101,11 @@ struct CoarseHistogram {
                 #pragma unroll
                 for (uint32_t j = 0; j < 4; ++ j) {
                     const uint32_t slot = group * 4 + j;
-                    if ((lo[j] | hi[j]) != 0 and slot < num_used_slots and window_row + slot < num_rows) {
+                    const unsigned long long counts = epilogue::pack_bin_pair(lo[j], hi[j]);
+                    if (counts != 0 and slot < num_used_slots and window_row + slot < num_rows) {
                         atomicAdd(reinterpret_cast<unsigned long long*>(
                                       global + static_cast<uint64_t>(window_row + slot) * kBins + 2 * pair),
-                                  static_cast<unsigned long long>(lo[j]) | (static_cast<unsigned long long>(hi[j]) << 32));
+                                  counts);
                     }
                 }
                 if constexpr (kClear)
