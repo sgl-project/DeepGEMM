@@ -420,10 +420,10 @@ Tensor dg_fp8_fp4_mqa_logits(const Tensor& q, const OptTensor& q_sf, const Tenso
 Tensor dg_fp8_fp4_paged_mqa_logits(const Tensor& q, const OptTensor& q_sf, const Tensor& fused_kv_cache,
                                    const Tensor& weights, const Tensor& context_lens,
                                    const Tensor& block_table, const Tensor& schedule_meta,
-                                   int64_t max_context_len, const OptTensor& indices) {
+                                   int64_t max_context_len, const OptTensor& indices, const OptTensor& histogram) {
     return attention::fp8_fp4_paged_mqa_logits(
         std::make_tuple(q, q_sf), fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-        static_cast<int>(max_context_len), indices);
+        static_cast<int>(max_context_len), indices, histogram);
 }
 
 Tensor dg_get_mqa_logits_metadata(const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
@@ -785,7 +785,8 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_fp4_mqa_logits(Tensor q, Tensor? q_sf, Tensor kv_data, Tensor kv_sf, Tensor weights, "
           "Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int max_seqlen_k, Tensor? schedule_meta) -> Tensor");
     m.def("fp8_fp4_paged_mqa_logits(Tensor q, Tensor? q_sf, Tensor fused_kv_cache, Tensor weights, "
-          "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, Tensor? indices) -> Tensor");
+          "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, Tensor? indices, "
+          "Tensor(a!)? histogram) -> Tensor");
     m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
           "int num_heads) -> Tensor");
     m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "

@@ -158,8 +158,10 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_q_tokens_total,
     }
 }
 
-// Visit requests chunk by chunk, reusing each chunk's KV across its Q blocks
-template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
+// Visit requests chunk by chunk, reusing each chunk's KV across its Q blocks. `kMaxTaskSplits` caps the splits of one
+// task (a one-Q-block request's whole share of an SM otherwise) for consumers that budget per task
+template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk,
+          uint32_t kMaxTaskSplits = 0xffffffffu>
 struct SM100PagedMQALogitsScheduler {
     static constexpr bool kIsPaged = true;
     static constexpr uint32_t kPageKV = PAGE_KV;
@@ -229,7 +231,10 @@ struct SM100PagedMQALogitsScheduler {
         current.get_q_block_span(current_q_block_in_request, q_block_token_offset, task.num_q_tokens);
         task.q_token_base = current.q_token_start + q_block_token_offset;
         task.kv_token_base = current_kv_split_base * SPLIT_KV;
-        task.num_kv_splits = (current.num_q_blocks == 1) ? remaining : cute::min(remaining, kSplitsPerChunk);
+        if constexpr (kMaxTaskSplits == 0xffffffffu)
+            task.num_kv_splits = (current.num_q_blocks == 1) ? remaining : cute::min(remaining, kSplitsPerChunk);
+        else
+            task.num_kv_splits = cute::min(remaining, current.num_q_blocks == 1 ? kMaxTaskSplits : kSplitsPerChunk);
         task.kv_shared_with_prev = current_q_block_in_request > 0;
         task_block_table_row = block_table + current.q_token_start * static_cast<uint64_t>(block_table_stride);
         task_num_kv_pages = current.num_kv_pages;
