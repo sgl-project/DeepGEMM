@@ -496,8 +496,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
           uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
-          typename WorkspaceT = layout::Workspace,
-          uint32_t kRecvCountHighTarget = kNumSMs * kNumRanks>
+          typename WorkspaceT = layout::Workspace>
 struct LegacyMegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
@@ -630,7 +629,7 @@ struct LegacyMegaMoEScheduler {
             if (expert_idx < kNumExpertsPerRank) {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

@@ -385,12 +385,3 @@ def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
         num_tokens, group_size, float(routed_scaling_factor),
     )
-
-
-from .m2n import (  # noqa: E402
-    MegaMoEM2NSymmBuffer,
-    get_symm_buffer_for_mega_moe_m2n,
-    make_m2n_weight_descs,
-    mega_moe_m2n_ag,
-    mega_moe_m2n_eg,
-)

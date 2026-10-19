@@ -34,7 +34,7 @@ bash build_sgl_deep_gemm.sh
 python3 -m pip install dist/sgl_deep_gemm-*.whl
 ```
 
-The build script initializes missing submodules and writes the wheel to `dist/`. It detects the GPU architecture automatically; set `TVM_FFI_CUDA_ARCH_LIST` when building for a different target or without a visible GPU. Set `SGL_DEEP_GEMM_VERSION` to override the wheel version without changing `sgl_deep_gemm/VERSION`. Keep the CUDA toolkit and C++ compiler available at runtime for DeepJIT compilation.
+The build script initializes and updates submodules to their recorded commits, then writes the wheel to `dist/`. It detects the GPU architecture automatically; set `TVM_FFI_CUDA_ARCH_LIST` when building for a different target or without a visible GPU. Set `SGL_DEEP_GEMM_VERSION` to override the wheel version without changing `sgl_deep_gemm/VERSION`. Keep the CUDA toolkit and C++ compiler available at runtime for DeepJIT compilation.
 
 From a directory outside the source checkout, check that the installed package exposes the M2N API:
 

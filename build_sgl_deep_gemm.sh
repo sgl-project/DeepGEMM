@@ -30,9 +30,7 @@ if [[ ! -f "setup.py" || ! -d "sgl_deep_gemm" || ! -d "deep_gemm" || ! -d "csrc"
 fi
 
 echo "--- Initialising submodules ---"
-if [[ ! -f third-party/cutlass/include/cutlass/cutlass.h || ! -f third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp ]]; then
-    git submodule update --init --recursive
-fi
+git submodule update --init --recursive
 
 echo "--- Linking CUTLASS headers into deep_gemm/include ---"
 ln -sfn "${ROOT_DIR}/third-party/cutlass/include/cutlass" "${ROOT_DIR}/deep_gemm/include/cutlass"
