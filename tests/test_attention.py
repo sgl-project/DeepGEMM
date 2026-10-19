@@ -41,10 +41,12 @@ def dtype_tag(dtype: torch.dtype) -> str:
 
 
 # SM100 takes MXFP4 / MXFP8 with BF16 weights and logits; SM90 takes E4M3 with one float scale per KV token, float
-# weights and float logits
+# weights and float logits; SM120 takes both E4M3 (as SM90) and MXFP4, with float weights and logits
 def mqa_logits_formats():
     if get_arch_major() == 10:
         return [(fmt, torch.bfloat16) for fmt in ('mxfp4', 'mxfp8')]
+    if get_arch_major() == 12:
+        return [('fp8', torch.float), ('mxfp4', torch.float)]
     return [('fp8', torch.float)]
 
 
@@ -53,6 +55,8 @@ def mqa_logits_heads(is_mxfp4: bool):
         heads = (8, 12, 16, 20, 32, 64)
         head_dims = (64, 128) if is_mxfp4 else (32, 64, 128)
         return heads, head_dims
+    if get_arch_major() == 12:
+        return (16, 32, 64), ((128, ) if is_mxfp4 else (32, 64, 128))
     return (32, 64), (32, 64, 128)
 
 
@@ -296,31 +300,103 @@ def kv_cache_cast_to_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4), x_cast_back.to(x.dtype)
 
 
+@test_filter(lambda: get_arch_major() == 12)
+def test_mqa_logits_short_queries():
+    # Few query tokens trigger split-KV on the FP8 path; nonzero starts test the compressed store offset
+    print('Testing MQA Logits (short queries):')
+    for fmt, dtype in mqa_logits_formats():
+        heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
+        for seq_len, seq_len_kv, starts in ((3, 8192, (0, 1, 127, 2730)), (9, 257, (0, 1, 127, 85)),
+                                            (33, 65536, (1, 129, 255, 21845))):
+            for num_heads in heads:
+                for head_dim in head_dims:
+                    q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+                    kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+                    weights = torch.randn(seq_len, num_heads, device='cuda', dtype=dtype)
+                    kernel_weights = to_mqa_weights(weights)
+                    ks = torch.tensor([min(starts[i % 4], seq_len_kv - 1) for i in range(seq_len)],
+                                      dtype=torch.int, device='cuda')
+                    ke = torch.tensor([seq_len_kv - (i % 3) for i in range(seq_len)], dtype=torch.int, device='cuda')
+                    ke = torch.maximum(ke, ks + 1)
+
+                    q_in, q_simulated = quantize_mqa_q(q, fmt)
+                    if fmt == 'fp8':
+                        kv_in = per_custom_dims_cast_to_fp8(kv, (0, ), False)
+                        kv_simulated = (kv_in[0].float() * kv_in[1].unsqueeze(1)).to(torch.bfloat16)
+                    else:
+                        kv_in, kv_simulated = quantize_mqa_q(kv, fmt)
+                    ref_logits, _ = ref_mqa_logits(q, kv, kernel_weights.float(), ks, ke)
+                    simulated_logits, _ = ref_mqa_logits(q_simulated, kv_simulated, kernel_weights.float(), ks, ke)
+
+                    max_seqlen_k = (ke - ks).max().item()
+                    logits = deep_gemm.fp8_fp4_mqa_logits(q_in, kv_in, kernel_weights, ks, ke, max_seqlen_k=max_seqlen_k)
+                    assert logits.size() == (seq_len, max_seqlen_k) and logits.dtype == dtype
+
+                    # Expand the compressed result for comparison with the dense reference
+                    expanded = torch.full((seq_len, seq_len_kv), float('-inf'), device='cuda')
+                    for i in range(seq_len):
+                        expanded[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]].float()
+                    mask = torch.isneginf(ref_logits)
+                    diff_tol, simulated_diff_tol = mqa_logits_tolerances(fmt)
+                    diff = calc_diff(expanded.masked_fill(mask, 0), ref_logits.masked_fill(mask, 0))
+                    simulated_diff = calc_diff(expanded.masked_fill(mask, 0), simulated_logits.masked_fill(mask, 0))
+                    assert diff < diff_tol, f'{fmt=}, {seq_len=}, {seq_len_kv=}, {num_heads=}, {head_dim=}: {diff=}'
+                    assert simulated_diff < simulated_diff_tol, f'{fmt=}, {seq_len=}, {num_heads=}: {simulated_diff=}'
+                    print(f' > Fmt={fmt:5}, SQ={seq_len:2}, SK={seq_len_kv:5}, H={num_heads:2}, D={head_dim:3}: OK')
+    print()
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_paged_mqa_logits_all_empty():
+    # Every context empty: the SM120 metadata kernel returns without scheduling any atom
+    print('Testing Paged MQA Logits (all contexts empty):')
+    for is_varlen in (False, True):
+        batch_size, next_n = (6, 1) if is_varlen else (3, 2)
+        num_heads, head_dim, block_kv = 32, 128, 64
+        q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
+        q_in, _ = quantize_mqa_q(q, 'fp8')
+        kv_in, _ = kv_cache_cast_to_fp8(torch.randn((2, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16))
+        weights = to_mqa_weights(torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=torch.float))
+        context_lens = torch.zeros((batch_size, next_n), device='cuda', dtype=torch.int)
+        block_table = torch.zeros((batch_size, 1), device='cuda', dtype=torch.int)
+        indices = torch.arange(batch_size, device='cuda', dtype=torch.int) // 2 if is_varlen else None
+        meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv, deep_gemm.get_num_sms(), indices)
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(q_in, kv_in, weights, context_lens, block_table, meta, block_kv,
+                                                    indices=indices)
+        torch.cuda.synchronize()
+        assert logits.shape == (batch_size * next_n, block_kv)
+        print(f' > {is_varlen=}: OK')
+    print()
+
+
 def test_paged_mqa_logits():
     # SM100 flattens varlen requests into `[num_q_tokens, 1]` rows tied together by `indices`; SM90 takes
-    # `[batch_size, next_n]` queries. Both give every row its own context length
-    is_varlen = get_arch_major() == 10
+    # `[batch_size, next_n]` queries; SM120 takes both. Every row has its own context length
+    is_sm120 = get_arch_major() == 12
+    varlen_modes = (True, ) if get_arch_major() == 10 else ((False, True) if is_sm120 else (False, ))
 
     def enumerate_paged_mqa_logits():
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_q_tokens = 16 * 1024
-        for fmt, dtype in mqa_logits_formats():
-            heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
-            for block_kv in ((64, 128, 32) if is_varlen else (64, )):
-                for num_sequences in (64, 256, ):
-                    for max_tokens_per_batch in ((6, 8) if is_varlen else (1, 2)):
-                        for num_heads in heads:
-                            for head_dim in head_dims:
-                                for avg_kv in (8192, 65536, 256 * 1024):
-                                    if num_sequences * avg_kv > max_kv_pool_tokens:
-                                        continue
-                                    if num_sequences * max_tokens_per_batch > max_q_tokens:
-                                        continue
-                                    yield fmt, dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv
+        for is_varlen in varlen_modes:
+            for fmt, dtype in mqa_logits_formats():
+                heads, head_dims = mqa_logits_heads(fmt == 'mxfp4')
+                for block_kv in ((64, 32, 128, 256) if is_sm120 else ((64, 128, 32) if is_varlen else (64, ))):
+                    for num_sequences in (64, 256, ):
+                        for max_tokens_per_batch in ((6, 8) if is_varlen else ((1, 2, 3, 4, 5) if is_sm120 else (1, 2))):
+                            for num_heads in heads:
+                                for head_dim in head_dims:
+                                    for avg_kv in (8192, 65536, 256 * 1024):
+                                        if num_sequences * avg_kv > max_kv_pool_tokens:
+                                            continue
+                                        if num_sequences * max_tokens_per_batch > max_q_tokens:
+                                            continue
+                                        yield (is_varlen, fmt, dtype, block_kv, num_sequences, max_tokens_per_batch,
+                                               num_heads, head_dim, avg_kv)
 
     print('Testing Paged MQA Logits:')
 
-    for fmt, dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv in sample_mqa_cases('paged', list(enumerate_paged_mqa_logits())):
+    for is_varlen, fmt, dtype, block_kv, num_sequences, max_tokens_per_batch, num_heads, head_dim, avg_kv in sample_mqa_cases('paged', list(enumerate_paged_mqa_logits())):
         # Query layout: varlen rows `(num_q_tokens, 1)` or fixed `(num_sequences, next_n)`
         if is_varlen:
             tokens_per_seq = torch.randint(1, max_tokens_per_batch + 1, (num_sequences,), device='cuda', dtype=torch.int)
@@ -336,6 +412,9 @@ def test_paged_mqa_logits():
         weights = torch.randn((num_q_tokens, num_heads), device='cuda', dtype=dtype)
         kernel_weights = to_mqa_weights(weights)
         context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (num_sequences,), device='cuda', dtype=torch.int)
+        if is_sm120:
+            # Empty contexts (for varlen, a request's first token); the SM120 scheduler skips their atoms
+            context_lens[::7] = 0
 
         # Per-token context lengths: the tokens of a sequence see growing prefixes, the last one the full length
         if is_varlen:
@@ -711,5 +790,7 @@ if __name__ == '__main__':
     random.seed(0)
 
     test_mqa_logits()
+    test_mqa_logits_short_queries()
+    test_paged_mqa_logits_all_empty()
     test_paged_mqa_logits()
     test_sparse_mqa_logits()

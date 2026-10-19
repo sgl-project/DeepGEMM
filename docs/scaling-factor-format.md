@@ -312,7 +312,7 @@ Sources: `csrc/apis/attention.hpp` (host checks), `tests/test_attention.py` (SF 
 deep_gemm.fp8_fp4_mqa_logits(
     q,                       # (q_fp, q_sf): q_fp [seq_len, num_heads, head_dim]
     kv,                      # (kv_fp, kv_sf):       kv_fp [seq_len_kv, head_dim]
-    weights,                 # [seq_len, num_heads]; bf16 on SM100, float32 on SM90
+    weights,                 # [seq_len, num_heads]; bf16 on SM100, float32 on SM90 and SM120
     cu_seq_len_k_start, cu_seq_len_k_end,
     max_seqlen_k=max_seqlen_k,
 )
@@ -322,8 +322,8 @@ deep_gemm.fp8_fp4_mqa_logits(
 
 | Mode | `q_sf` | `kv_sf` | Q/KV data dtype | Arch |
 |---|---|---|---|---|
-| MX (`q_sf` provided) | `int32` packed UE8M0, contiguous | `int32` packed UE8M0, contiguous | FP8 (MXFP8) or packed FP4 (MXFP4) | SM100 only |
-| non-MX (`q_sf=None`) | — | `float32` (one plain scale per token), contiguous | FP8 only | SM90 only |
+| MX (`q_sf` provided) | `int32` packed UE8M0, contiguous | `int32` packed UE8M0, contiguous | FP8 (MXFP8) or packed FP4 (MXFP4) on SM100; packed FP4 (MXFP4) only on SM120 | SM100, SM120 |
+| non-MX (`q_sf=None`) | — | `float32` (one plain scale per token), contiguous | FP8 only | SM90, SM120 |
 
 Additional rules:
 
@@ -331,8 +331,9 @@ Additional rules:
 - SF shapes: `q_sf` is `[seq_len, num_heads]` (non-paged) or `[batch_size, next_n, num_heads]` (paged); `kv_sf` is 1-D `[seq_len_kv]`. Both contiguous.
 - MX SF granularity is per-32-element blocks along `head_dim` — with `head_dim <= 128` all (up to 4) UE8M0 exponents of one token/head fit in exactly **one `int32`**, hence the shapes above have no trailing K dimension.
 - The non-paged API returns compressed logits and requires a positive `max_seqlen_k`. Neither API cleans entries beyond each row's valid KV span; callers must mask them.
-- Weights and logits are BF16 on SM100 and FP32 on SM90; the output dtype is fixed by the architecture.
-- Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]` — per token, the value bytes (`head_dim` for FP8, `head_dim/2` for FP4) are followed by 4 SF bytes interpreted as `int32` (MX) or `float32` (non-MX) (attention.hpp:266-285).
+- Weights and logits are BF16 on SM100 and FP32 on SM90 and SM120; the output dtype is fixed by the architecture.
+- SM120 takes 16, 32 or 64 heads (FP4 with `head_dim` 128), paged pages of 32, 64, 128 or 256 tokens, and paged requests either varlen or with a fixed `next_n`; consecutive varlen rows are paired and must share a block-table row, and varlen metadata fits about 8K query tokens. It has no dense `schedule_meta`.
+- Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]`, laid out per page: the value bytes of all `block_kv` tokens (`head_dim` each for FP8, `head_dim/2` for FP4) come first, followed by the page's `block_kv` 4-byte SFs, interpreted as `int32` (MX) or `float32` (non-MX). The page stride (`stride(0)`) may exceed the page size (attention.hpp:226-250).
 
 ```python
 from deep_gemm.utils import per_token_cast_to_fp8, per_custom_dims_cast_to_fp8
