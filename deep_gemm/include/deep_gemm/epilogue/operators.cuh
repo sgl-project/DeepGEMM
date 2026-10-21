@@ -173,8 +173,8 @@ public:
         }
         // Clamp amax once; defer element clamping until packing so the reduction can start earlier.
         amax = __hmin2_nan(amax, bound);
-        sf_exp.x = math::get_ue8m0_sf_exp(amax.x);
-        sf_exp.y = kSwapAB ? math::get_ue8m0_sf_exp(amax.y) : sf_exp.x;
+        sf_exp.x = math::get_ue8m0_sf_exp(amax.x, args.min_sf_exp);
+        sf_exp.y = kSwapAB ? math::get_ue8m0_sf_exp(amax.y, args.min_sf_exp) : sf_exp.x;
     }
 
     // Clamp, scale and pack a prepared BF16 fragment.

@@ -55,9 +55,9 @@ std::optional<std::tuple<int, int, int>> to_optional_tuple3(const at::OptionalIn
     return values.has_value() ? std::make_optional(to_tuple3(values.value())) : std::nullopt;
 }
 
-// `deep_gemm.epilogue` objects cross as `(kind, scalar, sfd, count)`; kind 0 is no epilogue
+// `deep_gemm.epilogue` objects cross as `(kind, scalar, sfd, count, amax_eps)`; kind 0 is no epilogue
 std::shared_ptr<EpilogueClass> make_epilogue_class(int64_t kind, std::optional<double> scalar,
-                                                   const OptTensor& sfd, const OptTensor& count) {
+                                                   const OptTensor& sfd, const OptTensor& count, std::optional<double> amax_eps) {
     switch (kind) {
         case 0: return nullptr;
         case 1: return std::make_shared<IdentityEpilogue>();
@@ -67,7 +67,7 @@ std::shared_ptr<EpilogueClass> make_epilogue_class(int64_t kind, std::optional<d
         case 3:
             DG_HOST_ASSERT(sfd.has_value());
             return std::make_shared<FP8CastWithClampEpilogue>(
-                sfd.value(), scalar.has_value() ? std::make_optional(static_cast<float>(scalar.value())) : std::nullopt, count);
+                sfd.value(), scalar.has_value() ? std::make_optional(static_cast<float>(scalar.value())) : std::nullopt, count, static_cast<float>(amax_eps.value_or(1e-4)));
         case 4: return std::make_shared<BF16StochasticRoundingEpilogue>();
         default: DG_HOST_UNREACHABLE("Unknown epilogue kind");
     }
@@ -220,11 +220,11 @@ void dg_##name(const Tensor& a, const Tensor& a_sf, const Tensor& b, const Tenso
                at::OptionalIntArrayRef recipe_b, const std::string& compiled_dims,                 \
                bool disable_ue8m0_cast, std::optional<double> alpha,                               \
                int64_t epilogue_kind, std::optional<double> epilogue_scalar,                       \
-               const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {                   \
+               const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {                   \
     gemm::name({a, a_sf}, {b, b_sf}, d, c,                                                         \
                to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b), \
                compiled_dims, disable_ue8m0_cast, to_optional_float(alpha),                        \
-               make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count)); \
+               make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps)); \
 }
 DG_DEFINE_FP8_FP4_GEMM(fp8_fp4_gemm_nt)
 DG_DEFINE_FP8_FP4_GEMM(fp8_fp4_gemm_nn)
@@ -242,12 +242,12 @@ void dg_m_grouped_fp8_fp4_gemm_nt_contiguous(const Tensor& a, const Tensor& a_sf
                                              bool disable_ue8m0_cast, bool use_psum_layout,
                                              bool ensure_zero_padding,
                                              std::optional<int64_t> expected_m_for_psum_layout,
-                                             int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                             int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::m_grouped_fp8_fp4_gemm_nt_contiguous(
         {a, a_sf}, {b, b_sf}, d, grouped_layout,
         to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b),
         compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
-        to_optional_int(expected_m_for_psum_layout), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        to_optional_int(expected_m_for_psum_layout), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_m_grouped_fp8_fp4_gemm_nn_contiguous(const Tensor& a, const Tensor& a_sf,
@@ -259,11 +259,11 @@ void dg_m_grouped_fp8_fp4_gemm_nn_contiguous(const Tensor& a, const Tensor& a_sf
                                              const std::string& compiled_dims,
                                              bool disable_ue8m0_cast, bool use_psum_layout,
                                              bool ensure_zero_padding,
-                                             int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                             int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::m_grouped_fp8_fp4_gemm_nn_contiguous(
         {a, a_sf}, {b, b_sf}, d, grouped_layout,
         to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b),
-        compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_m_grouped_fp8_fp4_gemm_nt_masked(const Tensor& a, const Tensor& a_sf,
@@ -273,20 +273,20 @@ void dg_m_grouped_fp8_fp4_gemm_nt_masked(const Tensor& a, const Tensor& a_sf,
                                          at::OptionalIntArrayRef recipe_a,
                                          at::OptionalIntArrayRef recipe_b,
                                          const std::string& compiled_dims, bool disable_ue8m0_cast,
-                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::m_grouped_fp8_fp4_gemm_nt_masked(
         {a, a_sf}, {b, b_sf}, d, masked_m, static_cast<int>(expected_m),
         to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b),
-        compiled_dims, disable_ue8m0_cast, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        compiled_dims, disable_ue8m0_cast, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 #define DG_DEFINE_BF16_GEMM(name)                                                                  \
 void dg_##name(const Tensor& a, const Tensor& b, const Tensor& d, const OptTensor& c,              \
                const std::string& compiled_dims, std::optional<double> alpha,                      \
                int64_t epilogue_kind, std::optional<double> epilogue_scalar,                       \
-               const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {                   \
+               const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {                   \
     gemm::name(a, b, d, c, compiled_dims, to_optional_float(alpha),                                \
-               make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count)); \
+               make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps)); \
 }
 DG_DEFINE_BF16_GEMM(bf16_gemm_nt)
 DG_DEFINE_BF16_GEMM(bf16_gemm_nn)
@@ -298,34 +298,34 @@ void dg_m_grouped_bf16_gemm_nt_contiguous(const Tensor& a, const Tensor& b, cons
                                           const Tensor& grouped_layout, const std::string& compiled_dims,
                                           bool use_psum_layout, bool ensure_zero_padding,
                                           std::optional<int64_t> expected_m_for_psum_layout,
-                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims,
                                             use_psum_layout, ensure_zero_padding,
-                                            to_optional_int(expected_m_for_psum_layout), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+                                            to_optional_int(expected_m_for_psum_layout), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_m_grouped_bf16_gemm_nn_contiguous(const Tensor& a, const Tensor& b, const Tensor& d,
                                           const Tensor& grouped_layout, const std::string& compiled_dims,
                                           bool use_psum_layout, bool ensure_zero_padding,
-                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims,
-                                            use_psum_layout, ensure_zero_padding, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+                                            use_psum_layout, ensure_zero_padding, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_m_grouped_bf16_gemm_nt_masked(const Tensor& a, const Tensor& b, const Tensor& d,
                                       const Tensor& masked_m, int64_t expected_m,
                                       const std::string& compiled_dims,
-                                      int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
-    gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, static_cast<int>(expected_m), compiled_dims, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+                                      int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
+    gemm::m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, static_cast<int>(expected_m), compiled_dims, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_k_grouped_bf16_gemm_tn_contiguous(const Tensor& a, const Tensor& b, const Tensor& d,
                                           at::OptionalIntArrayRef ks, const Tensor& grouped_layout,
                                           const OptTensor& c, const std::string& compiled_dims,
                                           bool use_psum_layout,
-                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                          int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::k_grouped_bf16_gemm_tn_contiguous(a, b, d, to_optional_int_vector(ks), grouped_layout,
-                                            c, compiled_dims, use_psum_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+                                            c, compiled_dims, use_psum_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_k_grouped_fp8_gemm_tn_contiguous(const Tensor& a, const Tensor& a_sf,
@@ -334,10 +334,10 @@ void dg_k_grouped_fp8_gemm_tn_contiguous(const Tensor& a, const Tensor& a_sf,
                                          const Tensor& grouped_layout, const OptTensor& c,
                                          at::IntArrayRef recipe, const std::string& compiled_dims,
                                          bool use_psum_layout, bool use_padded_sf_layout,
-                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::k_grouped_fp8_gemm_tn_contiguous(
         {a, a_sf}, {b, b_sf}, d, to_optional_int_vector(ks), grouped_layout,
-        c, to_tuple3(recipe), compiled_dims, use_psum_layout, use_padded_sf_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        c, to_tuple3(recipe), compiled_dims, use_psum_layout, use_padded_sf_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_k_grouped_fp8_gemm_nt_contiguous(const Tensor& a, const Tensor& a_sf,
@@ -346,10 +346,10 @@ void dg_k_grouped_fp8_gemm_nt_contiguous(const Tensor& a, const Tensor& a_sf,
                                          const Tensor& grouped_layout, const OptTensor& c,
                                          at::IntArrayRef recipe, const std::string& compiled_dims,
                                          bool use_psum_layout, bool use_padded_sf_layout,
-                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::k_grouped_fp8_gemm_nt_contiguous(
         {a, a_sf}, {b, b_sf}, d, to_optional_int_vector(ks), grouped_layout,
-        c, to_tuple3(recipe), compiled_dims, use_psum_layout, use_padded_sf_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        c, to_tuple3(recipe), compiled_dims, use_psum_layout, use_padded_sf_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_k_grouped_fp4_gemm_nt_contiguous(const Tensor& a, const Tensor& a_sf,
@@ -358,10 +358,10 @@ void dg_k_grouped_fp4_gemm_nt_contiguous(const Tensor& a, const Tensor& a_sf,
                                          const Tensor& grouped_layout, const OptTensor& c,
                                          at::IntArrayRef recipe, const std::string& compiled_dims,
                                          bool use_psum_layout,
-                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                                         int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     gemm::k_grouped_fp4_gemm_nt_contiguous(
         {a, a_sf}, {b, b_sf}, d, to_optional_int_vector(ks), grouped_layout,
-        c, to_tuple3(recipe), compiled_dims, use_psum_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+        c, to_tuple3(recipe), compiled_dims, use_psum_layout, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 void dg_batched_syrk(const Tensor& a, const Tensor& d) {
@@ -376,8 +376,8 @@ void dg_batched_symm(const Tensor& a, const Tensor& b, const Tensor& d) {
 // Einsum
 // ---------------------------------------------------------------------------
 void dg_einsum(const std::string& expr, const Tensor& a, const Tensor& b, const Tensor& d,
-               const OptTensor& c, bool use_cublaslt, int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
-    einsum::einsum(expr, a, b, d, c, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count), use_cublaslt);
+               const OptTensor& c, bool use_cublaslt, int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
+    einsum::einsum(expr, a, b, d, c, make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps), use_cublaslt);
 }
 
 void dg_fp8_einsum(const std::string& expr,
@@ -385,11 +385,11 @@ void dg_fp8_einsum(const std::string& expr,
                    const Tensor& b_data, const Tensor& b_sf,
                    const Tensor& d, const OptTensor& d_sf,
                    const OptTensor& c, at::IntArrayRef recipe,
-                   int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count) {
+                   int64_t epilogue_kind, std::optional<double> epilogue_scalar, const OptTensor& epilogue_sfd, const OptTensor& epilogue_count, std::optional<double> epilogue_amax_eps) {
     std::variant<Tensor, std::pair<Tensor, Tensor>> output = d;
     if (d_sf.has_value())
         output = std::make_pair(d, d_sf.value());
-    einsum::fp8_einsum(expr, {a_data, a_sf}, {b_data, b_sf}, output, c, to_tuple3(recipe), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count));
+    einsum::fp8_einsum(expr, {a_data, a_sf}, {b_data, b_sf}, output, c, to_tuple3(recipe), make_epilogue_class(epilogue_kind, epilogue_scalar, epilogue_sfd, epilogue_count, epilogue_amax_eps));
 }
 
 // ---------------------------------------------------------------------------
@@ -681,10 +681,10 @@ std::tuple<Tensor, Tensor> dg_bf16_mega_gate(const Tensor& x, const Tensor& weig
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
-#define DG_FP8_FP4_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, Tensor? c, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, bool disable_ue8m0_cast, float? alpha, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
-#define DG_BF16_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c, str compiled_dims, float? alpha, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
+#define DG_FP8_FP4_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, Tensor? c, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, bool disable_ue8m0_cast, float? alpha, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()"
+#define DG_BF16_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c, str compiled_dims, float? alpha, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()"
 #define DG_CUBLASLT_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c) -> ()"
-#define DG_K_GROUPED_FP8_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, int[]? ks, Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, bool use_padded_sf_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
+#define DG_K_GROUPED_FP8_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, int[]? ks, Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, bool use_padded_sf_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()"
 #define DG_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts"
 #define DG_SM90_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, bool use_fp8_dispatch, str activation"
 
@@ -748,36 +748,36 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_fp4_gemm_tt" DG_FP8_FP4_GEMM_SCHEMA);
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, "
           "Tensor grouped_layout, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, "
-          "bool disable_ue8m0_cast, bool use_psum_layout, bool ensure_zero_padding, int? expected_m_for_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "bool disable_ue8m0_cast, bool use_psum_layout, bool ensure_zero_padding, int? expected_m_for_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, "
           "Tensor grouped_layout, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, "
-          "bool disable_ue8m0_cast, bool use_psum_layout, bool ensure_zero_padding, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "bool disable_ue8m0_cast, bool use_psum_layout, bool ensure_zero_padding, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("m_grouped_fp8_fp4_gemm_nt_masked(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, "
           "Tensor masked_m, int expected_m, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, "
-          "bool disable_ue8m0_cast, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "bool disable_ue8m0_cast, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("bf16_gemm_nt" DG_BF16_GEMM_SCHEMA);
     m.def("bf16_gemm_nn" DG_BF16_GEMM_SCHEMA);
     m.def("bf16_gemm_tn" DG_BF16_GEMM_SCHEMA);
     m.def("bf16_gemm_tt" DG_BF16_GEMM_SCHEMA);
     m.def("m_grouped_bf16_gemm_nt_contiguous(Tensor a, Tensor b, Tensor(a!) d, Tensor grouped_layout, "
-          "str compiled_dims, bool use_psum_layout, bool ensure_zero_padding, int? expected_m_for_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "str compiled_dims, bool use_psum_layout, bool ensure_zero_padding, int? expected_m_for_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("m_grouped_bf16_gemm_nn_contiguous(Tensor a, Tensor b, Tensor(a!) d, Tensor grouped_layout, "
-          "str compiled_dims, bool use_psum_layout, bool ensure_zero_padding, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "str compiled_dims, bool use_psum_layout, bool ensure_zero_padding, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("m_grouped_bf16_gemm_nt_masked(Tensor a, Tensor b, Tensor(a!) d, Tensor masked_m, int expected_m, "
-          "str compiled_dims, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "str compiled_dims, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("k_grouped_bf16_gemm_tn_contiguous(Tensor a, Tensor b, Tensor(a!) d, int[]? ks, Tensor grouped_layout, "
-          "Tensor? c, str compiled_dims, bool use_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "Tensor? c, str compiled_dims, bool use_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("k_grouped_fp8_gemm_tn_contiguous" DG_K_GROUPED_FP8_GEMM_SCHEMA);
     m.def("k_grouped_fp8_gemm_nt_contiguous" DG_K_GROUPED_FP8_GEMM_SCHEMA);
     m.def("k_grouped_fp4_gemm_nt_contiguous(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, int[]? ks, "
-          "Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("batched_syrk(Tensor a, Tensor(a!) d) -> ()");
     m.def("batched_symm(Tensor a, Tensor b, Tensor(a!) d) -> ()");
 
     // Einsum and hyperconnection
-    m.def("einsum(str expr, Tensor a, Tensor b, Tensor(a!) d, Tensor? c, bool use_cublaslt, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+    m.def("einsum(str expr, Tensor a, Tensor b, Tensor(a!) d, Tensor? c, bool use_cublaslt, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("fp8_einsum(str expr, Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, Tensor(a!) d, "
-          "Tensor(b!)? d_sf, Tensor? c, int[] recipe, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
+          "Tensor(b!)? d_sf, Tensor? c, int[] recipe, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count, float? epilogue_amax_eps=None) -> ()");
     m.def("tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(a!) d, Tensor(b!) sqr_sum, int? num_splits) -> ()");
 
     // Attention

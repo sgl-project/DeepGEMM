@@ -25,9 +25,9 @@ static void register_apis(pybind11::module_& m) {
         "Cast BF16-rounded GEMM output to FP8, optionally clamping before scaling. "
         "clamped_count is an optional single-element CUDA uint32 tensor; "
         "the kernel writes the total asynchronously when provided.")
-        .def(pybind11::init<const torch::Tensor&, const std::optional<float>&, const std::optional<torch::Tensor>&>(),
+        .def(pybind11::init<const torch::Tensor&, const std::optional<float>&, const std::optional<torch::Tensor>&, const float&>(),
              pybind11::arg("sfd"), pybind11::arg("clamp_value") = std::nullopt,
-             pybind11::arg("clamped_count") = std::nullopt);
+             pybind11::arg("clamped_count") = std::nullopt, pybind11::arg("amax_eps") = 1e-4f);
     pybind11::class_<BF16StochasticRoundingEpilogue, EpilogueClass,
                      std::shared_ptr<BF16StochasticRoundingEpilogue>>(submodule, "BF16StochasticRounding")
         .def(pybind11::init<>());

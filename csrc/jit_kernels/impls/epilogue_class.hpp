@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,6 +71,7 @@ class FP8CastWithClampEpilogue final: public EpilogueClass {
     torch::Tensor sfd;
     std::optional<float> clamp_value;
     std::optional<torch::Tensor> clamped_count;
+    uint32_t min_sf_exp;
 
     static uint32_t* get_clamp_count_ready() {
         const auto stream = c10::cuda::getCurrentCUDAStream();
@@ -86,8 +88,15 @@ class FP8CastWithClampEpilogue final: public EpilogueClass {
 public:
     explicit FP8CastWithClampEpilogue(const torch::Tensor& sfd,
                                       const std::optional<float>& clamp_value = std::nullopt,
-                                      const std::optional<torch::Tensor>& clamped_count = std::nullopt):
+                                      const std::optional<torch::Tensor>& clamped_count = std::nullopt,
+                                      const float& amax_eps = 1e-4f):
         sfd(sfd), clamp_value(clamp_value), clamped_count(clamped_count) {
+        DG_HOST_ASSERT(std::isfinite(amax_eps) and amax_eps > 0.0f);
+        // Compute in double precision so epsilon / 448 cannot underflow before
+        // validation. Both the scale and its BF16 reciprocal must be finite.
+        const auto exponent = static_cast<int>(std::ceil(std::log2(static_cast<double>(amax_eps) / 448.0))) + 127;
+        DG_HOST_ASSERT(exponent >= 1 and exponent <= 253);
+        min_sf_exp = static_cast<uint32_t>(exponent);
         DG_HOST_ASSERT(not clamp_value.has_value() or clamp_value.value() > 0.0f);
         if (clamped_count.has_value())
             DG_HOST_ASSERT(clamped_count->scalar_type() == torch::kUInt32 and clamped_count->numel() == 1);
@@ -103,7 +112,8 @@ public:
                 .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n),
                 .clamp_value = clamp_value.value_or(0.0f),
                 .clamped_count = clamped_count.has_value() ? static_cast<uint32_t*>(clamped_count->data_ptr()) : nullptr,
-                .clamp_count_ready = clamped_count.has_value() ? get_clamp_count_ready() : nullptr};
+                .clamp_count_ready = clamped_count.has_value() ? get_clamp_count_ready() : nullptr,
+                .min_sf_exp = min_sf_exp};
     }
 
     void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
