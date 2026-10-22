@@ -111,6 +111,12 @@ skip_test() {
   SKIPPED+=("$1 ($2)")
 }
 
+# Match the release workflow's dependency preflight without requiring the
+# optional TileLang package for ordinary wheel validation.
+if [ "${TEST_PROFILE}" = release ]; then
+  run_test test_mhc_reference_import.py
+fi
+
 DEFAULT_SINGLE_GPU_TESTS=(
   test_bf16.py
   test_einsum.py
