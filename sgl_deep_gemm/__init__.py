@@ -361,7 +361,7 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       activation: str = 'swiglu') -> SM90SymmBuffer:
     from .utils.math import align
 
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
     return SM90SymmBuffer(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -382,6 +382,7 @@ def get_symm_buffer_for_mega_moe(group,
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
         assert mma_type.split('x')[0] == 'fp8'
+        assert num_shared_experts == 0
         return get_symm_buffer_for_sm90_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
@@ -423,7 +424,11 @@ def fp8_mega_moe(y: torch.Tensor,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 num_tokens_bound: Optional[int] = None):
+    """`num_tokens_bound`: upper bound on this call's per-rank token count on every rank (e.g. the maximum over a DP step);
+    lets the launch pick its schedule by the call instead of by the buffer capacity. None = the buffer capacity, and a
+    bound above it is rejected."""
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_mega_moe(
@@ -437,7 +442,8 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        int(num_tokens_bound) if num_tokens_bound is not None else 0
     )
 
 

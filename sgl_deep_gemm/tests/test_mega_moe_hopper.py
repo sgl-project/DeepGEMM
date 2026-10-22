@@ -8,8 +8,8 @@ path, with the compute path changed to SM90 FP8:
   ``transform_weights_for_mega_moe_sm90`` and a ``SymmBuffer``.
 * baseline: DeepEP dispatch, two grouped FP8 GEMMs, Triton SwiGLU, and DeepEP
   combine with untransformed weights. The current SM90 grouped GEMM path accepts
-  per-128-K L2 activation SF, while the fused SM90 MegaMoE L1 epilogue writes
-  per-64-K L2 activation SF to avoid cross-CTA synchronization. This is a
+  per-128-K L2 activation SF, as the fused SM90 MegaMoE L1 epilogue writes it,
+  with power-of-two scales where the fused epilogue's are continuous. This is a
   same-pipeline performance reference, not a bitwise correctness oracle.
 * low-latency baseline (optional, ``--run-low-latency-baseline``): mirrors the
   sglang low-latency MoE pipeline (see
@@ -82,7 +82,7 @@ FP8_E4M3_MAX = 448.0
 # the plain float above.
 _FP8_E4M3_MAX_TL = tl.constexpr(448.0)
 L1_ACT_SF_GRAN = 128
-FUSED_L2_ACT_SF_GRAN = 64
+FUSED_L2_ACT_SF_GRAN = 128
 BASELINE_L2_ACT_SF_GRAN = 128
 WEIGHT_SF_GRAN_MN = 128
 WEIGHT_SF_GRAN_K = 128
@@ -92,8 +92,8 @@ WEIGHT_SF_GRAN_K = 128
 # Section 1: Triton SwiGLU + FP8 quantization kernel.
 # ----------------------------------------------------------------------------
 # The baseline L2 path uses DeepGEMM SM90 grouped FP8 GEMM, which accepts
-# per-128-K activation SF. The scale values still use the same power-of-two
-# rounding as the fused epilogue to avoid adding an exact-FP32-scale difference.
+# per-128-K activation SF. The scales are rounded to a power of two when
+# `use_ue8m0_scale` is set; the fused epilogue writes continuous FP32 scales.
 # Input  x        : (M, 2*H) bf16, laid out as [gate_part | up_part].
 # Input  topk_w   : (M,) fp32, optional.
 # Output y        : (M, H) fp8_e4m3fn.
@@ -359,8 +359,8 @@ def _reference_fused(
 
             l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)
             s, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s, ih // 64, 64)
+            assert ih == intermediate_hidden and ih % FUSED_L2_ACT_SF_GRAN == 0
+            l1_view = l1_y.view(s, ih // FUSED_L2_ACT_SF_GRAN, FUSED_L2_ACT_SF_GRAN)
             amax = l1_view.abs().amax(dim=-1).clamp(1e-4)
             sf2 = amax / FP8_E4M3_MAX
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
@@ -1243,8 +1243,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # SM90 fused-kernel shape constraints from csrc/apis/sm90_mega.hpp::fp8_mega_moe:
     #   * H and IH must be multiples of 128 (L1 input per-128-K SF and
     #     block-(128,128) weight SF).
-    #   * IH / 64 <= 64, i.e. IH <= 4096, because l2_arrival_mask is uint64
-    #     with one bit per 64-column block.
+    #   * H % 512 == 0 and IH % 256 == 0: the per-128-K L2 activation SF takes
+    #     the 256-wide tiles, whose L1 and L2 N block counts must be even.
+    #   * IH / 64 <= 64, i.e. IH <= 4096. l2_arrival_mask is uint64 with one bit
+    #     per L1 N block, i.e. per 128 post-SwiGLU columns at BLOCK_N = 256, so
+    #     the mask alone would allow IH <= 8192.
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64, (
@@ -1353,7 +1356,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
     dist_print(
-        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} FP32 pow2, "
+        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} FP32, "
         f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} FP32 pow2 "
         f"(SM90 grouped-GEMM constraint)",
         once_in_node=True,
@@ -1450,10 +1453,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
         # Triton SwiGLU + FP8 quantization, including topk weight scaling.
-        # The fused SM90 MegaMoE L2 activation SF is per-64-K. The current
-        # DeepGEMM SM90 grouped GEMM supports only per-128-K activation SF, so
-        # the baseline uses per-128-K FP32 scales with the same power-of-two
-        # rounding rule as the fused epilogue.
+        # The current DeepGEMM SM90 grouped GEMM supports only per-128-K
+        # activation SF, so the baseline uses per-128-K power-of-two scales;
+        # the fused epilogue writes continuous FP32 scales.
         l1_y = swiglu_apply_weight_to_fp8_triton(
             x=l1_y,
             topk_weights=recv_topk_weights,

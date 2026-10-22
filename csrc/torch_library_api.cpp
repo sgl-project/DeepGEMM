@@ -473,6 +473,10 @@ int64_t dg_get_token_alignment_for_mega_moe() {
     return mega::get_token_alignment_for_mega_moe();
 }
 
+int64_t dg_get_token_alignment_for_sm90_mega_moe() {
+    return mega::get_token_alignment_for_sm90_mega_moe();
+}
+
 int64_t dg_get_block_m_for_mega_moe(int64_t num_ranks, int64_t num_experts,
                                     int64_t num_max_tokens_per_rank, int64_t num_tokens,
                                     int64_t num_topk, const std::string& mma_type,
@@ -605,13 +609,14 @@ void dg_fp8_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l1
                      at::IntArrayRef sym_buffer_ptrs, int64_t rank_idx,
                      int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                      at::IntArrayRef recipe, const std::string& activation,
-                     std::optional<double> activation_clamp, bool fast_math) {
+                     std::optional<double> activation_clamp, bool fast_math, int64_t num_tokens_bound) {
+    DG_HOST_ASSERT(0 <= num_tokens_bound and num_tokens_bound <= std::numeric_limits<int>::max());
     mega::fp8_mega_moe(
         y, {l1_weights, l1_weights_sf}, {l2_weights, l2_weights_sf},
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs.vec(),
         static_cast<int>(rank_idx), static_cast<int>(num_max_tokens_per_rank),
         static_cast<int>(num_experts), static_cast<int>(num_topk), to_tuple3(recipe),
-        activation, to_optional_float(activation_clamp), fast_math);
+        activation, to_optional_float(activation_clamp), fast_math, static_cast<int>(num_tokens_bound));
 }
 
 void dg_mega_moe_pre_dispatch(const Tensor& x, const Tensor& topk_idx, const Tensor& topk_weights,
@@ -708,6 +713,7 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("get_theoretical_mk_alignment_for_contiguous_layout(int? expected_m, int? num_groups) -> int",
           &dg_get_theoretical_mk_alignment_for_contiguous_layout);
     m.def("get_token_alignment_for_mega_moe() -> int", &dg_get_token_alignment_for_mega_moe);
+    m.def("get_token_alignment_for_sm90_mega_moe() -> int", &dg_get_token_alignment_for_sm90_mega_moe);
     m.def("get_block_m_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_tokens, "
           "int num_topk, str mma_type, int? global_num_tokens) -> int", &dg_get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe(" DG_SYMM_BUFFER_ARGS ") -> int", &dg_get_symm_buffer_size_for_mega_moe);
@@ -819,7 +825,7 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l1_weights_sf, Tensor l2_weights, "
           "Tensor l2_weights_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "
-          "int[] recipe, str activation, float? activation_clamp, bool fast_math) -> ()");
+          "int[] recipe, str activation, float? activation_clamp, bool fast_math, int num_tokens_bound=0) -> ()");
     m.def("mega_moe_pre_dispatch(Tensor x, Tensor topk_idx, Tensor topk_weights, Tensor(a!) buf_x, "
           "Tensor(b!) buf_x_sf, Tensor(c!) buf_topk_idx, Tensor(d!) buf_topk_weights, int num_tokens, int group_size, "
           "str mma_type, Tensor(e!)? buf_x_scales, Tensor? expert_scales) -> ()");
