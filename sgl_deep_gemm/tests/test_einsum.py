@@ -272,6 +272,33 @@ def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
     print()
 
 
+@test_filter(lambda: get_arch_major() == 10)
+def test_fp8_scale_floor():
+    # An identity contraction includes zeros and values around both floors.
+    for b in (3, 65):
+        x = torch.randn((b, 1, 512), device='cuda').to(torch.float8_e4m3fn)
+        x[0].zero_()
+        xs = torch.ones((b, 1, 4), device='cuda')
+        xs[1] *= 2 ** -30
+        y = torch.eye(512, device='cuda').to(torch.float8_e4m3fn).unsqueeze(0)
+        ys = torch.ones((1, 4, 4), device='cuda')
+        ref = torch.empty_like(x, dtype=torch.bfloat16)
+        deep_gemm.fp8_einsum('bhr,hdr->bhd', (x, xs), (y, ys), ref)
+        output = torch.empty_like(x)
+        sf = torch.empty_strided((b, 4), (1, align(b, 4)), device='cuda', dtype=torch.int32)
+        for eps in (1e-4, 1e-10):
+            for clamp in (None, 0.5):
+                expected = ref if clamp is None else ref.clamp(-clamp, clamp)
+                grouped = expected.float().view(b, 16, 32)
+                scale = 2.0 ** torch.ceil(torch.log2(grouped.abs().amax(-1).clamp_min(eps) / 448.0))
+                codes = (grouped / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view_as(output)
+                exponents = (torch.log2(scale) + 127).to(torch.uint8).view(torch.int32)
+                deep_gemm.fp8_einsum('bhr,hdr->bhd', (x, xs), (y, ys), output,
+                                     epilogue=deep_gemm.epilogue.FP8CastWithClamp(sf, clamp, amax_eps=eps))
+                assert torch.equal(output.view(torch.uint8), codes.view(torch.uint8))
+                assert torch.equal(sf, exponents)
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -284,6 +311,7 @@ if __name__ == '__main__':
     test_bhd_hdr_bhr()
     test_bhd_bhr_hdr()
 
+    test_fp8_scale_floor()
     test_fp8_bhr_hdr_bhd()
     test_fp8_bhd_hdr_bhr()
     test_fp8_bhd_bhr_hdr()
