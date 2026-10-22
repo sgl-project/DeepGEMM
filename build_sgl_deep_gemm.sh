@@ -55,6 +55,7 @@ mkdir -p "$PKG_DIR/include"
 cp -r "${ROOT_DIR}/deep_gemm/include/deep_gemm" "$PKG_DIR/include/deep_gemm"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cute" "$PKG_DIR/include/cute"
 cp -r "${ROOT_DIR}/third-party/cutlass/include/cutlass" "$PKG_DIR/include/cutlass"
+"$PYTHON_EXE" scripts/patch_cutlass_sm107.py "$PKG_DIR/include"
 cp -r "${ROOT_DIR}/third-party/deep_jit/include/deep_jit" "$PKG_DIR/include/deep_jit"
 
 echo "--- Reading version from sgl_deep_gemm/VERSION ---"
