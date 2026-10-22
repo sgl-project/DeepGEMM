@@ -188,7 +188,13 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         (kNumHeads == 12 or kNumHeads == 20 or
          (kIsMXSF and kNumHeads == 64 and not cute::is_same_v<reduce_dtype_t, float>));
     constexpr uint32_t kNumSpecializedRegisters = kMoreSpecializedRegisters ? 64 : 56;
-    constexpr uint32_t kNumMathRegisters = kMoreSpecializedRegisters ? 216 : 224;
+    // Three math warpgroups split the CTA pool of 512 registers per thread-slot four ways
+    constexpr uint32_t kNumEntryRegisters = (512 / (kNumMathWarpGroups + 1) / 8) * 8;
+    constexpr uint32_t kNumMathRegisters = kNumMathWarpGroups == 2 ?
+        (kMoreSpecializedRegisters ? 216 : 224) :
+        ((kNumEntryRegisters * (kNumMathWarpGroups + 1) - kNumSpecializedRegisters) / kNumMathWarpGroups / 8) * 8;
+    DG_STATIC_ASSERT(kNumMathRegisters * kNumMathWarpGroups + kNumSpecializedRegisters <= 512,
+                     "Register reconfiguration exceeds the CTA pool");
 
     cudaGridDependencySynchronize();
 
@@ -267,11 +273,18 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.empty_kv_barriers[kv_stage_idx].wait(kv_phase ^ 1);
 
                     const uint32_t kv_tma_offset = scheduler.get_kv_tma_offset(kv_base, kv_split_idx);
-                    tma::copy<kHeadDim, SPLIT_KV, 0>(
-                        &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
-                        smem.smem_kv[kv_stage_idx], 0, kv_tma_offset);
-                    tma::copy<SPLIT_KV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
-                                              smem.smem_sf_kv[kv_stage_idx], kv_tma_offset, 0);
+                    // A TMA box spans at most 256 rows
+                    constexpr uint32_t kKVTmaTokens = SPLIT_KV % 256 == 0 ? 256 : 128;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SPLIT_KV / kKVTmaTokens; ++ i) {
+                        tma::copy<kHeadDim, kKVTmaTokens, 0>(
+                            &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
+                            smem.smem_kv[kv_stage_idx] + i * kKVTmaTokens * kNumQKBytesPerToken,
+                            0, kv_tma_offset + i * kKVTmaTokens);
+                        tma::copy<kKVTmaTokens, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
+                                                      smem.smem_sf_kv[kv_stage_idx] + i * kKVTmaTokens,
+                                                      kv_tma_offset + i * kKVTmaTokens, 0);
+                    }
                     smem.full_kv_barriers[kv_stage_idx].arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_SF_KV_SIZE_PER_STAGE);
                 }
                 __syncwarp();

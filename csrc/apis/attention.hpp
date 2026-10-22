@@ -147,7 +147,11 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Allocate output
     DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
-    const int block_kv = arch_major == 12 ? 128 : 256;
+    // On SM100, bf16 weights and logits without in-kernel cleaning or a schedule take a 384-token split
+    // with three math warpgroups; the other variants keep the 256-token split (fp32 weights spill there)
+    const bool sm100_wide_split = arch_major == 10 and weights.scalar_type() == torch::kBFloat16 and
+        not clean_logits and not schedule_meta.has_value();
+    const int block_kv = arch_major == 12 ? 128 : (sm100_wide_split ? 384 : 256);
     const int block_q = 128 / num_heads;
 
     torch::Tensor logits;
