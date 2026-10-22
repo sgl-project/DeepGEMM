@@ -90,9 +90,9 @@ Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant doc
 The kernel family has two versions, non-paged (for prefilling) and paged (for decoding).
 Take the non-paged version `fp8_fp4_mqa_logits` as an example. Its main inputs are:
 
-- `q`, a `(q_data, q_sf)` tuple; SM100 accepts MXFP4/MXFP8 data with packed UE8M0 scales
+- `q`, a `(q_data, q_sf)` tuple; SM100 accepts MXFP4/MXFP8 data with packed UE8M0 scales; SM120 accepts MXFP4 with packed UE8M0 scales, or FP8 with no Q scale and per-token float KV scales
 - `kv`, a `(kv_data, kv_sf)` tuple with shape `[seq_len_kv, head_dim]` logically
-- `weights`, tensor with shape `[seq_len, num_heads]` (BF16 on SM100)
+- `weights`, tensor with shape `[seq_len, num_heads]` (BF16 on SM100, FP32 on SM90 and SM120)
 - `cu_seq_len_k_start` and `cu_seq_len_k_end`, int tensor with shape `[seq_len]`
 - `max_seqlen_k`, the maximum valid KV span of any query row
 
