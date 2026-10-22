@@ -38,7 +38,7 @@ CUTLASS_DEVICE void sqrt_softplus(float (&values)[kNumValues]) {
 
 template <bool kScoreOnStore, uint32_t kScoreTokenStride,
           uint32_t UMMA_M, uint32_t kNumMmaCtas, uint32_t kNumGateWarps>
-CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint32_t& tmem_base_addr,
+CUTLASS_DEVICE void sm100_store_tmem_scores_to_global(float* scores, const uint32_t& tmem_base_addr,
                                                       const uint32_t& effective_umma_n,
                                                       const uint32_t& expert_base_idx,
                                                       const uint32_t& mma_cta_rank,
@@ -58,7 +58,6 @@ CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint3
                                    expert_atom_idx * 32 + ptx::get_lane_idx();
 
     // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits
-    auto scores_are_finite = true;
     for (auto token_idx = wg_idx * kNumTmemFragmentRows; token_idx < num_token_cols; token_idx += kTokenStep) {
         uint32_t values[kNumTmemFragmentRows];
         ptx::tmem_load_32dp32b<kNumTmemFragmentRows>(tmem_base_addr + token_idx, values);
@@ -70,11 +69,9 @@ CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint3
             auto score = __uint_as_float(values[row_idx]);
             if constexpr (kScoreOnStore)
                 score = sqrt_softplus(score);
-            scores_are_finite = scores_are_finite and isfinite(score);
             row_base_ptr[row_idx * kScoreTokenStride] = score;
         }
     }
-    return scores_are_finite;
 }
 
 CUTLASS_DEVICE void warp_reduce_best(const float& score, int& expert_idx) {
