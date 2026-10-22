@@ -284,7 +284,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             // sqrt-softplus is not linear: with split-K it is applied after summing the partials in the top-k loop,
             // with a single split it is applied on store and the selected score is re-read
             constexpr bool kScoreOnStore = kHasScoringBias and kNumSplitK == 1;
-            auto gate_is_valid = epilogue::mega_gate::sm100_store_tmem_scores_to_global<
+            epilogue::mega_gate::sm100_store_tmem_scores_to_global<
                                     kScoreOnStore, Workspace::kTokenStride, UMMA_M, kNumMmaCtas, kNumGateWarps>(
                                         workspace.get_score_ptr(token_base_idx, split_k_idx),
                                         accum_stage_idx * UMMA_N,
@@ -319,6 +319,8 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                 load_scores(global_token_idx, global_expert_idx, score);
                 return score;
             };
+            // Masked rows are never checked, so padded rows may hold non-finite scores
+            auto gate_is_valid = true;
             // Every logical CTA of the block ranks a share of its tokens once all the splits are visible
             for (uint32_t global_token_idx = token_base_idx + gate_warp_idx * kNumLogicalCtas + logical_cta_rank;
                  global_token_idx < token_end_idx;
@@ -350,6 +352,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                             selected_unbiased_score = load_reduced_score(global_token_idx, static_cast<uint32_t>(selected_expert_idx));
                             if constexpr (not kScoreOnStore)
                                 selected_unbiased_score = epilogue::mega_gate::sqrt_softplus(selected_unbiased_score);
+                            gate_is_valid = gate_is_valid and isfinite(selected_unbiased_score);
                         }
                         epilogue::mega_gate::store_topk_token<kNumTopk, kHasUnmappedTopkIdx, kHasPhysicalMap>(
                             routing_args, routed_logical_count, global_token_idx, lane_idx, selected_expert_idx, selected_unbiased_score);
@@ -392,6 +395,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                     #pragma unroll
                     for (uint32_t value_idx = 0; value_idx < kNumExpertsPerLaneVector; ++ value_idx) {
                         const auto unbiased_score = score_values[value_idx];
+                        gate_is_valid = gate_is_valid and (not is_valid_expert or isfinite(unbiased_score));
                         if constexpr (kNumSplitK > 1)
                             unbiased_scores_local[local_expert_base_idx + value_idx] = unbiased_score;
                         scores_local[local_expert_base_idx + value_idx] = is_valid_expert ?
