@@ -2,10 +2,13 @@
 
 #include "../../runtime/runtime.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -13,6 +16,8 @@
 #include <torch/torch.h>
 
 #include <deep_jit/backend/cuda/driver.hpp>
+#include <deep_jit/backend/cuda/kernel.hpp>
+#include <deep_jit/utils/gil.hpp>
 #include <deep_jit/utils/env.hpp>
 
 #include "../heuristics/sm90.hpp"
@@ -410,4 +415,66 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                             allow_tf32);
 }
 
+template <typename... Args>
+static void launch_with_shared_memory_mode(const std::optional<int>& shared_memory_mode,
+                                           const std::shared_ptr<deep_jit::cuda::Kernel>& kernel,
+                                           const deep_jit::cuda::LaunchOptions& override_options,
+                                           const Args&... args) {
+    if (not shared_memory_mode.has_value()) {
+        jit->launch(kernel, override_options, args...);
+        return;
+    }
+#if CUDA_VERSION >= 13040
+    [[maybe_unused]] deep_jit::GilScopedRelease gil_release;
+    const auto options = jit->default_launch_options.override_with(override_options);
+    DG_HOST_ASSERT(kernel != nullptr and kernel->kernel_handle != nullptr);
+    DG_HOST_ASSERT(not *options.nonportable_cluster_size_allowed);
+
+    std::array<CUlaunchAttribute, 4> attributes{};
+    unsigned int num_attributes = 0;
+    if (*options.cooperative) {
+        auto& attribute = attributes[num_attributes ++];
+        attribute.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attribute.value.cooperative = 1;
+    }
+    if (options.cluster_dim->x > 1) {
+        auto& attribute = attributes[num_attributes ++];
+        attribute.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attribute.value.clusterDim.x = options.cluster_dim->x;
+        attribute.value.clusterDim.y = 1;
+        attribute.value.clusterDim.z = 1;
+    }
+    if (*options.enable_pdl) {
+        auto& attribute = attributes[num_attributes ++];
+        attribute.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        attribute.value.programmaticStreamSerializationAllowed = 1;
+    }
+    {
+        auto& attribute = attributes[num_attributes ++];
+        attribute.id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+        attribute.value.sharedMemoryMode = static_cast<CUsharedMemoryMode>(*shared_memory_mode);
+    }
+
+    void* kernel_arg_ptrs[sizeof...(Args) + 1] = {deep_jit::cuda::kernel_arg_pointer(args)..., nullptr};
+    CUlaunchConfig config{};
+    config.gridDimX = options.grid_dim->x;
+    config.gridDimY = options.grid_dim->y;
+    config.gridDimZ = options.grid_dim->z;
+    config.blockDimX = options.block_dim->x;
+    config.blockDimY = options.block_dim->y;
+    config.blockDimZ = options.block_dim->z;
+    config.sharedMemBytes = *options.num_smem_bytes;
+    config.hStream = options.stream
+        ? *options.stream
+        : deep_jit::cuda::get_current_cuda_stream(torch::stable::accelerator::getCurrentDeviceIndex());
+    config.attrs = attributes.data();
+    config.numAttrs = num_attributes;
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuLaunchKernelEx(
+        &config, kernel->kernel_handle, sizeof...(Args) == 0 ? nullptr : kernel_arg_ptrs, nullptr));
+#else
+    DG_HOST_UNREACHABLE("Shared memory modes require CUDA 13.4");
+#endif
+}
+
 } // namespace deep_gemm
+
