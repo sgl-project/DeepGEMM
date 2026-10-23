@@ -366,5 +366,10 @@ CUTLASS_DEVICE void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+// Store the low 16 bits of a packed pair: the `.b16` store truncates a 32-bit source register
+CUTLASS_DEVICE void st_global_low_bf16(nv_bfloat16* ptr, const nv_bfloat162& value) {
+    asm volatile("st.global.b16 [%0], %1;" :: "l"(ptr), "r"(*reinterpret_cast<const uint32_t*>(&value)));
+}
+
 } // namespace deep_gemm::ptx
 #endif

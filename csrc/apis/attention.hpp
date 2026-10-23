@@ -12,6 +12,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
+#include "../jit_kernels/impls/sm100_bf16_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_paged_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
@@ -191,9 +192,19 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
             seq_len >= 2048 and seq_len_kv >= 65536;
         const bool separate_cleanup = clean_logits and not schedule_meta.has_value() and
             (legacy_fp8_cleanup or long_mx_cleanup or long_legacy_h8_cleanup);
-        sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
-                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
-                         clean_logits and not separate_cleanup, is_mx_sf, qk_dtype, schedule_meta);
+        // MX scales with BF16 weights and compressed BF16 logits (uncleaned, unscheduled) take the kernel with
+        // separate KV / SF producers; it shares the 384-token split, so the logits layout above holds
+        const bool bf16_mqa_kernel = is_mx_sf and weights.scalar_type() == torch::kBFloat16 and
+            logits_dtype == torch::kBFloat16 and max_seqlen_k > 0 and not clean_logits and not schedule_meta.has_value();
+        if (bf16_mqa_kernel) {
+            DG_HOST_ASSERT(block_kv == kBF16MQALogitsSplitKV);
+            sm100_bf16_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+                                  seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, qk_dtype);
+        } else {
+            sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
+                             clean_logits and not separate_cleanup, is_mx_sf, qk_dtype, schedule_meta);
+        }
         if (separate_cleanup)
             smxx_clean_logits(logits, cu_seq_len_k_start, cu_seq_len_k_end, 1, seq_len, seq_len_kv, stride_logits);
     } else if (arch_major == 12) {
