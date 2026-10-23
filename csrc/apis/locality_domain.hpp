@@ -25,7 +25,7 @@ static size_t get_granularity() {
 }
 
 static bool is_localization_available() {
-    return mlopart::is_available();
+    return LocalityDomainAllocator::is_localization_available();
 }
 
 static void release(void* ptr) {
@@ -163,8 +163,10 @@ static torch::Tensor get_balanced_sm_locality_domains() {
 }
 
 static void release_mlopart() {
+#if CUDA_VERSION < 13040
     get_balanced_sm_locality_domains();
     mlopart::release();
+#endif
 }
 
 #ifndef DG_USE_TORCH_LIBRARY
