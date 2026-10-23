@@ -25,7 +25,11 @@ static size_t get_granularity() {
 }
 
 static bool is_localization_available() {
-    return mlopart::is_available();
+    return LocalityDomainAllocator::is_localization_available();
+}
+
+static bool uses_native_locality_domains() {
+    return CUDA_VERSION >= 13040;
 }
 
 static void release(void* ptr) {
@@ -163,8 +167,10 @@ static torch::Tensor get_balanced_sm_locality_domains() {
 }
 
 static void release_mlopart() {
+#if CUDA_VERSION < 13040
     get_balanced_sm_locality_domains();
     mlopart::release();
+#endif
 }
 
 #ifndef DG_USE_TORCH_LIBRARY
@@ -173,6 +179,7 @@ static void register_apis(pybind11::module_& m) {
     submodule.def("get_num_locality_domains", &get_num_locality_domains);
     submodule.def("get_granularity", &get_granularity);
     submodule.def("is_localization_available", &is_localization_available);
+    submodule.def("uses_native_locality_domains", &uses_native_locality_domains);
     submodule.def("empty", &empty, pybind11::arg("sizes"), pybind11::arg("dtype"), pybind11::arg("domain_idx"));
     submodule.def("empty_per_domain", &empty_per_domain, pybind11::arg("sizes"), pybind11::arg("dtype"));
     submodule.def("empty_split_rows", &empty_split_rows, pybind11::arg("sizes"), pybind11::arg("dtype"));
