@@ -283,7 +283,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
         const auto expert_group_base_idx = expert_group_idx * kNumExpertsPerGroup;
         constexpr bool kHasScoringBias = kHasBias or kHasImageTokenMask;
         constexpr bool kScoreOnStore = kHasScoringBias and kNumSplitK == 1;
-        auto gate_is_valid = epilogue::mega_gate::sm100_store_tmem_scores_to_global<
+        epilogue::mega_gate::sm100_store_tmem_scores_to_global<
                                 kScoreOnStore ? kScoringType : static_cast<uint32_t>(mega_gate_layout::ScoringType::Identity),
                                 kNumRoutedExperts, UMMA_M, kNumMmaCtas, kNumGateWarps>(
                                     split_score_tile,
@@ -322,6 +322,8 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             load_scores(token_idx_in_block, global_expert_idx, score);
             return score;
         };
+        // Masked rows are never checked, so padded rows may hold non-finite scores
+        auto gate_is_valid = true;
         for (uint32_t token_idx_in_block = gate_warp_idx * kNumLogicalCtas + logical_cta_rank;
              token_idx_in_block < num_valid_tokens;
              token_idx_in_block += kNumGateWarps * kNumLogicalCtas) {
@@ -362,6 +364,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                         selected_unbiased_score = load_reduced_score(token_idx_in_block, static_cast<uint32_t>(selected_expert_idx));
                         if constexpr (kNumSplitK > 1 or not kHasScoringBias)
                             selected_unbiased_score = epilogue::mega_gate::apply_scoring<kScoringType>(selected_unbiased_score);
+                        gate_is_valid = gate_is_valid and isfinite(selected_unbiased_score);
                     }
                     epilogue::mega_gate::store_topk_token<
                         kNumTopk, kUnmappedTopkIdxExists, kToPhysicalMapExists>(global_token_idx, lane_idx,
@@ -415,6 +418,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                 #pragma unroll
                 for (uint32_t value_idx = 0; value_idx < kNumVectorElements; ++ value_idx) {
                     const auto unbiased_score = score_values[value_idx];
+                    gate_is_valid = gate_is_valid and (not is_valid_expert or isfinite(unbiased_score));
                     if constexpr (kNumSplitK > 1)
                         unbiased_scores_local[local_expert_base_idx + value_idx] = unbiased_score;
                     scores_local[local_expert_base_idx + value_idx] = is_valid_expert

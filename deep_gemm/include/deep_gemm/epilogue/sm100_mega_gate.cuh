@@ -53,7 +53,7 @@ CUTLASS_DEVICE void apply_scoring(float (&values)[kNumValues]) {
 
 template <uint32_t kStoreScoringType, uint32_t kNumRoutedExperts,
           uint32_t UMMA_M, uint32_t kNumMmaCtas, uint32_t kNumGateWarps>
-CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint32_t& tmem_base_addr,
+CUTLASS_DEVICE void sm100_store_tmem_scores_to_global(float* scores, const uint32_t& tmem_base_addr,
                                                       const uint32_t& effective_umma_n,
                                                       const uint32_t& expert_base_idx,
                                                       const uint32_t& mma_cta_rank,
@@ -71,7 +71,6 @@ CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint3
                                    expert_atom_idx * 32 + ptx::get_lane_idx();
     const auto tmem_addr = tmem_base_addr + (subpartition_idx * 32 << 16);
 
-    auto scores_are_finite = true;
     for (auto token_idx = warp_idx_in_subpartition * kNumTmemFragmentRows;
          token_idx < num_token_cols; token_idx += kTokenStride) {
         uint32_t values[kNumTmemFragmentRows];
@@ -83,12 +82,10 @@ CUTLASS_DEVICE bool sm100_store_tmem_scores_to_global(float* scores, const uint3
         for (uint32_t row_idx = 0; row_idx < kNumTmemFragmentRows; ++ row_idx) {
             const auto dst_token_idx = token_base_idx + token_idx + row_idx;
             const auto score = apply_scoring<kStoreScoringType>(__uint_as_float(values[row_idx]));
-            scores_are_finite = scores_are_finite and isfinite(score);
             ptx::st_global(scores + static_cast<uint64_t>(dst_token_idx) * kNumRoutedExperts +
                            global_expert_idx, score);
         }
     }
-    return scores_are_finite;
 }
 
 CUTLASS_DEVICE void warp_reduce_best(const float& score, int& expert_idx) {
