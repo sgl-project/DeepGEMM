@@ -16,6 +16,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
+#include "../utils/arch_traits.hpp"
 
 namespace deep_gemm::einsum {
 
@@ -50,7 +51,7 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -84,7 +85,7 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -118,7 +119,7 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -236,7 +237,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
 
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 10) {
+    if (arch::uses_sm100_tuning(arch_major)) {
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k,
                       gran_k_a, gran_k_b, major_a, major_b, compiled_dims,
                       resolve_epilogue_class(merged_epilogue_class, c, d_tensor));
@@ -274,7 +275,7 @@ static void fp8_einsum(const std::string& expr,
             std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class);
-    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
+    } else if (expr == "bhd,hdr->bhr" and arch::uses_sm100_tuning(arch_major)) {
         // (batch_size, m, n, k): (h, b, r, d)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 0, 2});
@@ -284,7 +285,7 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_d = std::get<torch::Tensor>(d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk", epilogue_class);
-    } else if (expr == "bhd,bhr->hdr" and arch_major == 10) {
+    } else if (expr == "bhd,bhr->hdr" and arch::uses_sm100_tuning(arch_major)) {
         // (batch_size, m, n, k): (h, d, r, b)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
         const auto perm_a = a.first.permute({1, 2, 0});

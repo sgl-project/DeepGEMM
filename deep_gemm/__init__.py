@@ -125,3 +125,74 @@ _C.init(os.path.dirname(os.path.abspath(__file__)))
 atexit.register(shutdown)
 
 __version__ = '2.8.2'
+
+
+# ---------------------------------------------------------------------------
+# Capability query
+# ---------------------------------------------------------------------------
+def supported_arch_majors():
+    """CUDA architecture majors this installed `_C.so` accepts, e.g. `(9, 10, 11, 12)`.
+
+    Answered by the compiled binary, so a stale `_C.so` under a fresh Python side
+    reports what it can actually do. No CUDA context is created.
+    """
+    return tuple(_C.supported_arch_majors())
+
+
+# Per-feature support state, as reported by the compiled binary
+# (csrc/utils/arch_traits.hpp). 0 = unsupported, 1 = enabled and tested on that
+# arch, 2 = implementation exists but no test has run on that arch.
+_FEATURE_SUPPORT = ('unsupported', 'validated', 'unvalidated')
+
+
+def arch_feature_status():
+    """`{name: {'sm100': state, 'sm110': state}}` for every gated feature.
+
+    SM110 is answered for its real arch major (11); nothing is mapped onto 10.
+    This separates "SM110 shares the SM100 kernel family" from "this newer
+    variant has actually been run on SM110".
+    """
+    return {
+        name: {'sm100': _FEATURE_SUPPORT[sm100], 'sm110': _FEATURE_SUPPORT[sm110]}
+        for name, sm100, sm110 in _C.arch_feature_status()
+    }
+
+
+def supports_feature(arch, feature: str) -> bool:
+    """Whether `feature` is enabled and validated for `arch` (an int or e.g. 'sm110')."""
+    major = _arch_major(arch)
+    status = arch_feature_status().get(feature)
+    if status is None:
+        return False
+    if major == 10:
+        return status['sm100'] == 'validated'
+    if major == 11:
+        return status['sm110'] == 'validated'
+    return False
+
+
+def _arch_major(arch) -> int:
+    """Normalise an architecture to its major number without mapping SM110 onto SM100."""
+    if isinstance(arch, str):
+        value = arch.strip().lower()
+        if value.startswith('sm'):
+            value = value[2:]
+        value = value.lstrip('_')
+        if not value.isdigit():
+            raise ValueError(f'unrecognised architecture {arch!r}; expected e.g. "sm110", "sm_110" or 11')
+        number = int(value)
+    elif isinstance(arch, int):
+        number = arch
+    else:
+        raise TypeError(f'architecture must be an int or a str, got {type(arch).__name__}')
+    return number // 10 if number >= 90 else number
+
+
+def supports_arch(arch) -> bool:
+    """Whether this build accepts `arch`, given as an int or an `sm`-style name.
+
+    `supports_arch('sm110')` / `supports_arch(110)` / `supports_arch(11)` ask the
+    same question: is SM110 (arch major 11) a supported architecture here?
+    """
+    return _arch_major(arch) in supported_arch_majors()
+

@@ -7,6 +7,7 @@
 #include "../utils/compatibility.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_gate.hpp"
 #include "../utils/layout.hpp"
+#include "../utils/arch_traits.hpp"
 
 namespace deep_gemm::mega_gate {
 
@@ -156,7 +157,10 @@ bf16_mega_gate(const torch::Tensor& x,
     DG_HOST_ASSERT(num_tokens <= static_cast<int>(mega_gate_layout::kNumMaxTokens));
 
     const auto arch_major = jit->device.get_arch_major();
-    DG_HOST_ASSERT(arch_major == 10);
+    // Same SM100 kernel family as SM100, but Mega-Gate is feature-gated separately: its kernel
+    // emits `redux.sync.max.f32`, which ptxas rejects for sm_110f, so Thor cannot JIT it at all.
+    DG_HOST_ASSERT(arch::uses_sm100_tuning(arch_major));
+    DG_HOST_ASSERT(arch::verified_feature("bf16_mega_gate", arch_major));
     const mega_gate_layout::RoutingArgs routing_args = {
         .to_physical_map = to_physical_map ? to_physical_map->data_ptr<int>() : nullptr,
         .logical_count = logical_count ? logical_count->data_ptr<int>() : nullptr,

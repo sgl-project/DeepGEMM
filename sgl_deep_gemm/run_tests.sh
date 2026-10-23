@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Pre-release gate for the installed sgl-deep-gemm wheel (sglang's release-whl-deepgemm.yml).
+# Runs from sgl_deep_gemm/tests/ so `import deep_gemm` hits the wheel's prebuilt _C.so, not
+# the source tree (which JIT-rebuilds _C); the guard below aborts if that resolution is wrong.
+#
+# Usage: run_tests.sh [DEEPGEMM_SRC] [--release] [--max-procs N] [--skip-sanitizer] [--skip-mega-moe]
+#   DEEPGEMM_SRC defaults to this script's own repo root.
+#   --release selects bounded attention coverage and focused sanitizer functions.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEEPGEMM_SRC="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
+  DEEPGEMM_SRC="$(cd "$1" && pwd)"; shift
+fi
+MAX_PROCS=""
+SKIP_SANITIZER=0
+SKIP_MEGA_MOE=0
+TEST_PROFILE=full
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --release) TEST_PROFILE=release; shift ;;
+    --max-procs) MAX_PROCS="$2"; shift 2 ;;
+    --skip-sanitizer) SKIP_SANITIZER=1; shift ;;
+    --skip-mega-moe) SKIP_MEGA_MOE=1; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+export DG_TEST_PROFILE="${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ] && [ "${DG_MQA_NUM_CASES+x}" = x ]; then
+  echo "--release cannot be combined with DG_MQA_NUM_CASES; unset the random sampling cap." >&2
+  exit 1
+fi
+
+TESTS_DIR="${DEEPGEMM_SRC}/sgl_deep_gemm/tests"
+PYTHON="${PYTHON:-python3}"
+
+if [ ! -d "${TESTS_DIR}" ]; then
+  echo "No sgl_deep_gemm/tests/ directory under ${DEEPGEMM_SRC}" >&2
+  exit 1
+fi
+
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "${NUM_GPUS}" -eq 0 ]; then
+  echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
+  exit 1
+fi
+# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100/SM103),
+# 12 == Blackwell (SM120, e.g. RTX 5090).
+COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+ARCH_MAJOR=${COMPUTE_CAP%%.*}
+
+NPROC=${NUM_GPUS}
+if [ -n "${MAX_PROCS}" ] && [ "${MAX_PROCS}" -lt "${NPROC}" ]; then
+  NPROC=${MAX_PROCS}
+fi
+
+DG_FILE=$(cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_gemm, sys; sys.stdout.write(deep_gemm.__file__)" 2>/dev/null)
+if [ -z "${DG_FILE}" ]; then
+  echo "Failed to import deep_gemm — is the wheel installed?" >&2
+  exit 1
+fi
+case "${DG_FILE}" in
+  "${DEEPGEMM_SRC}"/*)
+    echo "ERROR: 'import deep_gemm' resolved to the source tree (${DG_FILE})," >&2
+    echo "       not the installed wheel. Aborting." >&2
+    exit 1 ;;
+esac
+
+echo "=============================================================="
+echo " DeepGEMM wheel test run"
+echo "   deep_gemm:    ${DG_FILE}"
+echo "   GPUs:         ${NUM_GPUS} (compute_cap ${COMPUTE_CAP}, arch major ${ARCH_MAJOR})"
+echo "   processes:    ${NPROC}"
+echo "   profile:      ${TEST_PROFILE}"
+if [ "${TEST_PROFILE}" = release ]; then
+  echo "   coverage:     reduced attention matrix and focused memcheck/synccheck"
+fi
+echo "   skip-mega:    ${SKIP_MEGA_MOE}   skip-sanitizer: ${SKIP_SANITIZER}"
+echo "=============================================================="
+
+PASSED=()
+FAILED=()
+SKIPPED=()
+
+run_test() {
+  local name="$1"; shift
+  echo ""
+  echo "----- RUN ${name} $* -----"
+  local log; log=$(mktemp)
+  (cd "${TESTS_DIR}" && "${PYTHON}" -u "${name}" "$@") 2>&1 | tee "${log}"
+  local rc=${PIPESTATUS[0]}
+  # Fork-based multiprocessing tests can crash in child processes while the
+  # launcher still exits 0; treat an unhandled traceback as a failure too.
+  if [ "${rc}" -eq 0 ] && grep -q "Traceback (most recent call last)" "${log}"; then
+    echo "----- FAIL ${name} (child process crashed; launcher exited 0) -----"
+    FAILED+=("${name}")
+  elif [ "${rc}" -eq 0 ]; then
+    echo "----- PASS ${name} -----"
+    PASSED+=("${name}")
+  else
+    echo "----- FAIL ${name} (exit ${rc}) -----"
+    FAILED+=("${name}")
+  fi
+  rm -f "${log}"
+}
+
+skip_test() {
+  echo ""
+  echo "----- SKIP $1 ($2) -----"
+  SKIPPED+=("$1 ($2)")
+}
+
+DEFAULT_SINGLE_GPU_TESTS=(
+  test_bf16.py
+  test_einsum.py
+  test_fp8_fp4.py
+  test_hyperconnection.py
+  test_layout.py
+  test_attention.py
+  test_legacy.py
+)
+SM120_SINGLE_GPU_TESTS=(
+  test_bf16.py
+  test_einsum.py
+  test_fp8_fp4.py
+  test_attention.py
+)
+SM120_UNSUPPORTED_SINGLE_GPU_TESTS=(
+  test_hyperconnection.py
+  test_layout.py
+  test_legacy.py
+)
+
+if [ "${ARCH_MAJOR}" -eq 12 ]; then
+  SINGLE_GPU_TESTS=("${SM120_SINGLE_GPU_TESTS[@]}")
+else
+  SINGLE_GPU_TESTS=("${DEFAULT_SINGLE_GPU_TESTS[@]}")
+fi
+
+for t in "${SINGLE_GPU_TESTS[@]}"; do
+  if [ -f "${TESTS_DIR}/${t}" ]; then
+    run_test "${t}"
+  else
+    skip_test "${t}" "not present in this branch"
+  fi
+done
+
+for t in test_mega_gate.py test_mega_mhc.py test_clean_logits_bounds.py; do
+  if [ "${ARCH_MAJOR}" -eq 10 ]; then
+    run_test "${t}"
+  else
+    skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
+  fi
+done
+
+if [ "${ARCH_MAJOR}" -eq 12 ]; then
+  for t in "${SM120_UNSUPPORTED_SINGLE_GPU_TESTS[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
+  done
+fi
+
+if [ -f "${TESTS_DIR}/test_lazy_init.py" ]; then
+  run_test test_lazy_init.py --num-processes "${NPROC}"
+fi
+
+# mega_moe family covers Blackwell fp4 + symmetric-memory kernels and the SM90
+# Hopper fp8 path.
+# test_mega_moe.py additionally needs deep_ep (with ElasticBuffer); the l1 and
+# pre_dispatch tests use deep_gemm's own symmetric buffer.
+MEGA_MOE_BLACKWELL=(
+  test_mega_moe.py
+  test_mega_moe_sgl.py
+  test_mega_moe_situ.py
+  test_mega_moe_situ_equal_transform.py
+  test_mega_moe_l1_fp4_accuracy.py
+  test_mega_moe_l1_sentinel.py
+  test_mega_moe_nvfp4_alphas.py
+  test_mega_moe_global_tokens.py
+  test_mega_moe_pre_dispatch.py
+)
+MEGA_MOE_HOPPER=(
+  test_mega_moe_hopper.py
+  test_mega_moe_pre_dispatch_sm90.py
+)
+MEGA_MOE_ALL=(
+  "${MEGA_MOE_BLACKWELL[@]}"
+  "${MEGA_MOE_HOPPER[@]}"
+)
+if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
+  for t in "${MEGA_MOE_ALL[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
+  done
+elif [ "${ARCH_MAJOR}" -eq 12 ]; then
+  for t in "${MEGA_MOE_ALL[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "not supported on SM120"
+  done
+elif [ "${ARCH_MAJOR}" -ge 10 ]; then
+  if [ -f "${TESTS_DIR}/test_mega_moe.py" ]; then
+    if (cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_ep; assert hasattr(deep_ep, 'ElasticBuffer')") >/dev/null 2>&1; then
+      run_test test_mega_moe.py --num-processes "${NPROC}"
+      if [ "${NPROC}" -ge 2 ]; then
+        run_test test_mega_moe.py --num-processes 2 --mma-type bf16xbf16 \
+          --num-tokens 2048 --num-max-tokens-per-rank 2048 --hidden 1024 \
+          --intermediate-hidden 512 --num-experts 8 --num-topk 2 --num-shared-experts 0 \
+          --num-correctness-tests 1 --num-graph-correctness-tests 24
+      fi
+    else
+      skip_test test_mega_moe.py "deep_ep with ElasticBuffer not installed"
+    fi
+  fi
+  if [ -f "${TESTS_DIR}/test_mega_moe_sgl.py" ]; then
+    run_test test_mega_moe_sgl.py --num-processes "${NPROC}"
+  fi
+  [ -f "${TESTS_DIR}/test_mega_moe_situ.py" ] && run_test test_mega_moe_situ.py --num-processes 1
+  # Pure-torch identity check for the SiTU rewrite: no GPU, no distributed setup.
+  [ -f "${TESTS_DIR}/test_mega_moe_situ_equal_transform.py" ] && run_test test_mega_moe_situ_equal_transform.py
+  L1_NPROC="${NPROC}"
+  if [ "${L1_NPROC}" -gt 2 ]; then
+    L1_NPROC=2
+  fi
+  for t in test_mega_moe_l1_fp4_accuracy.py test_mega_moe_l1_sentinel.py; do
+    [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${L1_NPROC}"
+  done
+  if [ "${NPROC}" -ge 2 ]; then
+    run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
+    run_test test_mega_moe_global_tokens.py --num-processes "${NPROC}"
+  else
+    skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
+    skip_test test_mega_moe_global_tokens.py "requires at least 2 ranks"
+  fi
+  [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
+  for t in "${MEGA_MOE_HOPPER[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM90-only, arch major ${ARCH_MAJOR}"
+  done
+else
+  for t in "${MEGA_MOE_BLACKWELL[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "Blackwell-only, arch major ${ARCH_MAJOR}"
+  done
+  for t in "${MEGA_MOE_HOPPER[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${NPROC}"
+  done
+  run_test test_mega_moe_hopper.py --num-processes "${NPROC}" \
+    --accuracy --layers 1 2 3 4 5 --num-correctness-tests 32
+fi
+
+if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
+  if [ "${SKIP_SANITIZER}" -eq 1 ]; then
+    skip_test test_sanitizer.py "--skip-sanitizer"
+  elif [ "${TEST_PROFILE}" = release ]; then
+    # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
+    SANITIZER_FUNCS=test_attention.test_gemm_skip_head_mid
+    if [ "${ARCH_MAJOR}" -eq 10 ]; then
+      SANITIZER_FUNCS+=,test_clean_logits_bounds.test_clean_logits_bounds
+    fi
+    run_test test_sanitizer.py --funcs "${SANITIZER_FUNCS}" --tools memcheck,synccheck
+  else
+    run_test test_sanitizer.py
+  fi
+fi
+
+echo ""
+echo "=============================================================="
+echo " Summary: ${#PASSED[@]} passed, ${#FAILED[@]} failed, ${#SKIPPED[@]} skipped"
+[ ${#PASSED[@]}  -gt 0 ] && printf '   PASS  %s\n'  "${PASSED[@]}"
+[ ${#SKIPPED[@]} -gt 0 ] && printf '   SKIP  %s\n'  "${SKIPPED[@]}"
+[ ${#FAILED[@]}  -gt 0 ] && printf '   FAIL  %s\n'  "${FAILED[@]}"
+echo "=============================================================="
+
+[ ${#FAILED[@]} -eq 0 ]

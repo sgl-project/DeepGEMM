@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
 #include "layout.hpp"
+#include "../utils/arch_traits.hpp"
 
 namespace deep_gemm::gemm {
 
@@ -124,7 +125,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             const auto major_sfb = get_major_type_ab(sfb);
             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch::uses_sm100_tuning(arch_major) and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
     } else {
@@ -239,7 +240,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch::uses_sm100_tuning(arch_major) and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
@@ -308,7 +309,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch::uses_sm100_tuning(arch_major) and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, std::nullopt, d));
@@ -359,7 +360,7 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
 
     // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 10) {
+    if (arch::uses_sm100_tuning(arch_major)) {
         const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
         const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
@@ -477,7 +478,7 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
 
     // Dispatch implementation
-    if (arch_major == 10) {
+    if (arch::uses_sm100_tuning(arch_major)) {
         sm100_k_grouped_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, sum_k, grouped_layout,
                                       k_alignment, major_a, major_b, compiled_dims, use_psum_layout,
                                       resolve_epilogue_class(epilogue_class, c, d));
@@ -527,7 +528,7 @@ static void bf16_gemm_nt(const torch::Tensor& a,
         DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -612,7 +613,7 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         sm90_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
                                             use_psum_layout, expected_m_for_psum_layout);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
@@ -664,7 +665,7 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_m_grouped_gemm_masked(a, b, d, masked_m,
                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims,
                                          resolve_epilogue_class(epilogue_class, std::nullopt, d));
@@ -712,7 +713,7 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
         DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
-    } else if (arch_major == 10) {
+    } else if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
                                   resolve_epilogue_class(epilogue_class, c, d));

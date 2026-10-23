@@ -4,6 +4,7 @@
 #include <deep_jit/backend/cuda/backend.hpp>
 #include <deep_jit/python_api.hpp>
 
+#include "utils/arch_traits.hpp"
 #include "apis/config.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
@@ -23,6 +24,26 @@
 // ReSharper disable once CppParameterMayBeConstPtrOrRef
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepGEMM C++ library";
+
+    // Reports the arch majors this binary's dispatcher accepts, before any CUDA
+    // context exists -- so a stale `_C.so` under a newer Python side is caught.
+    // NOTES: plain `m.def(name, fn)`; a type annotation in the name would become
+    // part of the attribute name under pybind11.
+    m.def("supported_arch_majors", []() {
+        return std::vector<int64_t>(deep_gemm::arch::kSupportedArchMajors.begin(),
+                                    deep_gemm::arch::kSupportedArchMajors.end());
+    });
+
+    // SM110 (Jetson Thor) policy table: which SM100-family features this arch has
+    // actually been validated on. Reported as (name, sm100_state, sm110_state).
+    m.def("arch_feature_status", []() {
+        std::vector<std::tuple<std::string, int64_t, int64_t>> result;
+        for (const auto& feature : deep_gemm::arch::kFeatureStates)
+            result.emplace_back(feature.name,
+                                static_cast<int64_t>(feature.state.sm100),
+                                static_cast<int64_t>(feature.state.sm110));
+        return result;
+    });
 
     // Register JIT objects
     deep_jit::register_python_api(m, deep_gemm::jit);

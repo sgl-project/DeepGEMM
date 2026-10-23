@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "locality_domain.hpp"
+#include "../utils/arch_traits.hpp"
 
 namespace deep_gemm::mega {
 
@@ -253,7 +254,7 @@ static void fp8_fp4_mega_moe(
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
     // Dispatch into different architectures
-    if (arch_major == 10) {
+    if (arch::uses_sm100_tuning(arch_major)) {
         sm100_fp8_fp4_mega_moe(y,
                                l1_acts, l1_acts_sf,
                                l2_acts, l2_acts_sf,
@@ -364,7 +365,7 @@ static void bf16_mega_moe(
                 l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf] = slice(sym_buffer);
 
     // Dispatch into different architectures
-    if (arch_major == 10) {
+    if (arch::uses_sm100_tuning(arch_major)) {
         sm100_bf16_mega_moe(y,
                             l1_acts, l2_acts,
                             shared_l1_acts, shared_l2_acts,

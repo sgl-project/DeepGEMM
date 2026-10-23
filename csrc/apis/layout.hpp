@@ -5,6 +5,7 @@
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/smxx_layout.hpp"
+#include "../utils/arch_traits.hpp"
 
 namespace deep_gemm::layout {
 
@@ -43,7 +44,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, x, gran_k) on SM100: transform to (INT, 1, gran_k), TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and arch_major == 10) {
+    if (sf.scalar_type() == torch::kFloat and (gran_k == 32 or gran_k == 128) and arch::uses_sm100_tuning(arch_major)) {
         DG_HOST_ASSERT(not disable_ue8m0_cast);
         const auto broadcasted = gran_mn == 1 ? sf :
                                  sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
@@ -51,7 +52,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     }
 
     // (INT, 1, gran_k) on SM100: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch_major == 10)
+    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch::uses_sm100_tuning(arch_major))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
 
     DG_HOST_UNREACHABLE("Unknown SF transformation");
@@ -98,18 +99,18 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     const int gran_k = std::get<2>(recipe);
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT((arch_major == 9 and gran_k == 128 and k_alignment == 128) or
-                   (arch_major == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
+                   (arch::uses_sm100_tuning(arch_major) and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
 
     // FP32 on SM90
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
         return get_mn_major_tma_aligned_tensor(sf);
 
     // FP32 on SM100
-    if (sf.scalar_type() == torch::kFloat and arch_major == 10)
+    if (sf.scalar_type() == torch::kFloat and arch::uses_sm100_tuning(arch_major))
         return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
     // Pre-packed UE8M0 is only accepted for gran_k=32 on SM100.
-    if (sf.scalar_type() == torch::kInt and arch_major == 10 and gran_k == 32)
+    if (sf.scalar_type() == torch::kInt and arch::uses_sm100_tuning(arch_major) and gran_k == 32)
         return check_k_grouped_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
     DG_HOST_UNREACHABLE("Unknown cases");
