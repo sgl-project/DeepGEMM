@@ -563,7 +563,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
-    parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires CUDA 13.4 locality domains, or MLOPart)')
+    parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires MLOPart)')
 
     # Test settings
     parser.add_argument('--post-expert-norm', action='store_true', help='Check the fused post-expert RMS norm')
