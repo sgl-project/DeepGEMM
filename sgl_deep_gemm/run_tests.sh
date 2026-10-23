@@ -254,7 +254,7 @@ if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
     skip_test test_sanitizer.py "--skip-sanitizer"
   elif [ "${TEST_PROFILE}" = release ]; then
     # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
-    SANITIZER_FUNCS=test_attention.test_paged_mqa_logits
+    SANITIZER_FUNCS=test_attention.test_paged_mqa_logits,test_attention.test_paged_mqa_logits_histogram
     run_test test_sanitizer.py --funcs "${SANITIZER_FUNCS}" --tools memcheck,synccheck
   else
     run_test test_sanitizer.py

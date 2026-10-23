@@ -16,6 +16,8 @@ static constexpr int kMQALogitsSplitKV = 384;
 static constexpr int kMQALogitsNumTmemStages = 3;
 static constexpr int kMQALogitsSplitsPerChunk = 8;
 static constexpr int kMQALogitsNumSpecializedThreads = 128;
+// Bins per row of the optional paged histogram (`epilogue::kNumCoarseHistogramBins`)
+static constexpr int kMQALogitsHistogramBins = 1024;
 
 // The Q tile always covers 128 (token, head) rows
 static int get_mqa_logits_block_q(const int& num_heads) {
@@ -117,7 +119,7 @@ static void __instantiate_kernel() {{
 // Kernel geometry shared by the contiguous and paged runtimes: every math warpgroup consumes one UMMA_M = 128 KV
 // tile, the Q tile always covers 128 (token, head) rows, and the FP4 pipelines are deeper (half-size stages)
 struct MQALogitsConfig {
-    bool is_fp4, is_paged;
+    bool is_fp4, is_paged, with_histogram;
     int num_heads, head_dim, block_q, umma_n;
     int num_q_stages, num_kv_stages;
     static constexpr int split_kv = kMQALogitsSplitKV;
@@ -125,9 +127,10 @@ struct MQALogitsConfig {
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
     static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
-    MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged):
-            is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
-            block_q(get_mqa_logits_block_q(num_heads)) {
+    MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged,
+                    const bool& with_histogram = false):
+            is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), with_histogram(with_histogram),
+            num_heads(num_heads), head_dim(head_dim), block_q(get_mqa_logits_block_q(num_heads)) {
         DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
@@ -136,6 +139,13 @@ struct MQALogitsConfig {
         umma_n = align(block_q * num_heads, 8);
         num_q_stages = is_fp4 ? 2 : 3;
         num_kv_stages = is_fp4 ? 8 : 3;
+        if (with_histogram) {
+            // The window follows the shared storage: keep the deepest KV ring that leaves room for it (MXFP4 D128: 7)
+            while (smem_size() + histogram_smem_size() > SM100ArchSpec::smem_capacity) {
+                DG_HOST_ASSERT(num_kv_stages > 2);
+                -- num_kv_stages;
+            }
+        }
     }
 
     const char* qk_dtype_name() const {
@@ -155,6 +165,16 @@ struct MQALogitsConfig {
     // Weights rows are padded to 16 bytes for TMA
     int num_weight_elements_per_row() const {
         return static_cast<int>(align(num_heads * static_cast<uint32_t>(sizeof(nv_bfloat16)), 16u) / sizeof(nv_bfloat16));
+    }
+
+    // FP4 chunks span the KV ring, so a chunk stays resident for the other Q blocks of its request
+    int splits_per_chunk() const {
+        return is_fp4 ? num_kv_stages : kMQALogitsSplitsPerChunk;
+    }
+
+    // Histogram window: two Q blocks of rows, 1024 16-bit counters each (`epilogue::RowWindowHistogram`)
+    int histogram_smem_size() const {
+        return with_histogram ? 2 * block_q * kMQALogitsHistogramBins * static_cast<int>(sizeof(uint16_t)) : 0;
     }
 
     // Template arguments of `layout::MQALogitsSharedStorage`; the generated source asserts `sizeof` == `smem_size()`
@@ -309,8 +329,10 @@ static void sm100_paged_mqa_logits(const MQALogitsConfig& config,
                                    const int& num_q_tokens_total,
                                    const int& num_kv_blocks, const int& page_kv,
                                    const int& logits_stride,
-                                   const int& block_table_stride) {
+                                   const int& block_table_stride,
+                                   int* histogram) {
     DG_HOST_ASSERT(config.is_paged);
+    DG_HOST_ASSERT(config.with_histogram == (histogram != nullptr));
     DG_HOST_ASSERT(logits_stride % config.split_kv == 0);
     const int num_sms = runtime->get_num_sms();
     DG_HOST_ASSERT(schedule_meta.size(0) == num_sms + 1);
@@ -333,7 +355,7 @@ static void sm100_paged_mqa_logits(const MQALogitsConfig& config,
     const auto tensor_map_weights = config.make_tensor_map_weights(weights, num_q_tokens_total);
     const int smem_size = config.smem_size();
 
-    // Compile
+    // Compile (the histogram variant appends `kWithHistogram`)
     const auto kernel = MQALogitsConfig::compile("sm100_paged_mqa_logits", std::format(R"(
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
 
@@ -350,7 +372,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {}, {},
-        {}
+        {}{}
     >);
 }};
 )",
@@ -359,14 +381,14 @@ static void __instantiate_kernel() {{
     page_kv,
     config.block_q, config.umma_n,
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
-    config.split_kv, kMQALogitsSplitsPerChunk,
+    config.split_kv, config.splits_per_chunk(),
     config.num_specialized_threads, config.num_math_threads,
-    config.qk_dtype_name()));
+    config.qk_dtype_name(), config.with_histogram ? ", true" : ""));
 
     // Launch
     jit->launch(
         kernel, {
-            .num_smem_bytes = smem_size,
+            .num_smem_bytes = smem_size + config.histogram_smem_size(),
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(config.num_specialized_threads + config.num_math_threads, 1, 1),
         },
@@ -376,7 +398,7 @@ static void __instantiate_kernel() {{
         block_table.data_ptr<int>(), indices.data_ptr<int>(), schedule_meta.data_ptr<int>(),
         tensor_map_q, tensor_map_sf_q,
         tensor_map_kv, tensor_map_sf_kv,
-        tensor_map_weights
+        tensor_map_weights, histogram
     );
 }
 
