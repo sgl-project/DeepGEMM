@@ -56,6 +56,7 @@ _C.set_mlopart_callbacks(*(ctypes.cast(f, ctypes.c_void_p).value for f in _callb
 get_num_locality_domains = _C.get_num_locality_domains
 get_granularity = _C.get_locality_domain_granularity
 is_localization_available = _C.is_localization_available
+uses_native_locality_domains = _C.uses_native_locality_domains
 is_localized = _C.is_localized
 release_mlopart = _C.release_mlopart
 get_sm_locality_domains = _C.get_sm_locality_domains

@@ -28,6 +28,10 @@ static bool is_localization_available() {
     return LocalityDomainAllocator::is_localization_available();
 }
 
+static bool uses_native_locality_domains() {
+    return CUDA_VERSION >= 13040;
+}
+
 static void release(void* ptr) {
     locality_domain_allocator.release(ptr);
 }
@@ -175,6 +179,7 @@ static void register_apis(pybind11::module_& m) {
     submodule.def("get_num_locality_domains", &get_num_locality_domains);
     submodule.def("get_granularity", &get_granularity);
     submodule.def("is_localization_available", &is_localization_available);
+    submodule.def("uses_native_locality_domains", &uses_native_locality_domains);
     submodule.def("empty", &empty, pybind11::arg("sizes"), pybind11::arg("dtype"), pybind11::arg("domain_idx"));
     submodule.def("empty_per_domain", &empty_per_domain, pybind11::arg("sizes"), pybind11::arg("dtype"));
     submodule.def("empty_split_rows", &empty_split_rows, pybind11::arg("sizes"), pybind11::arg("dtype"));

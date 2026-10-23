@@ -186,5 +186,6 @@ if __name__ == '__main__':
     test_empty()
     test_localize()
     test_localize_rows()
-    test_mlopart()
-    test_without_mlopart()
+    if not locality_domain.uses_native_locality_domains():
+        test_mlopart()
+        test_without_mlopart()
