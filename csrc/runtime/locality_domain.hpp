@@ -13,7 +13,7 @@
 
 namespace deep_gemm {
 
-// Locality domain APIs of CUDA 13.4, or MLOPart with older toolkits
+// Compatability layer for locality domain APIs in CUDA 13.4
 class LocalityDomainAllocator {
     struct Mapping {
         size_t num_bytes;
@@ -32,19 +32,9 @@ class LocalityDomainAllocator {
     }
 
     CUmemGenericAllocationHandle create(const size_t& num_bytes, const int& domain_idx) {
+        // TODO: `cuMemCreate` on the location `{CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN, {device, domain_idx}}` with CUDA 13.4
         DG_HOST_ASSERT(0 <= domain_idx and domain_idx < get_num_locality_domains());
-#if CUDA_VERSION >= 13040
-        CUmemAllocationProp prop{};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN;
-        prop.location.localized.deviceId = static_cast<unsigned char>(c10::cuda::current_device());
-        prop.location.localized.localityDomainId = static_cast<unsigned char>(domain_idx);
-        CUmemGenericAllocationHandle handle = 0;
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuMemCreate(&handle, num_bytes, &prop, 0));
-        return handle;
-#else
         return mlopart::create_memory(num_bytes, domain_idx);
-#endif
     }
 
 public:
@@ -58,20 +48,9 @@ public:
             release(reinterpret_cast<void*>(reservations.begin()->first));
     }
 
-    // The weight layout always has `kNumDeviceLocalityDomains` slices, localized or not
     static int get_num_locality_domains() {
+        // TODO: `CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT` with CUDA 13.4
         return kNumDeviceLocalityDomains;
-    }
-
-    static bool is_localization_available() {
-#if CUDA_VERSION >= 13040
-        int num_domains = 0;
-        const auto result = deep_jit::cuda::driver::lazy_cuDeviceGetAttribute(
-            &num_domains, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, c10::cuda::current_device());
-        return result == CUDA_SUCCESS and num_domains == kNumDeviceLocalityDomains;
-#else
-        return mlopart::is_available();
-#endif
     }
 
     static size_t get_granularity() {

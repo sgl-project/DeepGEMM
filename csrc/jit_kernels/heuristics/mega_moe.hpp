@@ -69,10 +69,10 @@ struct MegaMoEConfig {
     }
 };
 
-// Locality domains are read per physical SM, so a grid smaller than the GPU stays correct
+// We need to distribute work across locality domains, so we must use the whole GPU
 static int get_num_sms_for_mega_moe() {
     const auto num_sms = runtime->get_num_sms();
-    DG_HOST_ASSERT(num_sms > 0 and num_sms % 2 == 0 and num_sms <= jit->device.get_num_sms());
+    DG_HOST_ASSERT(num_sms == jit->device.get_num_sms());
     return num_sms;
 }
 
