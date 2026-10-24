@@ -222,7 +222,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         //  - `d.stride(0) == n`: the batches are contiguous along the columns of the view
         //  - `n % 128 == 0`: each batch is quantized independently, so neither an SF group
         //    nor a packed 4-SF word may cross a batch boundary
-        DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+        DG_HOST_ASSERT(arch::uses_sm100_tuning(jit->device.get_arch_major()));
         DG_HOST_ASSERT(d_tensor.stride(0) == n and n % 128 == 0);
         check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
     }

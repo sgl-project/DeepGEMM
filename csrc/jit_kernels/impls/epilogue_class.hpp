@@ -11,6 +11,7 @@
 #include <deep_gemm/common/types.cuh>
 
 #include "../../runtime/jit.hpp"
+#include "../../utils/arch_traits.hpp"
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
@@ -126,6 +127,12 @@ public:
     }
 
     void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
+        // Refuse before the JIT is asked to compile: `cvt.rs` does not exist on SM110,
+        // so ptxas would reject the generated PTX and surface it as an opaque compile
+        // failure far from the call site that selected this epilogue.
+        DG_HOST_ASSERT(arch::feature_state("bf16_stochastic_rounding", jit->device.get_arch_major()) != arch::FeatureSupport::Unsupported and
+                       "The BF16 stochastic-rounding epilogue needs the PTX `cvt.rs` instruction, "
+                       "which is unavailable on this architecture (it is `sm_100a`-only)");
         DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16 and
                        "Stochastic rounding requires a direct BF16 output");
     }

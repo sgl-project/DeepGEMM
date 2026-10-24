@@ -6,6 +6,7 @@
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
+#include "../../utils/arch_traits.hpp"
 #include "../../utils/layout.hpp"
 #include "../heuristics/runtime.hpp"
 
@@ -221,7 +222,8 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
                                                                             const int gran_k,
                                                                             const int k_alignment,
                                                                             const bool& use_psum_layout) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0);
+    DG_HOST_ASSERT(arch::uses_sm100_tuning(jit->device.get_arch_major())
+                   and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0);
     const auto [sf_k, mn] = get_shape<2>(sf);
     const auto num_groups = static_cast<int>(grouped_layout.numel());
 

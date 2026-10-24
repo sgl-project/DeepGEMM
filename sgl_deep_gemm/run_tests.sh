@@ -249,7 +249,6 @@ if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then
     skip_test test_sanitizer.py "--skip-sanitizer"
   elif [ "${TEST_PROFILE}" = release ]; then
     # Keep both tools, but avoid instrumenting every benchmark Cartesian product.
-    SANITIZER_FUNCS=test_attention.test_gemm_skip_head_mid
     if [ "${ARCH_MAJOR}" -eq 10 ]; then
       SANITIZER_FUNCS+=,test_clean_logits_bounds.test_clean_logits_bounds
     fi

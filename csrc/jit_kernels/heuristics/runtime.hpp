@@ -3,6 +3,7 @@
 #include <deep_jit/utils/lazy.hpp>
 
 #include "../../runtime/jit.hpp"
+#include "../../utils/arch_traits.hpp"
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
@@ -55,7 +56,9 @@ public:
     }
 
     static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
-        if (jit->device.get_arch_major() != 10)
+        // The SM100-tuned 256 alignment is only validated on SM100 itself; other
+        // members of the family (SM110) keep the legacy value.
+        if (not arch::verified_feature("contiguous_mk_alignment_sm100", jit->device.get_arch_major()))
             return kLegacyMKAlignmentForContiguousLayout;
 
         // The newly supported UMMA_N=256 allows a fixed alignment of 256, which is friendlier to MoE cast, M-grouped, and K-grouped operators.

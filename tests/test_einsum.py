@@ -18,6 +18,18 @@ from utils import (
 )
 
 
+def _supports_bf16_stochastic_rounding() -> bool:
+    """Whether this device can run the stochastic-rounding epilogue at all.
+
+    It lowers to the PTX `cvt.rs.bf16x2.f32` instruction, which ptxas accepts only
+    for `sm_100a`. Asking for it elsewhere fails at JIT compile time, so the tests
+    that require it are filtered by the published feature table rather than by a
+    hard-coded architecture major.
+    """
+    status = deep_gemm.arch_feature_status()['bf16_stochastic_rounding']
+    return status['sm100' if get_arch_major() == 10 else 'sm110'] == 'validated'
+
+
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
     for s in (129, 4096, 8192):
@@ -41,6 +53,7 @@ def test_bmk_bnk_mn() -> None:
     print()
 
 
+@test_filter(_supports_bf16_stochastic_rounding)
 def test_bhr_hdr_bhd():
     print('Testing "bhr, hdr -> bhd":')
     for h, r, d in [(128, 512, 128), (8, 4096, 1024)]:
@@ -72,6 +85,7 @@ def test_bhr_hdr_bhd():
     print()
 
 
+@test_filter(_supports_bf16_stochastic_rounding)
 def test_bhd_hdr_bhr():
     print('Testing "bhd, hdr -> bhr":')
     for h, r, d in [(128, 512, 128), (8, 4096, 1024)]:
@@ -205,6 +219,7 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
 
 
 @test_filter(lambda: get_arch_major() >= 10)
+@test_filter(_supports_bf16_stochastic_rounding)
 def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
     deep_gemm.use_deterministic_algorithms(False)
     print('Testing FP8 "bhd, hdr -> bhr":')

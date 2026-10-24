@@ -186,7 +186,11 @@ def test_k_grouped_gemm_contiguous() -> None:
                         a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
                         use_psum_layout=use_psum_layout)
                     assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
-                    if out_dtype == torch.bfloat16:
+                    # The stochastic-rounding epilogue lowers to PTX `cvt.rs`, which
+                    # ptxas only accepts for `sm_100a`; `test_gemm` above guards the
+                    # same call with `get_arch_major() == 10`, and this site needs the
+                    # same guard or it fails at JIT compile time on other majors.
+                    if out_dtype == torch.bfloat16 and get_arch_major() == 10:
                         deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
                             a, b, d, test_host_ks_cpu, grouped_layout, None, use_psum_layout=use_psum_layout,
                             epilogue=deep_gemm.epilogue.BF16StochasticRounding())

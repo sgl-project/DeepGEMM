@@ -77,6 +77,14 @@ inline constexpr struct {
     // test has run it. Refuse it until one does, instead of letting an opt-in caller
     // discover a JIT or numerical failure at request time.
     {"bf16_mega_mhc", {FeatureSupport::Validated, FeatureSupport::Unvalidated}},
+    // The `BF16StochasticRounding` epilogue lowers to the PTX `cvt.rs.bf16x2.f32`
+    // instruction, which ptxas accepts only for `sm_100a`. Measured on CUDA 13.0:
+    // `sm_100a` builds, while `sm_100f`, `sm_110a`, `sm_110f`, `sm_120a` and `sm_90a`
+    // all fail with "Feature '.rs' not supported". This is a hardware instruction
+    // that does not exist on SM110 -- not a variant that merely lacks testing -- so
+    // it is Unsupported rather than Unvalidated, and callers get a clear refusal
+    // instead of a ptxas failure buried in a JIT traceback.
+    {"bf16_stochastic_rounding", {FeatureSupport::Validated, FeatureSupport::Unsupported}},
 };
 
 inline constexpr size_t kNumFeatureStates = std::size(kFeatureStates);
@@ -100,6 +108,23 @@ constexpr bool verified_feature(const char* const name, const int64_t arch_major
         }
     }
     return false;
+}
+
+// Raw state of a feature on an arch, without collapsing it to a yes/no answer.
+// Lets a caller distinguish "not tested yet" from "cannot exist here at all",
+// which are different messages to give a user.
+constexpr FeatureSupport feature_state(const char* const name, const int64_t arch_major) {
+    const auto index = major_to_index(arch_major);
+    if (index < 0)
+        return FeatureSupport::Unsupported;
+    for (const auto& feature : kFeatureStates) {
+        const char* a = feature.name;
+        const char* b = name;
+        while (*a and *a == *b) { ++a; ++b; }
+        if (*a == *b)
+            return index == 0 ? feature.state.sm100 : feature.state.sm110;
+    }
+    return FeatureSupport::Unsupported;
 }
 
 // The 384-token BF16 MQA split is taken only where it has actually been run.

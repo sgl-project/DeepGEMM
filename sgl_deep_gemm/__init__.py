@@ -182,21 +182,35 @@ def _parse_tensor_or_tuple(input):
 # GEMM / Attention / Einsum wrappers (handle optional params in Python)
 # ---------------------------------------------------------------------------
 try:
+    def _fp8_fp4_gemm_forward(name, a, b, d, c, recipe, recipe_a, recipe_b,
+                              compiled_dims, disable_ue8m0_cast, alpha):
+        """Call an FP8/FP4 GEMM under either binding layout.
+
+        Newer upstream passes `a` and `b` as `(values, sf)` pairs, older builds as
+        separate flat tensor arguments. Try the pair form first.
+        """
+        a_pair, b_pair = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        op = getattr(_C, name)
+        try:
+            op(a_pair, b_pair, d, c, recipe, recipe_a, recipe_b,
+               compiled_dims, disable_ue8m0_cast, alpha)
+        except TypeError:
+            a_data, a_sf = a_pair
+            b_data, b_sf = b_pair
+            op(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b,
+               compiled_dims, disable_ue8m0_cast, alpha)
+
     def fp8_fp4_gemm_nt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_nt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _fp8_fp4_gemm_forward('fp8_fp4_gemm_nt', a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
 
     def fp8_fp4_gemm_nn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_nn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _fp8_fp4_gemm_forward('fp8_fp4_gemm_nn', a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
 
     def fp8_fp4_gemm_tn(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_tn(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _fp8_fp4_gemm_forward('fp8_fp4_gemm_tn', a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
 
     def fp8_fp4_gemm_tt(a, b, d, c=None, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='', disable_ue8m0_cast=False, alpha=None):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_fp4_gemm_tt(a_data, a_sf, b_data, b_sf, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
+        _fp8_fp4_gemm_forward('fp8_fp4_gemm_tt', a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha)
 
     fp4_gemm_nt = fp8_fp4_gemm_nt
     fp8_gemm_nt = fp8_fp4_gemm_nt
@@ -204,41 +218,67 @@ try:
     fp8_gemm_tn = fp8_fp4_gemm_tn
     fp8_gemm_tt = fp8_fp4_gemm_tt
 
+    def _grouped_fp8_fp4_forward(name, a, b, tail):
+        """Call an m-grouped FP8/FP4 GEMM under either binding layout.
+
+        Newer upstream passes `a`/`b` as `(values, sf)` pairs, older builds as
+        separate flat tensors followed by the same trailing arguments.
+        """
+        a_pair, b_pair = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        op = getattr(_C, name)
+        try:
+            return op(a_pair, b_pair, *tail)
+        except TypeError:
+            (a_data, a_sf), (b_data, b_sf) = a_pair, b_pair
+            return op(a_data, a_sf, b_data, b_sf, *tail)
+
     def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
+        _grouped_fp8_fp4_forward(
+            'm_grouped_fp8_fp4_gemm_nt_contiguous', a, b,
+            (d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
+             disable_ue8m0_cast, use_psum_layout, ensure_zero_padding,
+             expected_m_for_psum_layout))
 
     def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding)
+        _grouped_fp8_fp4_forward(
+            'm_grouped_fp8_fp4_gemm_nn_contiguous', a, b,
+            (d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
+             disable_ue8m0_cast, use_psum_layout, ensure_zero_padding))
 
     m_grouped_fp4_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
     m_grouped_fp8_gemm_nn_contiguous = m_grouped_fp8_fp4_gemm_nn_contiguous
 
-    def bf16_gemm_nt(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_nt(a, b, d, c, compiled_dims, alpha)
+    # Every variant takes the same optional `epilogue` the native binding exposes; it
+    # selects the device-side output operator (Identity, Alpha, FP8CastWithClamp,
+    # BF16StochasticRounding). `compiled_dims` defaults to 'nk', matching upstream --
+    # an empty string would ask the kernel cache for a different specialization.
+    def bf16_gemm_nt(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        _C.bf16_gemm_nt(a, b, d, c, compiled_dims, alpha, epilogue)
 
-    def bf16_gemm_nn(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_nn(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_nn(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        _C.bf16_gemm_nn(a, b, d, c, compiled_dims, alpha, epilogue)
 
-    def bf16_gemm_tn(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_tn(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_tn(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        _C.bf16_gemm_tn(a, b, d, c, compiled_dims, alpha, epilogue)
 
-    def bf16_gemm_tt(a, b, d, c=None, compiled_dims='', alpha=None):
-        _C.bf16_gemm_tt(a, b, d, c, compiled_dims, alpha)
+    def bf16_gemm_tt(a, b, d, c=None, compiled_dims='nk', alpha=None, epilogue=None):
+        _C.bf16_gemm_tt(a, b, d, c, compiled_dims, alpha, epilogue)
 
-    def einsum(expr, a, b, d, c=None, use_cublaslt=False):
-        _C.einsum(expr, a, b, d, c, use_cublaslt)
+    def einsum(expr, a, b, d, c=None, use_cublaslt=False, epilogue=None):
+        # `use_cublaslt` was replaced by an explicit epilogue object; `None` keeps
+        # the default path that flag used to select.
+        _C.einsum(expr, a, b, d, c, epilogue)
 
-    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128)):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        d_data, d_sf = d if isinstance(d, (tuple, list)) else (d, None)
-        _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d_data, d_sf, c, recipe)
+    def fp8_einsum(expr, a, b, d, c=None, recipe=(1, 128, 128), epilogue=None):
+        # The output is either a Tensor or a pair of Tensors, never (Tensor, None).
+        a_pair, b_pair = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        output = tuple(d) if isinstance(d, (tuple, list)) else d
+        return _C.fp8_einsum(expr, a_pair, b_pair, output, c=c,
+                             recipe=recipe, epilogue=epilogue)
 
-    def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)
+    # `fp8_gemm_nt_skip_head_mid` was removed upstream together with its kernel;
+    # SGLang never referenced it, so the public name is dropped here too.
 
     def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
         op = getattr(_C, 'fp8_paged_mqa_logits', None)
@@ -304,22 +344,30 @@ try:
     get_mk_alignment_for_contiguous_layout = _C.get_mk_alignment_for_contiguous_layout
 
     def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False):
-        (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+        return _grouped_fp8_fp4_forward(
+            'm_grouped_fp8_fp4_gemm_nt_masked', a, b,
+            (d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims,
+             disable_ue8m0_cast))
 
     m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
-    def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False):
-        """Use compact per-group SF by default; opt in to padded SF with use_padded_sf_layout."""
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.k_grouped_fp8_gemm_tn_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout)
+    def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False, epilogue=None):
+        if use_padded_sf_layout:
+            raise NotImplementedError('use_padded_sf_layout is not supported by this upstream binding')
+        return _C.k_grouped_fp8_gemm_tn_contiguous(
+            _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b), d, ks, grouped_layout,
+            c=c, recipe=recipe, compiled_dims=compiled_dims,
+            use_psum_layout=use_psum_layout, epilogue=epilogue)
 
-    def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False):
-        """Use compact per-group SF by default; opt in to padded SF with use_padded_sf_layout."""
-        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.k_grouped_fp8_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout, use_padded_sf_layout)
+    def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False, use_padded_sf_layout=False, epilogue=None):
+        if use_padded_sf_layout:
+            raise NotImplementedError('use_padded_sf_layout is not supported by this upstream binding')
+        return _C.k_grouped_fp8_gemm_nt_contiguous(
+            _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b), d, ks, grouped_layout,
+            c=c, recipe=recipe, compiled_dims=compiled_dims,
+            use_psum_layout=use_psum_layout, epilogue=epilogue)
 
     def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
         _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
@@ -330,8 +378,8 @@ try:
     def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims='nk'):
         _C.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims)
 
-    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, compiled_dims='mn', use_psum_layout=False):
-        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c, compiled_dims, use_psum_layout)
+    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, compiled_dims='mn', use_psum_layout=False, epilogue=None):
+        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c, compiled_dims, use_psum_layout, epilogue)
 
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
@@ -450,6 +498,18 @@ for _optional_mega_name in (
     except (ImportError, AttributeError):
         pass
 del _optional_mega_name
+
+# Locality domain helpers. `deep_gemm/__init__.py` re-exports these at package
+# level; this wrapper builds the package instead, so it has to do the same or
+# `from deep_gemm import locality_domain` fails against an installed wheel.
+from . import locality_domain
+from .locality_domain import (
+    get_num_locality_domains,
+    is_localization_available,
+    localize,
+    is_localized,
+    destroy_localizer,
+)
 
 
 class SM90SymmBuffer:

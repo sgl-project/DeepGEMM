@@ -141,14 +141,22 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$PKG_DIR"
 
 cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml "$BUILD_DIR/"
+# `setup.py` declares the prebuilt `_C.so` as an extension so setuptools stamps
+# the wheel with the real platform instead of `py3-none-any`.
+cp sgl_deep_gemm/setup.py "$BUILD_DIR/"
 cp sgl_deep_gemm/__init__.py sgl_deep_gemm/cuda_helpers.py sgl_deep_gemm/build_ext.py \
    sgl_deep_gemm/doctor.py "$PKG_DIR/"
 
 # `__init__.py` imports `.utils`, `.testing`, `.legacy`, `.mega` — pulled from
-# the existing deep_gemm/ tree.
-for sub in utils testing legacy mega; do
+# the existing deep_gemm/ tree. `jit_hooks` is not imported by `__init__.py` but
+# is imported lazily by the JIT path, so omitting it fails only at first compile.
+for sub in utils testing legacy mega jit_hooks; do
     cp -r "deep_gemm/${sub}" "$PKG_DIR/"
 done
+
+# Single-file modules at the package root. `locality_domain` is imported by
+# `__init__.py` (line 101), so a missing copy breaks `import deep_gemm` outright.
+cp deep_gemm/locality_domain.py "$PKG_DIR/"
 
 # Headers required by the runtime JIT (same set the deep_gemm wheel ships).
 mkdir -p "$PKG_DIR/include"
