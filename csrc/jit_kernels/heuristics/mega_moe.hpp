@@ -140,9 +140,7 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
-    int block_m = num_expected_tokens <= 10 ? 16 : 32;
-    if (num_expected_tokens <= 24 and deep_jit::get_env<int>("DG_MEGA_MOE_SKEWED_ROUTING"))
-        block_m = num_expected_tokens <= 16 ? 64 : 128;
+    int block_m = num_expected_tokens <= 2 ? 16 : 64;
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
