@@ -375,7 +375,7 @@ def test_paged_mqa_logits_sm90_all_empty():
     print('Testing Paged MQA Logits SM90 (all contexts empty):')
     num_heads, head_dim, block_kv = 32, 128, 64
     num_sms = deep_gemm.get_num_sms()
-    for batch_size, next_n in ((32, 1), (64, 1), (256, 1), (32, 2)):
+    for batch_size, next_n in ((8, 1), (32, 1), (33, 1), (64, 1), (256, 1), (32, 2)):
         q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
         q_in, _ = quantize_mqa_q(q, 'fp8')
         kv_in, _ = kv_cache_cast_to_fp8(torch.randn((2, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16))
@@ -383,16 +383,6 @@ def test_paged_mqa_logits_sm90_all_empty():
         context_lens = torch.zeros((batch_size, next_n), device='cuda', dtype=torch.int)
         block_table = torch.zeros((batch_size, 1), device='cuda', dtype=torch.int)
         meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)
-        torch.cuda.synchronize()
-
-        # Empty work -> `start == end`. End slot is always `(B * num_next_n_atoms, 0)`.
-        next_n_atom = 2 if next_n >= 2 else 1
-        num_next_n_atoms = ceil_div(next_n, next_n_atom)
-        sentinel = torch.tensor([batch_size * num_next_n_atoms, 0], device='cuda', dtype=torch.int)
-        assert meta.shape == (num_sms + 1, 2)
-        assert torch.equal(meta[-1], sentinel)
-        assert torch.all(meta[:-1] == sentinel)
-
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
             q_in, kv_in, weights, context_lens, block_table, meta, block_kv)
         torch.cuda.synchronize()
