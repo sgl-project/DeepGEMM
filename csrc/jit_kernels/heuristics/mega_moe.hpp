@@ -69,9 +69,9 @@ struct MegaMoEConfig {
     }
 };
 
-static int get_smem_capacity_for_mega_moe() {
+static int get_smem_capacity_for_mega_moe(const int& block_m) {
 #if CUDA_VERSION >= 13040
-    if (jit->device.get_arch_pair() == std::make_pair(10, 7))
+    if (jit->device.get_arch_pair() == std::make_pair(10, 7) and block_m != 240)
         return SM107ArchSpec::oversized_smem_capacity;
 #endif
     return SM100ArchSpec::smem_capacity;
@@ -309,7 +309,7 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
-        get_smem_capacity_for_mega_moe(),
+        get_smem_capacity_for_mega_moe(block_m),
         num_experts, hidden,
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
