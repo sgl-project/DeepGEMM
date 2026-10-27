@@ -111,6 +111,7 @@ void dg_set_block_size_multiple_of(int64_t m, int64_t n) {
 int64_t dg_get_num_locality_domains() { return locality_domain::get_num_locality_domains(); }
 int64_t dg_get_locality_domain_granularity() { return static_cast<int64_t>(locality_domain::get_granularity()); }
 bool dg_is_localization_available() { return locality_domain::is_localization_available(); }
+bool dg_uses_native_locality_domains() { return locality_domain::uses_native_locality_domains(); }
 bool dg_is_localized(const Tensor& t) { return is_localized(t); }
 void dg_release_mlopart() { locality_domain::release_mlopart(); }
 void dg_set_mlopart_callbacks(int64_t is_available, int64_t create_memory, int64_t release) {
@@ -724,6 +725,7 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("get_num_locality_domains() -> int", &dg_get_num_locality_domains);
     m.def("get_locality_domain_granularity() -> int", &dg_get_locality_domain_granularity);
     m.def("is_localization_available() -> bool", &dg_is_localization_available);
+    m.def("uses_native_locality_domains() -> bool", &dg_uses_native_locality_domains);
     m.def("release_mlopart() -> ()", &dg_release_mlopart);
     m.def("set_mlopart_callbacks(int is_available, int create_memory, int release) -> ()", &dg_set_mlopart_callbacks);
     m.def("locality_domain_empty(int[] sizes, ScalarType dtype, int domain_idx) -> Tensor", &dg_locality_domain_empty);
