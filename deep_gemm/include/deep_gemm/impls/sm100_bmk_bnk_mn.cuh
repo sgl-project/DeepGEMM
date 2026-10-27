@@ -92,6 +92,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
+    const uint32_t tmem_base = ptx::ld_shared(tmem_ptr_in_smem);
 
     // Block indices
     const uint32_t num_n_blocks = math::ceil_div(SHAPE_N, BLOCK_N);
@@ -171,7 +172,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
                         a_desc_base_lo, 0, k * UMMA_K);
                     b_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, BLOCK_N, kSwizzleABMode, cutlass::bfloat16_t>(
                         b_desc_base_lo, 0, k * UMMA_K);
-                    ptx::SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, 0, s > 0 or k > 0, runtime_instr_desc);
+                    ptx::SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, tmem_base, s > 0 or k > 0, runtime_instr_desc);
                 }
             }
 
@@ -184,10 +185,6 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
     // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
     // i.e., no need for `tmem_ptr |= (warp_idx * 32) << 16`.
-    // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-    if (warp_idx == 2)
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
-
     // TMA checks
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(float);
@@ -234,7 +231,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
             col ^= row % (kSwizzleCDMode / 16);
 
             // Source and destination memory address
-            uint32_t tmem_addr = s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // In-block offset
+            uint32_t tmem_addr = tmem_base + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // In-block offset
             auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // Base pointer
                             warp_idx * 32 * kSwizzleCDMode +                            // Warp offset
                             row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // In-atom offset
@@ -260,7 +257,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
     // Deallocate tensor memory by warp 1
     // NOTES: warp 0 is doing TMA stores
     if (warp_idx == 1)
-        cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+        cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
