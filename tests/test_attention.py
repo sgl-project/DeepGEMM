@@ -375,7 +375,7 @@ def test_paged_mqa_logits_sm90_all_empty():
     print('Testing Paged MQA Logits SM90 (all contexts empty):')
     num_heads, head_dim, block_kv = 32, 128, 64
     num_sms = deep_gemm.get_num_sms()
-    for batch_size, next_n in ((8, 1), (32, 1), (33, 1), (64, 1), (256, 1), (32, 2)):
+    for batch_size, next_n in ((8, 1), (8, 2), (32, 1), (33, 1), (64, 1), (256, 1), (32, 2)):
         q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
         q_in, _ = quantize_mqa_q(q, 'fp8')
         kv_in, _ = kv_cache_cast_to_fp8(torch.randn((2, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16))
