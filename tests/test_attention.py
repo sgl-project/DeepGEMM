@@ -824,5 +824,6 @@ if __name__ == '__main__':
     test_mqa_logits()
     test_mqa_logits_short_queries()
     test_paged_mqa_logits_all_empty()
+    test_paged_mqa_logits_sm90_all_empty()
     test_paged_mqa_logits()
     test_sparse_mqa_logits()
