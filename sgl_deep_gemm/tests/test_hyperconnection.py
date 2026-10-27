@@ -1,5 +1,9 @@
 import torch
 import random
+import re
+import shutil
+import tempfile
+from pathlib import Path
 
 import deep_gemm
 from deep_gemm.testing import (
@@ -47,8 +51,7 @@ def test_hc_prenorm_gemm() -> None:
 
 
 
-@test_filter(lambda: get_arch_major() == 10)
-def test_hc_prenorm_gemm_concurrent_streams() -> None:
+def _check_hc_prenorm_gemm_concurrent_streams() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -72,7 +75,6 @@ def test_hc_prenorm_gemm_concurrent_streams() -> None:
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
 
-    # Nonzero TMEM bases depend on scheduling; concurrency does not guarantee one.
     outputs = []
     for _ in range(8):
         for stream, (a, b, num_splits, d_shape, s_shape, ref_d, ref_s) in zip(streams, cases):
@@ -91,6 +93,45 @@ def test_hc_prenorm_gemm_concurrent_streams() -> None:
     print('Concurrent HC-prenorm GEMM passed')
 
 
+@test_filter(lambda: get_arch_major() == 10)
+def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
+    library_root = Path(deep_gemm.__file__).resolve().parent
+    with tempfile.TemporaryDirectory() as directory:
+        include = Path(directory) / 'include'
+        shutil.copytree(library_root / 'include', include, symlinks=True)
+        header = include / 'deep_gemm/impls/sm100_tf32_hc_prenorm_gemm.cuh'
+        source = header.read_text()
+        allocation = '        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);\n'
+        assert source.count(allocation) == 1
+        source = source.replace(allocation,
+            '        cute::TMEM::Allocator1Sm().allocate(256, &reserved_tmem_base);\n' +
+            allocation + '        cute::TMEM::Allocator1Sm().release_allocation_lock();\n')
+        # Reserve half the TMEM in the same CTA so the kernel must use a nonzero base.
+        initialization = '    // Initialize barriers\n'
+        assert source.count(initialization) == 1
+        source = source.replace(initialization,
+            '    DG_STATIC_ASSERT(kNumTmemCols == 256, "Test requires 256 kernel columns");\n'
+            '    __shared__ uint32_t reserved_tmem_base;\n\n' + initialization)
+        synchronization = source.index('    __syncthreads();\n', source.index(allocation))
+        synchronization += len('    __syncthreads();\n')
+        source = (source[:synchronization] +
+                  '    DG_DEVICE_ASSERT(*tmem_ptr_in_smem != 0);\n' + source[synchronization:])
+        # Free the fixture first, leaving the kernel's original deallocation untouched.
+        source, count = re.subn(
+            r'        if \(warp_idx == 1\)\n(            cute::TMEM::Allocator1Sm\(\).free\([^\n]+\);)\n',
+            r'        if (warp_idx == 1) {\n'
+            r'            cute::TMEM::Allocator1Sm().free(reserved_tmem_base, 256);\n\1\n        }\n',
+            source)
+        assert count == 1
+        header.write_text(source)
+        torch.cuda.synchronize()
+        deep_gemm._C.init(directory, '')
+        try:
+            _check_hc_prenorm_gemm_concurrent_streams()
+        finally:
+            deep_gemm._C.init(str(library_root), '')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -99,4 +140,4 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_hc_prenorm_gemm()
-    test_hc_prenorm_gemm_concurrent_streams()
+    test_hc_prenorm_gemm_nonzero_tmem_base()
