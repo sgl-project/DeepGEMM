@@ -183,6 +183,9 @@ if __name__ == '__main__':
     torch.manual_seed(0)
 
     test_sm_locality_domains()
+    if not deep_gemm.is_localization_available():
+        print('Localization is unavailable; skipping the allocation tests')
+        sys.exit(0)
     test_empty()
     test_localize()
     test_localize_rows()
