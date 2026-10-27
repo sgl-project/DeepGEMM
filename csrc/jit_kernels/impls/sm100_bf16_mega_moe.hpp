@@ -174,8 +174,8 @@ static void __instantiate_kernel() {{
         use_trtllm_weights ? "true" : "false"));
 
     // Launch
-    jit->launch(
-        kernel, {
+    launch_with_shared_memory_mode(
+        get_smem_mode_for_mega_moe(config.smem_size), kernel, {
             .num_smem_bytes = config.smem_size,
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),

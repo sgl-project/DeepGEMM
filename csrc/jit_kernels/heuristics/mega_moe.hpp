@@ -69,6 +69,22 @@ struct MegaMoEConfig {
     }
 };
 
+static int get_smem_capacity_for_mega_moe() {
+#if CUDA_VERSION >= 13040
+    if (jit->device.get_arch_pair() == std::make_pair(10, 7))
+        return SM107ArchSpec::oversized_smem_capacity;
+#endif
+    return SM100ArchSpec::smem_capacity;
+}
+
+static std::optional<int> get_smem_mode_for_mega_moe(const int& smem_size) {
+#if CUDA_VERSION >= 13040
+    if (smem_size > SM100ArchSpec::smem_capacity)
+        return CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+#endif
+    return std::nullopt;
+}
+
 // Locality domains are read per physical SM, so a grid smaller than the GPU stays correct
 static int get_num_sms_for_mega_moe() {
     const auto num_sms = runtime->get_num_sms();
@@ -293,7 +309,7 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
-        SM100ArchSpec::smem_capacity,
+        get_smem_capacity_for_mega_moe(),
         num_experts, hidden,
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
