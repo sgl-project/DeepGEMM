@@ -132,6 +132,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     if (warp_idx == kSpecWarpStart + 2)
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
     __syncthreads();
+    // Load the allocated TMEM base to keep derived addresses in uniform registers
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
 
     RingPipeline<kNumQStages> q_pipeline;
     RingPipeline<kNumKVStages> kv_pipeline;
@@ -283,7 +285,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         produce_kv(cute::false_type{});
     } else if (warp_idx == kSpecWarpStart + 2) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr_in_smem) == 0);
 
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
@@ -320,7 +321,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                 if (cute::elect_one_sync())
                     cute::SM100_UTCCP_4x32dp128bit_1cta::copy(
-                        sf_desc, kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage + i * 4);
+                        sf_desc, tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage + i * 4);
                 __syncwarp();
             }
             if (cute::elect_one_sync()) {
@@ -355,7 +356,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         auto smem_ptr = smem.smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
                         mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                         cute::SM100_UTCCP_4x32dp128bit_1cta::copy(
-                            sf_desc, kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + i * 4);
+                            sf_desc, tmem_base + kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + i * 4);
                     }
                     ptx::tcgen05_before_thread_sync();
                     smem.full_kv_barriers[kv_stage_idx].arrive();
@@ -365,9 +366,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        // Load the allocated TMEM base to keep derived addresses in uniform registers
-        const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
-        DG_TRAP_ONLY_DEVICE_ASSERT(tmem_base == 0);
         if (cute::elect_one_sync()) {
             using mma_op_t = cute::conditional_t<kIsFP4, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF8F6F4_SS>;
             DG_STATIC_ASSERT((not kIsFP4 and kHeadDim == 32) or kHeadDim == 64 or kHeadDim == 128, "Invalid head dim");
@@ -512,7 +510,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             }
                             reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
                         };
-                        visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
+                        visit_tmem_head_chunks<kNumHeads>(tmem_base + tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
                         store_token(i, kv_offset, sum_0, sum_1);
                     }
                 }
@@ -529,7 +527,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
-            cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
     }
 }
 

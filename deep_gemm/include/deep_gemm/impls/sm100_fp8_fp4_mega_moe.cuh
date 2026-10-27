@@ -443,6 +443,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
+    const uint32_t tmem_base = ptx::ld_shared(&shared_storage.tmem_ptr_in_smem);
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -1153,7 +1154,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfa[stage_idx] + sf_chunk_idx * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
+                                cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFA + i * 4);
                             }
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
@@ -1162,7 +1163,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                         : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                                cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFB + i * 4);
                             }
 
                             // Issue UMMA
@@ -1181,19 +1182,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, atom_byte_offset * LOAD_BLOCK_N, in_atom_byte_idx);
                                 if constexpr (kIsNVFP4) {
                                     ptx::SM100_MMA_MXF4NVF4_2x1SM_SS::fma(
-                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
                                         k_block_idx > 0 or mma_idx > 0, runtime_instr_desc,
-                                        kTmemStartColOfSFB, kTmemStartColOfSFA);
+                                        tmem_base + kTmemStartColOfSFB, tmem_base + kTmemStartColOfSFA);
                                 } else if constexpr (kIsMXFP4) {
                                     ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
-                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
                                         k_block_idx > 0 or mma_idx > 0, runtime_instr_desc,
-                                        kTmemStartColOfSFB, kTmemStartColOfSFA);
+                                        tmem_base + kTmemStartColOfSFB, tmem_base + kTmemStartColOfSFA);
                                 } else {
                                     ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
-                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
                                         k_block_idx > 0 or mma_idx > 0, runtime_instr_desc,
-                                        kTmemStartColOfSFB, kTmemStartColOfSFA);
+                                        tmem_base + kTmemStartColOfSFB, tmem_base + kTmemStartColOfSFA);
                                 }
                             }
                         }
@@ -1225,9 +1226,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
-        // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&shared_storage.tmem_ptr_in_smem) == 0);
-
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
@@ -1289,7 +1287,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                     auto& values = raw_values[s % kNumBuffers][i];
-                    const uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + (s * kNumAtomsPerStore + i) * ATOM_M;
+                    const uint32_t tmem_addr = tmem_base + accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + (s * kNumAtomsPerStore + i) * ATOM_M;
                     cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                            values[0], values[1], values[2], values[3]);
                     cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
@@ -1852,7 +1850,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
         if (epilogue_warp_idx == 0)
-            Allocator().free(0, kNumTmemCols);
+            Allocator().free(tmem_base, kNumTmemCols);
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers

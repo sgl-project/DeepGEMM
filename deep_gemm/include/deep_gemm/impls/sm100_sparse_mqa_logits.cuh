@@ -255,7 +255,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
     __syncthreads();
 
     DG_DEVICE_ASSERT(blockDim.x == kNumThreads and gridDim.x == kNumSMs);
-    DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr_in_smem) == 0);
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
     cudaGridDependencySynchronize();
 
     constexpr uint32_t kUMMAWarpIdx = kQAndMetadataWarpIdx + 2;
@@ -345,7 +345,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
             cutlass::arch::fence_view_async_shared();
             if (cute::elect_one_sync()) {
                 mma::sm100::replace_smem_desc_addr(sf_desc, smem.sf_q[q_stage_idx]);
-                cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, kTmemStartColOfSFQ + q_stage_idx * kNumSFQCols);
+                cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc, tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQCols);
                 ptx::tcgen05_before_thread_sync();
                 smem.full_sf_q_barriers[q_stage_idx].arrive();
             }
@@ -360,7 +360,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                     for (uint32_t sf_idx = 0; sf_idx < SPLIT_KV; sf_idx += kNumUTCCPAlignedElems) {
                         mma::sm100::replace_smem_desc_addr(sf_desc, smem.sf_kv[kv_stage_idx] + sf_idx);
                         cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sf_desc,
-                            kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + sf_idx / 32);
+                            tmem_base + kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + sf_idx / 32);
                     }
                     ptx::tcgen05_before_thread_sync();
                     smem.full_kv_barriers[kv_stage_idx].arrive();
@@ -391,7 +391,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                     #pragma unroll
                     for (uint32_t m_idx = 0; m_idx < kNumMathWarpGroups; ++ m_idx) {
                         CUTE_TIE_DECL(tmem_pipeline.advance(), tmem_stage_idx, tmem_phase);
-                        const uint32_t tmem_addr = tmem_stage_idx * UMMA_N;
+                        const uint32_t tmem_addr = tmem_base + tmem_stage_idx * UMMA_N;
                         smem.empty_tmem_barriers[tmem_stage_idx].wait(tmem_phase ^ 1u);
                         ptx::tcgen05_after_thread_sync();
                         #pragma unroll
@@ -403,8 +403,8 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                             const auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim / kPackFactor>(
                                                                            smem.q[q_stage_idx][0], 0, k_idx * UMMA_K);
                             mma_op_t::fma(a_desc, b_desc, tmem_addr, k_idx, runtime_instr_desc,
-                                          kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + m_idx * 4,
-                                          kTmemStartColOfSFQ + q_stage_idx * kNumSFQCols);
+                                          tmem_base + kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + m_idx * 4,
+                                          tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQCols);
                         }
                         ptx::umma_arrive_no_elect(smem.full_tmem_barriers[tmem_stage_idx]);
                     }
@@ -601,7 +601,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                 for (uint32_t q_token_offset = 0; q_token_offset < BLOCK_Q; ++ q_token_offset) {
                     if (q_token_offset >= num_q_tokens)
                         continue;
-                    const uint32_t tmem_addr = tmem_stage_idx * UMMA_N + q_token_offset * kNumHeads;
+                    const uint32_t tmem_addr = tmem_base + tmem_stage_idx * UMMA_N + q_token_offset * kNumHeads;
                     auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
                     auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
                     #pragma unroll
@@ -638,7 +638,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
         }
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
-            cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
     } else {
         cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
     }
