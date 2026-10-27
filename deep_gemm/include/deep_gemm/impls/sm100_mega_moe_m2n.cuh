@@ -670,6 +670,9 @@ sm100_mega_moe_m2n_eg_impl(
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
+    constexpr uint64_t kActsCacheHint = static_cast<uint64_t>(BLOCK_M <= 128 ?
+        cute::TMA::CacheHintSm100::EVICT_LAST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
+
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
@@ -1077,6 +1080,11 @@ sm100_mega_moe_m2n_eg_impl(
             const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(pull_stage_idx);
             const auto pull_mbarrier = dispatch_barriers[warp_idx * kNumDispatchPullStages + pull_stage_idx];
 
+            // Overlap the remote top-k weight read with the scale-factor copy.
+            const auto weight = *sym_buffer.map(
+                input_topk_weights_buffer.get_base_ptr<float>() + record.src_token_topk_idx,
+                record.rank_idx);
+
             // Load and store SF (overlaps with TMA token load)
             constexpr uint32_t kNumSFUint32 = kHidden / (kGranK * 4);
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
@@ -1094,9 +1102,6 @@ sm100_mega_moe_m2n_eg_impl(
 
             // Store weights and token data
             if (cute::elect_one_sync()) {
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + record.src_token_topk_idx,
-                    record.rank_idx);
                 *l1_topk_weights_buffer.get_data_buffer(record.pool_token_idx).get_base_ptr<float>() = weight;
 
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase[pull_stage_idx]);
@@ -1232,7 +1237,7 @@ sm100_mega_moe_m2n_eg_impl(
 
                 if (cute::elect_one_sync()) {
                     tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
+                        tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2, 0, kActsCacheHint);
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
@@ -1675,6 +1680,16 @@ sm100_mega_moe_m2n_eg_impl(
                         break;
                     }
 
+                    // Overlap source metadata reads with TMEM loads and the shared-memory transpose.
+                    layout::TokenSrcMetadata cached_src_metadata[kNumRowsPerWarp];
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                        const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
+                        if (m_idx_in_block < valid_m)
+                            cached_src_metadata[j] = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                    }
+                    __syncwarp();
+
                     #pragma unroll
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
@@ -1731,7 +1746,7 @@ sm100_mega_moe_m2n_eg_impl(
                         if (m_idx_in_block >= valid_m)
                             break;
 
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                        const auto& src_metadata = cached_src_metadata[j];
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;
                         const uint32_t dst_token_idx = src_metadata.token_idx;
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
