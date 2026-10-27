@@ -71,7 +71,7 @@ struct MegaMoEConfig {
 
 static int get_smem_capacity_for_mega_moe() {
 #if CUDA_VERSION >= 13040
-    if (jit->device.get_arch_pair() == std::make_pair(10, 7) and deep_jit::get_env<int>("DG_SM107_OVERSIZED_SMEM", 1))
+    if (jit->device.get_arch_pair() == std::make_pair(10, 7))
         return SM107ArchSpec::oversized_smem_capacity;
 #endif
     return SM100ArchSpec::smem_capacity;
