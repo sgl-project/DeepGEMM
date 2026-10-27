@@ -108,12 +108,19 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
                 lo = pred ? mid + 1 : lo;
                 hi = pred ? hi : mid;
             }
-            const uint32_t q_idx = lo;
-            const uint32_t offset_in_q = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1] * num_next_n_atoms);
-            const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : prefix_sum[q_idx] - prefix_sum[q_idx - 1]);
-            const uint32_t atom_idx = num_segs_q > 0 ? offset_in_q / num_segs_q : 0;
-            const uint32_t kv_split_idx = num_segs_q > 0 ? offset_in_q % num_segs_q : 0;
-            const uint32_t q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
+            uint32_t q_atom_idx = 0;
+            uint32_t kv_split_idx = 0;
+            if (lo < batch_size) {
+                const uint32_t q_idx = lo;
+                const uint32_t offset_in_q = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1] * num_next_n_atoms);
+                const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : prefix_sum[q_idx] - prefix_sum[q_idx - 1]);
+                const uint32_t atom_idx = num_segs_q > 0 ? offset_in_q / num_segs_q : 0;
+                kv_split_idx = num_segs_q > 0 ? offset_in_q % num_segs_q : 0;
+                q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
+            } else {
+                kv_split_idx = 0;
+                q_atom_idx = batch_size * num_next_n_atoms;
+            }
             __syncwarp();
 
             schedule_metadata[sm_idx * 2] = q_atom_idx;
@@ -186,6 +193,10 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         } else {
             current_advance = 1;
             const uint32_t q_idx = q_atom_idx / kNumNextNAtoms;
+            if (q_idx >= batch_size) {
+                current_num_kv = 0;
+                return;
+            }
             const auto lens_idx = (kIsContextLens2D ? q_idx * kNextN + kNextN - 1 : q_idx);
             current_num_kv = math::ceil_div(context_lens[lens_idx], BLOCK_KV);
         }
