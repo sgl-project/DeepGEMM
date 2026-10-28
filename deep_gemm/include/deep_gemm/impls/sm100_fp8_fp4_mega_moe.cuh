@@ -772,11 +772,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
+            // Load all SF words before storing: potentially aliasing stores otherwise
+            // serialize the remote loads across loop iterations.
+            constexpr uint32_t kNumSFPerLane = math::constexpr_ceil_div(kNumSFUint32, 32u);
+            uint32_t sf_values[kNumSFPerLane];
             #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
+            for (uint32_t i = 0; i < kNumSFPerLane; ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
                 if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                    sf_values[i] = remote_sf_ptr[j];
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumSFPerLane; ++ i) {
+                const uint32_t j = i * 32 + lane_idx;
+                if (j < kNumSFUint32)
+                    local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = sf_values[i];
             }
             __syncwarp();
 
