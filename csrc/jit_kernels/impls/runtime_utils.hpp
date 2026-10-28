@@ -316,7 +316,8 @@ static CUtensorMap make_tma_weights_2d_desc(const torch::Tensor& t, const int& b
 }
 
 // Accepts `(B, N, K)` or localized `(2, B, N / 2, K)`, and returns 4D TMA descriptor `(B, 2, N / 2, K)`
-static CUtensorMap make_tma_weights_3d_desc(const torch::Tensor& t, const int& block_k, const int& load_block_n, const int& swizzle_mode) {
+static CUtensorMap make_tma_weights_3d_desc(const torch::Tensor& t, const int& block_k, const int& load_block_n, const int& swizzle_mode,
+                                            const bool& fp4_unpacked_smem = true) {
     const auto num_domains = LocalityDomainAllocator::get_num_locality_domains();
     const bool localized = t.dim() == 4;
     const auto num_batches = static_cast<int>(t.size(localized ? 1 : 0));
@@ -327,7 +328,7 @@ static CUtensorMap make_tma_weights_3d_desc(const torch::Tensor& t, const int& b
                             k, n_per_domain, num_domains, num_batches,
                             block_k, load_block_n, 1, 1,
                             t.stride(-2), slice_stride, t.stride(localized ? 1 : 0),
-                            swizzle_mode);
+                            swizzle_mode, 0, false, fp4_unpacked_smem);
 }
 
 static CUtensorMap make_tma_a_desc(const cute::UMMA::Major& major,

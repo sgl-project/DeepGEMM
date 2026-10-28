@@ -50,6 +50,9 @@ struct MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
+    // SM107 K=64 `kind::mxf8f6f4` MMAs on packed FP4 weights, and the SIMT dispatch pull
+    bool use_sm107_k64, use_simt_pull;
+
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
@@ -64,14 +67,17 @@ struct MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull
+           << ", use_sm107_k64=" << config.use_sm107_k64 << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
     }
 };
 
-static int get_smem_capacity_for_mega_moe(const int& block_m) {
+// NOTES: oversized shared memory shrinks L1 to 8 KiB, which cannot hold the SIMT dispatch pull's in-flight remote
+// loads (5 KB per dispatch warp at hidden 5120): the SIMT pull keeps the normal budget
+static int get_smem_capacity_for_mega_moe(const int& block_m, const bool& use_simt_pull) {
 #if CUDA_VERSION >= 13040
-    if (jit->device.get_arch_pair() == std::make_pair(10, 7) and block_m != 240)
+    if (jit->device.get_arch_pair() == std::make_pair(10, 7) and block_m != 240 and not use_simt_pull)
         return SM107ArchSpec::oversized_smem_capacity;
 #endif
     return SM100ArchSpec::smem_capacity;
@@ -204,7 +210,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& use_sm107_k64 = false, const bool& use_simt_pull = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -216,7 +223,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Dispatch region
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = align(
+    // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
+    const int smem_send_buffers_size = align(use_simt_pull ? 16 * num_dispatch_warps :
         static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
@@ -251,9 +259,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
     // NOTES: for `MXFP8FP4` the FP4 weights are unpacked into 8-bit containers in smem,
-    // so A and B always share the same per-element footprint
+    // so A and B always share the same per-element footprint, except with SM107's K=64 MMA, which reads them packed
     const int smem_a_size_per_stage = load_block_m * block_k * elem_bits / 8;
-    const int smem_b_size_per_stage = block_n * block_k * elem_bits / 8;
+    const int smem_b_size_per_stage = block_n * block_k * (use_sm107_k64 ? 4 : elem_bits) / 8;
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
@@ -277,7 +285,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
     const MmaKind& mma_kind,
-    const std::optional<int64_t>& global_num_tokens) {
+    const std::optional<int64_t>& global_num_tokens,
+    const bool& fp4_weights = false) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
@@ -307,14 +316,24 @@ static MegaMoEConfig get_mega_moe_config(
         num_bytes_per_pull /= 2;
     }
 
+    // SM107 (CC 10.7) has a K=64 `kind::mxf8f6f4` MMA, which reads FP4 operands packed: FP8 x FP4 then loads its
+    // routed weights packed and splits the FP8 shared expert's K blocks. `DG_MEGA_MOE_SM107_K64=0` disables it
+    const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
+        jit->device.get_arch_pair() == std::make_pair(10, 7) and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
+    // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
+    // SMEM send buffers; on by default with the K=64 MMA, `DG_MEGA_MOE_SIMT_PULL=0/1` forces it (FP8 x FP4 only)
+    const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
+    const bool use_simt_pull = mma_kind == MmaKind::MXFP8FP4 and (hidden * get_element_bits(mma_kind) / 8) % 512 == 0 and
+        (simt_pull_env < 0 ? use_sm107_k64 : simt_pull_env != 0);
+
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
-        get_smem_capacity_for_mega_moe(block_m),
+        get_smem_capacity_for_mega_moe(block_m, use_simt_pull),
         num_experts, hidden,
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, use_sm107_k64, use_simt_pull);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -324,7 +343,8 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull
+        num_bytes_per_pull,
+        use_sm107_k64, use_simt_pull
     };
 
     // Print configs for the first time

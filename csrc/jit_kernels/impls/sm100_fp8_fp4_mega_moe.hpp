@@ -117,7 +117,8 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        mma_kind, global_num_tokens);
+        mma_kind, global_num_tokens,
+        l1_weights.scalar_type() == kPackedFP4);
 
     if (use_trtllm_weights) {
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
@@ -133,6 +134,15 @@ static void sm100_fp8_fp4_mega_moe(
     const auto weight_inner = [=](const int& num_elems) { return is_packed_fp4 ? num_elems / 2 : num_elems; };
     const int block_k_inner = to_inner(config.block_k);
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
+
+    // SM107 K=64 MMA: routed FP4 weights are loaded packed with 64B swizzle, and the shared expert's activations
+    // and FP8 weights are loaded in 64-wide K halves with 64B swizzle
+    const bool use_k64 = config.use_sm107_k64;
+    DG_HOST_ASSERT(not use_k64 or (not use_trtllm_weights and config.block_k == 128 and to_inner(config.block_k) == 128));
+    const int routed_weights_swizzle_mode = use_k64 ? 64 : config.swizzle_weights_mode;
+    const int shared_block_k_inner = use_k64 ? block_k_inner / 2 : block_k_inner;
+    const int shared_acts_swizzle_mode = use_k64 ? 64 : config.swizzle_acts_mode;
+    const int shared_weights_swizzle_mode = use_k64 ? 64 : config.swizzle_weights_mode;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      to_inner(hidden), config.num_ring_tokens,
                                                      block_k_inner, config.load_block_m,
@@ -150,7 +160,7 @@ static void sm100_fp8_fp4_mega_moe(
                          block_k_inner, config.load_block_n,
                          static_cast<int>(l1_weights.stride(-2)),
                          config.swizzle_weights_mode, 0, false, not is_packed_fp4) :
-        make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, config.swizzle_weights_mode);
+        make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
     const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
@@ -180,7 +190,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
     const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
-        make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, config.swizzle_weights_mode);
+        make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
     const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
@@ -193,9 +203,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l1_acts,
         to_inner(hidden), num_max_tokens_per_rank,
-        block_k_inner, config.load_block_m,
+        shared_block_k_inner, config.load_block_m,
         static_cast<int>(shared_l1_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l1_acts;
+        shared_acts_swizzle_mode) : tensor_map_l1_acts;
     const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l1_acts_sf,
         static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
@@ -203,7 +213,7 @@ static void sm100_fp8_fp4_mega_moe(
         1, 0, 0, false,
         sf_smem_outer_dim, static_cast<int>(shared_l1_acts_sf.stride(-1))) : tensor_map_l1_acts_sf;
     const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(weight_tensor(shared_l1_weights), block_k_inner, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l1_weights;
+        make_tma_weights_2d_desc(weight_tensor(shared_l1_weights), shared_block_k_inner, config.load_block_n, shared_weights_swizzle_mode) : tensor_map_l1_weights;
     const auto tensor_map_shared_l1_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l1_weights_sf,
         shared_intermediate_hidden * 2, hidden,
@@ -219,9 +229,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         to_inner(shared_intermediate_hidden), num_max_tokens_per_rank,
-        block_k_inner, config.load_block_m,
+        shared_block_k_inner, config.load_block_m,
         static_cast<int>(shared_l2_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l2_acts;
+        shared_acts_swizzle_mode) : tensor_map_l2_acts;
     const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l2_acts_sf,
         static_cast<int>(shared_l2_acts_sf.size(0)), shared_intermediate_hidden,
@@ -229,7 +239,7 @@ static void sm100_fp8_fp4_mega_moe(
         1, 0, 0, false,
         sf_smem_outer_dim, static_cast<int>(shared_l2_acts_sf.stride(-1))) : tensor_map_l2_acts_sf;
     const auto tensor_map_shared_l2_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(weight_tensor(shared_l2_weights), block_k_inner, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l2_weights;
+        make_tma_weights_2d_desc(weight_tensor(shared_l2_weights), shared_block_k_inner, config.load_block_n, shared_weights_swizzle_mode) : tensor_map_l2_weights;
     const auto tensor_map_shared_l2_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
         cute::UMMA::Major::MN, shared_l2_weights_sf,
         hidden, shared_intermediate_hidden,
@@ -271,7 +281,8 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {}, {}, {}, {},
         {}, {},
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {},
+        {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -302,7 +313,9 @@ static void __instantiate_kernel() {{
     post_norm_weight_first ? "true" : "false",
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
-    use_trtllm_weights ? "true" : "false"));
+    use_trtllm_weights ? "true" : "false",
+    config.use_sm107_k64 ? "true" : "false",
+    config.use_simt_pull ? "true" : "false"));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {
