@@ -205,7 +205,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const torch::Tensor& block_table,
                                               const torch::Tensor& schedule_meta,
                                               const int& max_context_len,
-                                              const std::optional<torch::Tensor>& indices) {
+                                              const std::optional<torch::Tensor>& indices,
+                                              const std::optional<torch::Tensor>& histogram) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
     const bool is_fp4 = qk_dtype == kPackedFP4;
@@ -268,6 +269,20 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
     }
 
+    // Check the optional coarse histogram: every stored non-NaN BF16 score is added to int32 `[rows, 1024]`
+    int* histogram_ptr = nullptr;
+    if (histogram.has_value()) {
+        DG_HOST_ASSERT(arch_major == 10 and "The paged MQA logits histogram requires SM100");
+        DG_HOST_ASSERT((num_heads == 32 or num_heads == 64) and "The paged MQA logits histogram supports 32 or 64 heads");
+        DG_HOST_ASSERT(histogram->device() == q_fp.device());
+        DG_HOST_ASSERT(histogram->scalar_type() == torch::kInt and histogram->is_contiguous());
+        DG_HOST_ASSERT(histogram->dim() == 2 and histogram->size(0) == batch_size * next_n and
+                       histogram->size(1) == kMQALogitsHistogramBins);
+        // Bin pairs are added as 64-bit words
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(histogram->data_ptr()) % 8 == 0);
+        histogram_ptr = histogram->data_ptr<int>();
+    }
+
     // Check schedule metadata
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
     DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
@@ -299,10 +314,10 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 
     // Dispatch implementation
     if (arch_major == 10) {
-        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, true);
+        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, true, histogram.has_value());
         sm100_paged_mqa_logits(config, q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits,
                                block_table, indices_tensor, schedule_meta, batch_size, num_kv_blocks, block_kv,
-                               aligned_max_context_len, block_table_stride);
+                               aligned_max_context_len, block_table_stride, histogram_ptr);
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
         DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
@@ -498,7 +513,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"),
-          py::arg("indices") = std::nullopt);
+          py::arg("indices") = std::nullopt, py::arg("histogram") = std::nullopt);
     m.def("get_sparse_mqa_logits_metadata", &get_sparse_mqa_logits_metadata,
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"), py::arg("num_kv_tokens"),
           py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"),

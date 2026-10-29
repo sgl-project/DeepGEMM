@@ -13,6 +13,7 @@ from deep_gemm.testing import (
 )
 from deep_gemm.utils import (ceil_div, per_token_cast_to_fp4, cast_back_from_fp4, per_token_cast_to_fp8,
                              cast_back_from_fp8, per_custom_dims_cast_to_fp8)
+from utils import ref_coarse_histogram
 
 
 def select_release_mqa_cases(cases: List[tuple]) -> List[tuple]:
@@ -35,7 +36,7 @@ def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
     elif num_cases is None:
         selected = cases
     else:
-        rng = random.Random({'prefill': 0, 'paged': 100000, 'sparse': 200000}[name])
+        rng = random.Random({'prefill': 0, 'paged': 100000, 'sparse': 200000, 'histogram': 300000}[name])
         selected = rng.sample(cases, min(int(num_cases), len(cases)))
     coverage = ' [release profile: reduced coverage]' if profile == 'release' else ''
     print(f' > {name}: running {len(selected)}/{len(cases)} cases{coverage}')
@@ -455,6 +456,165 @@ def test_paged_mqa_logits():
     print()
 
 
+def make_paged_histogram_case(fmt: str, num_heads: int, block_kv: int, request_lens: List[int], tokens_per_request: int,
+                              scores: str, seed: int):
+    """Paged MQA inputs for `test_paged_mqa_logits_histogram`: one row per token, `tokens_per_request` rows per request
+    (equal `indices`, causal lengths ending at the request length, the request's block table on every row). Requests
+    draw their pages from one shared pool (prefix sharing), so long rows stay cheap. `scores` sets the weights:
+    'fine' keeps |score| < 16 (FP16 bins), 'unit' gives |score| >= 16 with a random sign per row (unit bins, as GLM
+    indexer layers past the first), 'mixed' crosses |x| = 16 inside every warp, 'special' adds NaN, +-inf and +0 rows."""
+    head_dim = 128
+    generator = torch.Generator(device='cuda').manual_seed(seed)
+    num_requests, n = len(request_lens), tokens_per_request
+    request_lens_t = torch.tensor(request_lens, device='cuda', dtype=torch.int)
+    indices = torch.arange(num_requests, device='cuda', dtype=torch.int).repeat_interleave(n)
+    offsets = torch.arange(n, device='cuda', dtype=torch.int).repeat(num_requests)
+    context_lens = (request_lens_t.repeat_interleave(n) - (n - 1) + offsets).clamp(min=0).view(-1, 1).contiguous()
+    num_rows = num_requests * n
+
+    max_blocks = max(1, ceil_div(max(request_lens), block_kv))
+    kv = torch.randn((max_blocks, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16, generator=generator)
+    kv_in, _ = {'mxfp4': kv_cache_cast_to_mxfp4, 'mxfp8': kv_cache_cast_to_mxfp8}[fmt](kv)
+    del kv
+    block_table = torch.stack([torch.randperm(max_blocks, device='cuda', generator=generator)
+                               for _ in range(num_requests)]).int().repeat_interleave(n, dim=0).contiguous()
+
+    q = torch.randn((num_rows, 1, num_heads, head_dim), device='cuda', dtype=torch.bfloat16, generator=generator)
+    q_in, _ = quantize_mqa_q(q, fmt)
+    weights = torch.randn((num_rows, num_heads), device='cuda', dtype=torch.float, generator=generator)
+    if scores == 'fine':
+        weights = weights / 64
+    elif scores == 'unit':
+        signs = torch.randint(0, 2, (num_rows, 1), device='cuda', generator=generator) * 2 - 1
+        weights = (weights.abs() * 0.5 + 0.5) * signs
+    elif scores == 'special':
+        special = [float('nan'), float('inf'), -float('inf'), 0.0, 3e38]
+        for row, value in zip(range(0, num_rows, 2), special):
+            weights[row] = value
+    kernel_weights = to_mqa_weights(weights.to(torch.bfloat16))
+    return dict(q=q_in, kv_cache=kv_in, weights=kernel_weights, context_lens=context_lens, block_table=block_table,
+                max_context_len=max(max(request_lens), 1), indices=indices)
+
+
+def check_paged_histogram(kwargs: dict, block_kv: int, label: str):
+    """Logits are bit-identical with and without the histogram; the histogram equals the reference over the stored BF16
+    logits and accumulates across calls."""
+    context_lens = kwargs['context_lens']
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv, deep_gemm.get_num_sms(),
+                                                            indices=kwargs['indices'])
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta)
+    histogram = torch.zeros((context_lens.size(0), 1024), device='cuda', dtype=torch.int)
+    hist_logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta, histogram=histogram)
+    stored = torch.arange(logits.size(1), device='cuda')[None, :] < context_lens
+    assert_bitwise_equal(hist_logits.view(torch.int16).masked_fill(~stored, 0),
+                         logits.view(torch.int16).masked_fill(~stored, 0), f'{label}: histogram variant logits')
+    ref_hist = ref_coarse_histogram(logits, context_lens)
+    assert torch.equal(histogram, ref_hist), f'{label}: histogram mismatch in rows ' \
+        f'{(histogram != ref_hist).any(dim=1).nonzero().view(-1)[:8].tolist()}'
+    deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta, histogram=histogram)
+    assert torch.equal(histogram, 2 * ref_hist), f'{label}: the histogram must accumulate'
+    return schedule_meta, histogram
+
+
+@test_filter(lambda: get_arch_major() == 10)
+def test_paged_mqa_logits_histogram():
+    # Optional coarse histogram of the stored scores (LiteTopK decode): int32 [rows, 1024], exact for every stored
+    # non-NaN BF16 score, added to the caller's tensor; SM100, 32 or 64 heads, MXFP8 (GLM / DSA) and MXFP4 (V4.1)
+    print('Testing Paged MQA Logits with the optional coarse histogram:')
+    rng = random.Random(0)
+
+    def enumerate_paged_mqa_logits_histogram():
+        for fmt, num_heads, block_kv in (('mxfp8', 32, 64), ('mxfp8', 64, 64), ('mxfp4', 32, 128), ('mxfp4', 64, 32)):
+            for scores in ('fine', 'unit', 'mixed', 'special'):
+                for num_requests, tokens_per_request, avg_kv in ((1, 1, 4096), (16, 1, 65536), (128, 1, 4096),
+                                                                 (64, 1, 262144), (8, 2, 32768), (8, 4, 65536),
+                                                                 (32, 6, 16384), (2, 3, 1048576)):
+                    yield (fmt, dtype_tag(torch.bfloat16), num_heads, block_kv, scores,
+                           num_requests, tokens_per_request, avg_kv)
+
+    for fmt, _, num_heads, block_kv, scores, num_requests, tokens_per_request, avg_kv in \
+            sample_mqa_cases('histogram', list(enumerate_paged_mqa_logits_histogram())):
+        request_lens = [rng.randint(int(0.7 * avg_kv), int(1.3 * avg_kv)) for _ in range(num_requests)]
+        kwargs = make_paged_histogram_case(fmt, num_heads, block_kv, request_lens, tokens_per_request, scores,
+                                           seed=rng.randrange(1 << 30))
+        label = f'{fmt} H{num_heads} {scores} B={num_requests} TPR={tokens_per_request} L={avg_kv}'
+        schedule_meta, histogram = check_paged_histogram(kwargs, block_kv, label)
+        t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta),
+                         'paged_mqa_logits', suppress_kineto_output=True)
+        hist_t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta,
+                                                                         histogram=histogram),
+                              'paged_mqa_logits', suppress_kineto_output=True)
+        print(f' > Fmt={fmt:5}, H={num_heads:2}, PAGE_KV={block_kv:3}, {scores:7} scores, BSZ={num_requests:3}, '
+              f'TPR={tokens_per_request}, L={avg_kv:7}: {t * 1e6:7.1f} us -> {hist_t * 1e6:7.1f} us with histogram '
+              f'({(hist_t / t - 1) * 100:+5.1f}%)')
+        del kwargs, schedule_meta, histogram
+        torch.cuda.empty_cache()
+
+    # Edge lengths (empty rows, partial and exact splits and pages), 1-6 tokens per request, without and with PDL
+    use_pdl = deep_gemm.get_pdl()
+    try:
+        for pdl in (False, True):
+            deep_gemm.set_pdl(pdl)
+            for fmt, num_heads, block_kv in (('mxfp8', 32, 64), ('mxfp8', 64, 128), ('mxfp4', 32, 128)):
+                for n in range(1, 7):
+                    request_lens = [0, 1, 383, 384, 385, 767, 768, 1000, 4097, 0, 5, 131071]
+                    kwargs = make_paged_histogram_case(fmt, num_heads, block_kv, request_lens, n, 'mixed', seed=n)
+                    check_paged_histogram(kwargs, block_kv, f'{fmt} H{num_heads} edge lengths TPR={n} PDL={pdl}')
+    finally:
+        deep_gemm.set_pdl(use_pdl)
+    print(' > Edge lengths (0..131071, 1-6 tokens per request, PDL off / on): passed')
+
+    # Forced SM counts: one SM runs a 1M row as several tasks capped by the 16-bit window budget
+    num_sms = deep_gemm.get_num_sms()
+    try:
+        for forced_num_sms in (1, 7, 100):
+            deep_gemm.set_num_sms(forced_num_sms)
+            for fmt, num_heads, block_kv, n in (('mxfp8', 32, 64, 1), ('mxfp4', 32, 128, 5), ('mxfp8', 64, 64, 3)):
+                request_lens = [1 << 20, 70000, 0, 513] if forced_num_sms > 1 else [1 << 20]
+                kwargs = make_paged_histogram_case(fmt, num_heads, block_kv, request_lens, n, 'mixed', seed=forced_num_sms)
+                check_paged_histogram(kwargs, block_kv, f'{fmt} H{num_heads} TPR={n} SMs={forced_num_sms}')
+    finally:
+        deep_gemm.set_num_sms(num_sms)
+    print(' > Forced SM counts 1 / 7 / 100: passed')
+
+    # CUDA graph: zeroing and scoring captured once, replayed with new lengths and request grouping. Capture
+    # allocates the outputs from the caching allocator, which the sanitizer runner disables
+    if os.getenv('PYTORCH_NO_CUDA_MEMORY_CACHING', '0') == '1':
+        print(' > CUDA graph replay: skipped (PYTORCH_NO_CUDA_MEMORY_CACHING=1)')
+        print()
+        return
+    for fmt, num_heads, block_kv in (('mxfp8', 32, 64), ('mxfp4', 32, 128)):
+        n, num_requests, width = 4, 6, 32768
+        kwargs = make_paged_histogram_case(fmt, num_heads, block_kv, [width] * num_requests, n, 'mixed', seed=7)
+        context_lens, indices = kwargs['context_lens'], kwargs['indices']
+        histogram = torch.zeros((context_lens.size(0), 1024), device='cuda', dtype=torch.int)
+
+        def produce(hist=None):
+            schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv, deep_gemm.get_num_sms(),
+                                                                    indices=indices)
+            return deep_gemm.fp8_fp4_paged_mqa_logits(**kwargs, schedule_meta=schedule_meta, histogram=hist)
+
+        produce(histogram)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            histogram.zero_()
+            graph_logits = produce(histogram)
+        for length in (0, 1, 383, 385, 4096, width):
+            rows = torch.arange(context_lens.size(0), device='cuda', dtype=torch.int)
+            context_lens.copy_((length - n + 1 + rows % n).clamp(min=0).view(-1, 1))
+            # Odd lengths break the requests into single rows (same page tables)
+            indices.copy_(rows // (n if length % 2 == 0 else 1))
+            graph.replay()
+            logits = produce()
+            stored = torch.arange(logits.size(1), device='cuda')[None, :] < context_lens
+            assert_bitwise_equal(graph_logits.view(torch.int16).masked_fill(~stored, 0),
+                                 logits.view(torch.int16).masked_fill(~stored, 0), 'graph replay logits')
+            assert torch.equal(histogram, ref_coarse_histogram(logits, context_lens)), \
+                f'graph replay histogram, length {length}'
+    print(' > CUDA graph replay: passed')
+    print()
+
+
 def make_sparse_kv_block_indices(context_lens: List[int], request_indices: List[int] | None,
                                  sparse_block_kv: int, num_max_sparse_blocks: int,
                                  seed: int, context_starts: List[int] | None = None) -> Tuple[torch.Tensor, List[int]]:
@@ -728,4 +888,5 @@ if __name__ == '__main__':
 
     test_mqa_logits()
     test_paged_mqa_logits()
+    test_paged_mqa_logits_histogram()
     test_sparse_mqa_logits()
