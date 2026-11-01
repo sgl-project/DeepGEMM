@@ -433,6 +433,37 @@ Tensor dg_get_mqa_logits_metadata(const Tensor& cu_seq_len_k_start, const Tensor
                                               static_cast<int>(num_kv_tokens), static_cast<int>(num_heads));
 }
 
+Tensor dg_get_paged_mqa_logits_metadata_legacy(const Tensor& context_lens, int64_t block_kv,
+                                               int64_t num_sms, const OptTensor& indices) {
+    return attention::get_paged_mqa_logits_metadata_legacy(context_lens, static_cast<int>(block_kv),
+                                                           static_cast<int>(num_sms), indices);
+}
+
+Tensor dg_fp8_fp4_mqa_logits_legacy(const Tensor& q, const OptTensor& q_sf, const Tensor& kv_data, const Tensor& kv_sf,
+                                    const Tensor& weights, const Tensor& cu_seq_len_k_start,
+                                    const Tensor& cu_seq_len_k_end, bool clean_logits, int64_t max_seqlen_k,
+                                    at::ScalarType logits_dtype, const OptTensor& schedule_meta) {
+    return attention::fp8_fp4_mqa_logits_legacy(
+        std::make_tuple(q, q_sf), {kv_data, kv_sf}, weights, cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, static_cast<int>(max_seqlen_k), logits_dtype, schedule_meta);
+}
+
+Tensor dg_fp8_fp4_paged_mqa_logits_legacy(const Tensor& q, const OptTensor& q_sf, const Tensor& fused_kv_cache,
+                                          const Tensor& weights, const Tensor& context_lens,
+                                          const Tensor& block_table, const Tensor& schedule_meta,
+                                          int64_t max_context_len, bool clean_logits,
+                                          at::ScalarType logits_dtype, const OptTensor& indices) {
+    return attention::fp8_fp4_paged_mqa_logits_legacy(
+        std::make_tuple(q, q_sf), fused_kv_cache, weights, context_lens, block_table, schedule_meta,
+        static_cast<int>(max_context_len), clean_logits, logits_dtype, indices);
+}
+
+Tensor dg_get_mqa_logits_metadata_legacy(const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
+                                         int64_t num_kv_tokens, int64_t num_heads) {
+    return attention::get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end,
+                                                     static_cast<int>(num_kv_tokens), static_cast<int>(num_heads));
+}
+
 Tensor dg_get_sparse_mqa_logits_metadata(const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
                                          int64_t num_kv_tokens, const Tensor& sparse_kv_block_indices,
                                          at::ScalarType qk_dtype, int64_t sparse_block_kv, bool use_unaligned_ks) {
@@ -796,6 +827,15 @@ TORCH_LIBRARY(deep_gemm, m) {
           "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, Tensor? indices) -> Tensor");
     m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
           "int num_heads) -> Tensor");
+    m.def("get_paged_mqa_logits_metadata_legacy(Tensor context_lens, int block_kv, int num_sms, Tensor? indices) -> Tensor");
+    m.def("fp8_fp4_mqa_logits_legacy(Tensor q, Tensor? q_sf, Tensor kv_data, Tensor kv_sf, Tensor weights, "
+          "Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits, int max_seqlen_k, "
+          "ScalarType logits_dtype, Tensor? schedule_meta) -> Tensor");
+    m.def("fp8_fp4_paged_mqa_logits_legacy(Tensor q, Tensor? q_sf, Tensor fused_kv_cache, Tensor weights, "
+          "Tensor context_lens, Tensor block_table, Tensor schedule_meta, int max_context_len, bool clean_logits, "
+          "ScalarType logits_dtype, Tensor? indices) -> Tensor");
+    m.def("get_mqa_logits_metadata_legacy(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
+          "int num_heads) -> Tensor");
     m.def("get_sparse_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
           "Tensor sparse_kv_block_indices, ScalarType qk_dtype, int sparse_block_kv, bool use_unaligned_ks) -> Tensor");
     m.def("get_paged_sparse_mqa_logits_metadata(Tensor context_lens, Tensor block_table, Tensor indices, int page_kv, "
@@ -891,6 +931,10 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("fp8_fp4_mqa_logits", &dg_fp8_fp4_mqa_logits);
     m.impl("fp8_fp4_paged_mqa_logits", &dg_fp8_fp4_paged_mqa_logits);
     m.impl("get_mqa_logits_metadata", &dg_get_mqa_logits_metadata);
+    m.impl("get_paged_mqa_logits_metadata_legacy", &dg_get_paged_mqa_logits_metadata_legacy);
+    m.impl("fp8_fp4_mqa_logits_legacy", &dg_fp8_fp4_mqa_logits_legacy);
+    m.impl("fp8_fp4_paged_mqa_logits_legacy", &dg_fp8_fp4_paged_mqa_logits_legacy);
+    m.impl("get_mqa_logits_metadata_legacy", &dg_get_mqa_logits_metadata_legacy);
     m.impl("get_sparse_mqa_logits_metadata", &dg_get_sparse_mqa_logits_metadata);
     m.impl("get_paged_sparse_mqa_logits_metadata", &dg_get_paged_sparse_mqa_logits_metadata);
     m.impl("fp8_fp4_sparse_mqa_logits", &dg_fp8_fp4_sparse_mqa_logits);
