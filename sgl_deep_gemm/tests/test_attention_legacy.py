@@ -296,6 +296,19 @@ def test_mqa_logits():
                 logits_again = logits_again.masked_fill(~self_mask, 0)
             assert_bitwise_equal(logits_again, masked_logits, 'mqa logits self-consistency')
 
+        # 0.2.3 call shapes reach the same kernels through the current API names
+        k = kernel_kwargs
+        old_calls = [lambda: deep_gemm.fp8_fp4_mqa_logits(k['q'], k['kv'], k['weights'], ks, ke, k['clean_logits'],
+                                                          k['max_seqlen_k'], logits_dtype=k['logits_dtype'])]
+        if fmt == 'fp8' and logits_dtype == torch.float and weights_dtype == torch.float:
+            old_calls.append(lambda: deep_gemm.fp8_mqa_logits(k['q'][0], k['kv'], k['weights'], ks, ke,
+                                                              clean_logits=k['clean_logits'], max_seqlen_k=k['max_seqlen_k']))
+        for old_call in old_calls:
+            old_logits = old_call()
+            if compressed_logits:
+                old_logits = old_logits.masked_fill(~self_mask, 0)
+            assert_bitwise_equal(old_logits, masked_logits, 'mqa logits through the 0.2.3 signature')
+
         workspace = None
         if get_arch_major() == 10:
             workspace = deep_gemm.get_mqa_logits_metadata_legacy(ks, ke, seq_len_kv, num_heads)
@@ -587,6 +600,18 @@ def test_paged_mqa_logits():
             logits_again = deep_gemm.fp8_fp4_paged_mqa_logits_legacy(**kernel_kwargs).masked_fill(~self_mask, 0)
             assert_bitwise_equal(logits_again, masked_logits, 'paged mqa logits self-consistency')
 
+        # 0.2.3 call shapes, with the metadata of the shared `get_paged_mqa_logits_metadata` name
+        if not is_varlen:
+            k = kernel_kwargs
+            schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, block_kv, deep_gemm.get_num_sms())
+            old_calls = [lambda: deep_gemm.fp8_fp4_paged_mqa_logits(k['q'], k['kv_cache'], k['weights'], context_lens_nextn, block_table,
+                                                                    schedule_meta, max_model_len, False, logits_dtype=logits_dtype)]
+            if fmt == 'fp8' and logits_dtype == torch.float and weights_dtype == torch.float:
+                old_calls.append(lambda: deep_gemm.fp8_paged_mqa_logits(k['q'][0], k['kv_cache'], k['weights'], context_lens_nextn,
+                                                                        block_table, schedule_meta, max_model_len, clean_logits=False))
+            for old_call in old_calls:
+                assert_bitwise_equal(old_call().masked_fill(~self_mask, 0), masked_logits, 'paged mqa logits through the 0.2.3 signature')
+
         # Validation
         assert logits.dtype == logits_dtype
         logits = logits.to(torch.float)
@@ -636,9 +661,6 @@ def test_paged_mqa_logits():
     print()
 
 if __name__ == '__main__':
-    if get_arch_major() != 10:
-        print('Legacy MQA logits are SM100-only, skipping')
-        raise SystemExit(0)
     torch.manual_seed(0)
     random.seed(0)
 

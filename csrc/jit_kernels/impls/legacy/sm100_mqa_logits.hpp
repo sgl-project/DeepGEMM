@@ -163,10 +163,16 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
     const bool is_fp4 = qk_dtype == kPackedFP4;
 
     constexpr int num_specialized_threads = 128;
-    const int num_math_threads = 2 * 128;
+    // One math warpgroup per 128-token KV tile of the split
+    DG_HOST_ASSERT(split_kv == 256 or split_kv == 384);
+    const bool wide_split = split_kv == 384;
+    const int num_math_threads = split_kv / 128 * 128;
     const int num_q_stages = 3;
-    // Use the deepest KV pipeline that fits with headroom.
-    const int num_kv_stages = is_fp4 ? 10 : 5;
+    // Use the deepest KV pipeline that fits with headroom; with the 384-token split, FP4 is fastest at
+    // 7 KV stages (5 to 8 measured)
+    const int num_kv_stages = wide_split ? (is_fp4 ? 7 : 3) : (is_fp4 ? 10 : 5);
+    // A TMA box spans at most 256 rows, so the 384-token split loads in 128-token pieces
+    const int kv_tma_tokens = split_kv % 256 == 0 ? 256 : 128;
 
     const bool is_compressed_logits = (max_seqlen_k > 0);
     const int num_sms = runtime->get_num_sms();
@@ -196,12 +202,12 @@ static void sm100_mqa_logits(const torch::Tensor& q, const std::optional<torch::
                                     static_cast<int>(q.stride(1)),
                                     swizzle_mode, 0, false, not is_fp4);
     tensor_map_kv = make_tma_2d_desc(kv, head_dim, num_kv_tokens,
-                                     head_dim, split_kv,
+                                     head_dim, kv_tma_tokens,
                                      static_cast<int>(kv.stride(0)),
                                      swizzle_mode, 0, false, not is_fp4);
     tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
                                         get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())), 1,
-                                        split_kv, 1, 0, 0);
+                                        kv_tma_tokens, 1, 0, 0);
     if (is_mx_sf) {
         tensor_map_sf_q = make_tma_2d_desc(sf_q.value(), num_heads, num_q_tokens,
                                            num_heads, block_q,
