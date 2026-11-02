@@ -282,7 +282,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -315,7 +315,8 @@ static void __instantiate_kernel() {{
     to_string(post_norm_eps),
     use_trtllm_weights ? "true" : "false",
     config.use_sm107_k64 ? "true" : "false",
-    config.use_simt_pull ? "true" : "false"));
+    config.use_simt_pull ? "true" : "false",
+    config.num_pull_stages));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {

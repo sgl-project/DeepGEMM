@@ -48,7 +48,7 @@ struct MegaMoEConfig {
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
     // Dispatch pull config
-    int num_bytes_per_pull;
+    int num_bytes_per_pull, num_pull_stages;
 
     // SM107 K=64 `kind::mxf8f6f4` MMAs on packed FP4 weights, and the SIMT dispatch pull
     bool use_sm107_k64, use_simt_pull;
@@ -68,6 +68,7 @@ struct MegaMoEConfig {
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
            << ", num_bytes_per_pull=" << config.num_bytes_per_pull
+           << ", num_pull_stages=" << config.num_pull_stages
            << ", use_sm107_k64=" << config.use_sm107_k64 << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
     }
@@ -213,7 +214,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const MmaKind& mma_kind,
-    const bool& use_sm107_k64 = false, const bool& use_simt_pull = false) {
+    const bool& use_sm107_k64 = false, const bool& use_simt_pull = false,
+    const int num_pull_stages = 0) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -225,10 +227,18 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Dispatch region
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
-    const int smem_send_buffers_size = align(use_simt_pull ? 16 * num_dispatch_warps :
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
-        kSmemAlignment);
+    const int pull_record_bytes = hidden * elem_bits / 8 + hidden / gran_k + 16 + 16 + 32;
+    int send_buffer_bytes;
+    if (num_pull_stages) {
+        send_buffer_bytes = num_dispatch_warps * num_pull_stages * pull_record_bytes;
+    } else if (use_simt_pull) {
+        // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
+        send_buffer_bytes = 16 * num_dispatch_warps;
+    } else {
+        send_buffer_bytes = static_cast<int>(
+            layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes());
+    }
+    const int smem_send_buffers_size = align(send_buffer_bytes, kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
@@ -243,7 +253,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
     // + schedule task publish full/empty barriers.
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
+    const int smem_barriers = (num_dispatch_warps * std::max(num_pull_stages, 1) + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
@@ -328,6 +338,16 @@ static MegaMoEConfig get_mega_moe_config(
     const bool use_simt_pull = mma_kind == MmaKind::MXFP8FP4 and (hidden * get_element_bits(mma_kind) / 8) % 512 == 0 and
         (simt_pull_env < 0 ? use_sm107_k64 : simt_pull_env != 0);
 
+    // Pipeline whole NVFP4 tokens, scales and routing weights through independent TMA slots.
+    // Ring reuse needs additional retirement ordering, so retain its existing dispatch path.
+    // API dispatch already restricts this kernel to SM10x.
+    const bool can_stage_pulls = mma_kind == MmaKind::NVFP4 and hidden % 256 == 0 and
+        num_bytes_per_pull == hidden / 2 and num_ring_tokens >= layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    const int requested_pull_stages = deep_jit::get_env<int>("DG_MEGA_MOE_PULL_STAGES", 2);
+    DG_HOST_ASSERT(0 <= requested_pull_stages and requested_pull_stages <= 8);
+    const int num_pull_stages = can_stage_pulls ? requested_pull_stages : 0;
+
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         get_smem_capacity_for_mega_moe(block_m, use_simt_pull),
@@ -335,7 +355,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind, use_sm107_k64, use_simt_pull);
+        mma_kind, use_sm107_k64, use_simt_pull, num_pull_stages);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -345,7 +365,7 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull,
+        num_bytes_per_pull, num_pull_stages,
         use_sm107_k64, use_simt_pull
     };
 

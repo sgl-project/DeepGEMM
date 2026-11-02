@@ -9,6 +9,7 @@
 #   - the kernel's BLOCK_M matches `get_block_m_for_mega_moe` with the same hint,
 #     and on idle ranks it differs from the unhinted choice (the hint has teeth)
 #   - out-of-range hints are rejected
+#   - staging off/on preserve outputs and receive counts
 #
 # Usage:
 #   python3 sgl_deep_gemm/tests/test_mega_moe_global_tokens.py --num-processes 8
@@ -25,10 +26,13 @@ import tempfile
 import torch
 import torch.distributed as dist
 from typing import Dict, Optional, Tuple
+from unittest.mock import patch
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_nvfp4, transform_ue4m3_sf_into_required_layout
-from deep_gemm.utils.dist import dist_print, init_dist
+from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
+from test_mega_moe import _to_shared_mega_moe_sf_layout
+from utils import nvfp4_staging_variants
 
 GRAN_K = 16
 MMA_TYPE = 'nvfp4xnvfp4'
@@ -36,16 +40,19 @@ _CONFIG_LINE = re.compile(r'num_tokens=(\d+), global_num_tokens=(-?\d+),.*: Mega
 
 
 def cast_weights(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    is_shared = w.dim() == 2
+    w = w.unsqueeze(0) if is_shared else w
     num_groups, n, k = w.shape
     packed = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
     sf = torch.empty((num_groups, n, k // GRAN_K), device='cuda', dtype=torch.float)
     for i in range(num_groups):
         packed[i], sf[i] = per_token_cast_to_nvfp4(w[i], gran_k=GRAN_K)
-    return packed, transform_ue4m3_sf_into_required_layout(sf, n)
+    sf = transform_ue4m3_sf_into_required_layout(sf, n)
+    return (packed[0], sf[0]) if is_shared else (packed, sf)
 
 
 def tokens_per_rank(pattern: str, num_ranks: int, num_tokens: int) -> list:
-    if pattern == 'balanced':
+    if pattern in ('balanced', 'shared_only'):
         return [num_tokens] * num_ranks
     if pattern == 'single_first':
         return [num_tokens] + [0] * (num_ranks - 1)
@@ -102,7 +109,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > out-of-range hints rejected (valid range [0, {limit}])', once_in_node=True)
 
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        group, num_experts, num_max_tokens_per_rank, num_topk, hidden, inter, mma_type=MMA_TYPE)
+        group, num_experts, num_max_tokens_per_rank, num_topk, hidden, inter, mma_type=MMA_TYPE,
+        num_shared_experts=args.num_shared_experts)
 
     torch.manual_seed(rank_idx)
     l1 = torch.randn((num_local_experts, inter * 2, hidden), dtype=torch.bfloat16, device='cuda')
@@ -110,6 +118,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l1_weights, l2_weights = deep_gemm.transform_weights_for_mega_moe(
         cast_weights(l1), cast_weights(l2), 'swiglu', MMA_TYPE)
     del l1, l2
+    shared_l1_weights = shared_l2_weights = None
+    if args.num_shared_experts:
+        shared_inter = inter * args.num_shared_experts
+        shared_l1_weights, shared_l2_weights = deep_gemm.transform_weights_for_mega_moe(
+            cast_weights(torch.randn((shared_inter * 2, hidden), dtype=torch.bfloat16, device='cuda')),
+            cast_weights(torch.randn((hidden, shared_inter), dtype=torch.bfloat16, device='cuda')),
+            'swiglu', MMA_TYPE)
+    if args.use_localization:
+        def place(weights):
+            return (deep_gemm.localize(weights[0]), weights[1]) if weights is not None else None
+        l1_weights, l2_weights = place(l1_weights), place(l2_weights)
+        shared_l1_weights, shared_l2_weights = place(shared_l1_weights), place(shared_l2_weights)
 
     capture = ConfigCapture()
     dist_print(f'Config: {num_ranks} ranks x {num_local_experts} local experts, top-{num_topk}, '
@@ -126,6 +146,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             x_packed, x_sf = per_token_cast_to_nvfp4(x, gran_k=GRAN_K, use_packed_ue4m3=True)
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        if pattern == 'shared_only':
+            assert args.num_shared_experts > 0, 'shared_only requires shared experts'
+            topk_idx.fill_(-1)
+            topk_weights.zero_()
         # Idle ranks launch one masked row, as SGLang does: the binding needs a non-null `y`.
         num_rows = max(num_tokens, 1)
 
@@ -137,10 +161,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 buffer.x_sf[:num_tokens].copy_(x_sf)
                 buffer.topk_idx[:num_tokens].copy_(topk_idx)
                 buffer.topk_weights[:num_tokens].copy_(topk_weights)
+            if args.num_shared_experts:
+                buffer.shared_l1_acts_sf.zero_()
+                if num_tokens:
+                    block_m = deep_gemm.get_block_m_for_mega_moe(
+                        num_ranks, num_experts, num_max_tokens_per_rank, num_rows, num_topk, MMA_TYPE,
+                        global_num_tokens=hint)
+                    buffer.shared_l1_acts_sf.copy_(_to_shared_mega_moe_sf_layout(
+                        x_sf, block_m, buffer.shared_l1_acts_sf.size(0)))
             y = torch.empty((num_rows, hidden), dtype=torch.bfloat16, device='cuda')
             deep_gemm.nvfp4_mega_moe(
                 y, l1_weights, l2_weights, buffer,
                 cumulative_local_expert_recv_stats=recv_stats,
+                shared_l1_weights=shared_l1_weights, shared_l2_weights=shared_l2_weights,
                 fast_math=bool(args.fast_math), global_num_tokens=hint)
             return y[:num_tokens]
 
@@ -159,18 +192,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 f'get_block_m_for_mega_moe {expected} (hint={hint})'
             return y, stats, expected
 
-        y_local, stats_local, block_m_local = run_and_check(None)
-        y_global, stats_global, block_m_global = run_and_check(global_num_tokens)
-        assert torch.equal(y_local, y_global), \
-            f'[{pattern}] rank {rank_idx}: global_num_tokens changed the output, max |delta| ' \
-            f'{(y_local.float() - y_global.float()).abs().max().item() if num_tokens else 0:.3e}'
-        assert torch.equal(stats_local, stats_global), f'[{pattern}] rank {rank_idx}: receive counts differ'
-        num_received = stats_global.sum().clone()
-        dist.all_reduce(num_received, group=group)
-        num_routed = torch.tensor(num_tokens * num_topk, dtype=torch.int, device='cuda')
-        dist.all_reduce(num_routed, group=group)
-        assert num_received.item() == num_routed.item(), \
-            f'[{pattern}] received {num_received.item()} routed tokens, expected {num_routed.item()}'
+        routes = uneven_all_gather(topk_idx, group=group)
+        expected_stats = torch.bincount(routes[routes >= 0], minlength=num_experts)[
+            rank_idx * num_local_experts:(rank_idx + 1) * num_local_experts].int()
+        baseline = None
+        for stages in nvfp4_staging_variants():
+            with patch.dict(os.environ, DG_MEGA_MOE_PULL_STAGES=str(stages)):
+                for _ in range(args.staging_repeats):
+                    y_local, stats_local, block_m_local = run_and_check(None)
+                    y_global, stats_global, block_m_global = run_and_check(global_num_tokens)
+                    torch.testing.assert_close(y_local, y_global, rtol=0, atol=0)
+                    assert torch.isfinite(y_global).all(), f'[{pattern}] non-finite output'
+                    if pattern == 'shared_only':
+                        assert y_global.abs().sum() > 0, 'Shared-expert path is inactive'
+                    assert torch.equal(stats_local, expected_stats), f'[{pattern}] incorrect local-hint counts'
+                    assert torch.equal(stats_global, expected_stats), f'[{pattern}] incorrect global-hint counts'
+                    if baseline is None:
+                        baseline = y_global.clone()
+                    torch.testing.assert_close(y_global, baseline, rtol=0, atol=0)
 
         # Idle ranks are where the local estimate goes wrong; the hint must change their tile.
         if num_tokens == 0 and global_num_tokens >= num_ranks * num_max_tokens_per_rank // 8:
@@ -211,6 +250,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print('OK', once_in_node=True)
     dist.barrier()
     buffer.destroy()
+    deep_gemm.destroy_localizer()
     dist.destroy_process_group()
 
 
@@ -223,12 +263,17 @@ if __name__ == '__main__':
     parser.add_argument('--intermediate-hidden', type=int, default=512)
     parser.add_argument('--num-experts', type=int, default=16)
     parser.add_argument('--num-topk', type=int, default=4)
+    parser.add_argument('--num-shared-experts', type=int, default=0)
+    parser.add_argument('--use-localization', action='store_true')
     parser.add_argument('--fast-math', type=int, default=1)
+    parser.add_argument('--staging-repeats', type=int, default=3, help='repeat each staging variant for correctness')
     parser.add_argument('--patterns', type=str, default='balanced,single_first,single_last,uneven,all_idle')
     parser.add_argument('--bench', type=int, default=0, help='time each arm N times')
     parser.add_argument('--bench-patterns', type=str, default='single_first,uneven')
     args = parser.parse_args()
     assert args.num_experts % args.num_processes == 0
     assert args.num_tokens <= args.num_max_tokens_per_rank
+    assert args.staging_repeats > 0
+    assert args.num_shared_experts >= 0
     torch.multiprocessing.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)
     sys.exit(0)
