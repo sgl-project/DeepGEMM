@@ -118,6 +118,7 @@ DEFAULT_SINGLE_GPU_TESTS=(
   test_hyperconnection.py
   test_layout.py
   test_attention.py
+  test_attention_legacy.py
   test_legacy.py
 )
 SM120_SINGLE_GPU_TESTS=(
@@ -125,6 +126,7 @@ SM120_SINGLE_GPU_TESTS=(
   test_einsum.py
   test_fp8_fp4.py
   test_attention.py
+  test_attention_legacy.py
 )
 SM120_UNSUPPORTED_SINGLE_GPU_TESTS=(
   test_hyperconnection.py

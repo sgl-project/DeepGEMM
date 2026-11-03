@@ -154,16 +154,52 @@ try:
         d_data, d_sf = d if isinstance(d, (tuple, list)) else (d, None)
         _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d_data, d_sf, c, recipe, *_encode_epilogue(epilogue))
 
-    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices=None):
+    def _fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices=None):
         (q, q_sf) = q if isinstance(q, (tuple, list)) else (q, None)
         return _C.fp8_fp4_paged_mqa_logits(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, indices)
 
-    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
+    def _fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta=None):
         (q, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
         return _C.fp8_fp4_mqa_logits(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, max_seqlen_k, schedule_meta)
 
+    # 0.2.3 signatures: a bool `clean_logits` follows the fixed arguments, or `clean_logits` / `logits_dtype` is a keyword
+    def _is_legacy_mqa_call(args, kwargs):
+        return (len(args) > 0 and isinstance(args[0], bool)) or 'clean_logits' in kwargs or 'logits_dtype' in kwargs
+
+    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, *args, **kwargs):
+        fn = fp8_fp4_paged_mqa_logits_legacy if _is_legacy_mqa_call(args, kwargs) else _fp8_fp4_paged_mqa_logits
+        return fn(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, *args, **kwargs)
+
+    def fp8_fp4_mqa_logits(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, *args, **kwargs):
+        is_legacy = _is_legacy_mqa_call(args, kwargs) or not (args or 'max_seqlen_k' in kwargs)
+        fn = fp8_fp4_mqa_logits_legacy if is_legacy else _fp8_fp4_mqa_logits
+        return fn(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, *args, **kwargs)
+
+    # SM100's current metadata requires `indices`, so a call without them comes from the 0.2.3 API
     def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
+        if indices is None and torch.cuda.get_device_capability(context_lens.device)[0] == 10:
+            return _C.get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices)
         return _C.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
+
+    def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+        return fp8_fp4_mqa_logits_legacy(q, kv, weights, ks, ke, clean_logits, max_seqlen_k)
+
+    def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
+        return fp8_fp4_paged_mqa_logits_legacy(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, torch.float, indices)
+
+    def fp8_fp4_paged_mqa_logits_legacy(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
+        (q, q_sf) = q if isinstance(q, (tuple, list)) else (q, None)
+        return _C.fp8_fp4_paged_mqa_logits_legacy(q, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, logits_dtype, indices)
+
+    def fp8_fp4_mqa_logits_legacy(q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits=False, max_seqlen_k=0, logits_dtype=torch.float, schedule_meta=None):
+        (q, q_sf), (kv_data, kv_sf) = (q if isinstance(q, (tuple, list)) else (q, None)), _parse_tensor_or_tuple(kv)
+        return _C.fp8_fp4_mqa_logits_legacy(q, q_sf, kv_data, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k, logits_dtype, schedule_meta)
+
+    def get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices=None):
+        return _C.get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices)
+
+    def get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
+        return _C.get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads)
 
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)

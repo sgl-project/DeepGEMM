@@ -14,6 +14,10 @@
 
 namespace deep_gemm {
 
+struct SM107ArchSpec {
+    static constexpr int oversized_smem_capacity = 334848;
+};
+
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
 
