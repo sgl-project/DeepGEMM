@@ -6,6 +6,10 @@ from deep_gemm.testing import assert_bitwise_equal
 from deep_gemm.utils import align, ceil_div, get_mk_alignment_for_contiguous_layout
 
 
+def nvfp4_staging_variants():
+    return (0, 2)
+
+
 def assert_psum_zero_padding(a: torch.Tensor | tuple, d: torch.Tensor, grouped_layout: torch.Tensor, dtype_label: str) -> None:
     a_data = a[0] if isinstance(a, tuple) else a
     for group_idx, current_m in enumerate(grouped_layout.cpu().tolist()):

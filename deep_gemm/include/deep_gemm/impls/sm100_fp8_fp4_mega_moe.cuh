@@ -128,6 +128,7 @@ template <
     bool kUseSM107K64 = false,
     // SIMT dispatch pull (no SMEM send buffer)
     bool kUseSimtPull = false,
+    uint32_t kNumPullStages = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -356,6 +357,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
 
+    constexpr uint32_t kPullPayloadBytes = kHidden * kNumElemBits / 8;
+    constexpr uint32_t kPullSfOffset = kPullPayloadBytes;
+    constexpr uint32_t kPullSfBytes = kHidden / kGranK;
+    constexpr uint32_t kPullWeightOffset = kPullSfOffset + kPullSfBytes;
+    constexpr uint32_t kPullXScaleOffset = kPullWeightOffset + 16;
+    constexpr uint32_t kPullMetaOffset = kPullXScaleOffset + 16;
+    constexpr uint32_t kPullRecordBytes = kPullMetaOffset + 32;
+    constexpr uint32_t kPullStageCount = kNumPullStages ? kNumPullStages : 1;
+    constexpr uint32_t kDispatchBytesPerWarp = kNumPullStages ? kNumPullStages * kPullRecordBytes :
+        kUseSimtPull ? 16 : kNumBytesPerPull;
+    DG_STATIC_ASSERT(not kNumPullStages or (kRingCoversFullPool and
+        kIsNVFP4 and kNumBytesPerPull == kPullPayloadBytes and kPullSfBytes % 16 == 0),
+        "Staged pulls require full-pool NVFP4 with aligned whole tokens");
+
     // Scheduler configs
     constexpr uint32_t kNumScheduleStages = 2;
     constexpr uint32_t kNumScheduleConsumerThreads = 2 * kNumEpilogueThreads;
@@ -369,7 +384,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
         // NOTES: the SIMT pull goes through registers, so it needs no send buffer
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull];
+        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kDispatchBytesPerWarp];
         union {
             alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M_L2 * BLOCK_N];
@@ -380,7 +395,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / kSFChunkK)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
-        Barrier dispatch_barriers[kNumDispatchWarps];
+        Barrier dispatch_barriers[kNumDispatchWarps * kPullStageCount];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -424,7 +439,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == 1) {
         // Init m-barriers for dispatch
         #pragma unroll
-        for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
+        for (uint32_t i = lane_idx; i < kNumDispatchWarps * kPullStageCount; i += 32)
             shared_storage.dispatch_barriers[i].init(1);
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
@@ -639,6 +654,48 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
 
+        uint32_t issued = 0, retired = 0;
+        const auto stage_buffer = [&](uint32_t index) {
+            return shared_storage.dispatch_send_buffer[warp_idx] + index * kPullRecordBytes;
+        };
+        const auto retire_pull = [&]() {
+            const uint32_t index = retired % kPullStageCount;
+            auto* slot = stage_buffer(index);
+            const auto* meta = reinterpret_cast<const uint32_t*>(slot + kPullMetaOffset);
+            auto* barrier = &shared_storage.dispatch_barriers[warp_idx * kPullStageCount + index];
+            barrier->wait((retired / kPullStageCount) & 1);
+            const uint32_t pool_token_idx = meta[0];
+            const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+            const auto staged_sf = reinterpret_cast<const uint32_t*>(slot + kPullSfOffset);
+            #pragma unroll
+            for (uint32_t i = 0; i < math::constexpr_ceil_div(kPullSfBytes / 4, 32u); ++ i) {
+                const uint32_t j = i * 32 + lane_idx;
+                if (j < kPullSfBytes / 4)
+                    local_sf_ptr[j * kNumSFRingTokens + meta[7]] = staged_sf[j];
+            }
+            if (cute::elect_one_sync()) {
+                const auto token_idx = get_ring_token_idx(pool_token_idx);
+                *buffer.l1_topk_weights_buffer.get_data_buffer(token_idx).template get_base_ptr<float>() =
+                    reinterpret_cast<const float*>(slot + kPullWeightOffset)[meta[4]];
+                if constexpr (kUseXScales)
+                    *buffer.l1_x_scales_buffer.get_data_buffer(token_idx).template get_base_ptr<float>() =
+                        reinterpret_cast<const float*>(slot + kPullXScaleOffset)[meta[5]];
+                ptx::tma_store_1d(buffer.l1_token_buffer.get_data_buffer(token_idx).get_base_ptr(),
+                                  slot, kPullPayloadBytes);
+                cute::tma_store_arrive();
+            }
+            __syncwarp();
+            if (cute::elect_one_sync()) {
+                // Publish only after the local token store completes; then the slot can be reused.
+                ptx::tma_store_wait<0>();
+                *workspace.get_token_src_metadata_ptr(pool_token_idx) = {meta[1], meta[2], meta[3]};
+                ptx::red_add_rel(workspace.get_l1_full_count_ptr(
+                    get_ring_block_idx(pool_token_idx / BLOCK_M)), meta[6]);
+            }
+            __syncwarp();
+            ++ retired;
+        };
+
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
@@ -651,6 +708,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+            if constexpr (kNumPullStages > 0) {
+                if (issued - retired == kNumPullStages)
+                    retire_pull();
+            }
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -761,6 +822,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).get_base_ptr();
+            if constexpr (kNumPullStages > 0) {
+                const uint32_t index = issued % kNumPullStages;
+                auto* slot = stage_buffer(index);
+                auto* meta = reinterpret_cast<uint32_t*>(slot + kPullMetaOffset);
+                auto* barrier = &shared_storage.dispatch_barriers[warp_idx * kNumPullStages + index];
+                if (cute::elect_one_sync()) {
+                    meta[0] = pool_token_idx;
+                    meta[1] = current_rank_in_expert_idx;
+                    meta[2] = src_token_idx;
+                    meta[3] = src_topk_idx;
+                    meta[4] = src_token_topk_idx & 3u;
+                    meta[5] = src_token_idx & 3u;
+                    meta[6] = token_idx == expert_end_idx - 1 ? BLOCK_M - token_idx_in_expert % BLOCK_M : 1u;
+                    meta[7] = get_ring_block_idx(pool_block_idx) * SF_BLOCK_M +
+                              transform_sf_token_idx(token_idx_in_expert % BLOCK_M);
+                    ptx::mbarrier_arrive_and_set_tx(barrier,
+                        kPullPayloadBytes + kPullSfBytes + 16 + (kUseXScales ? 16 : 0));
+                    ptx::tma_load_1d(slot, src_base_ptr, barrier, kPullPayloadBytes);
+                    ptx::tma_load_1d(slot + kPullSfOffset, sym_buffer.map(
+                        buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                        current_rank_in_expert_idx), barrier, kPullSfBytes, cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                    // TMA requires aligned 16-byte transfers; select the scalar when retiring the slot.
+                    ptx::tma_load_1d(slot + kPullWeightOffset, sym_buffer.map(
+                        buffer.input_topk_weights_buffer.get_base_ptr<float>() + (src_token_topk_idx & ~3u),
+                        current_rank_in_expert_idx), barrier, 16, cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                    if constexpr (kUseXScales)
+                        ptx::tma_load_1d(slot + kPullXScaleOffset, sym_buffer.map(
+                            buffer.input_x_scales_buffer.get_base_ptr<float>() + (src_token_idx & ~3u),
+                            current_rank_in_expert_idx), barrier, 16, cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                }
+                __syncwarp();
+                ++ issued;
+                continue;
+            }
             if constexpr (kUseSimtPull) {
                 // SIMT pull: each lane loads its 16-byte slices of the token into registers, then stores them, with no
                 // SMEM bounce buffer and no TMA round trip. All remote loads of the token (data, SF and top-k weight) are
@@ -933,6 +1028,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             __syncwarp();
+        }
+
+        if constexpr (kNumPullStages > 0) {
+            while (retired < issued)
+                retire_pull();
         }
 
         // Clean workspace for the next usage, and also do cumulative stats

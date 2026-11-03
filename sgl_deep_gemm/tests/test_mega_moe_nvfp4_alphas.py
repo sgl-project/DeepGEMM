@@ -34,14 +34,17 @@
 #       python3 sgl_deep_gemm/tests/test_mega_moe_nvfp4_alphas.py --num-processes 2
 
 import argparse
+import os
 import sys
 import torch
 import torch.distributed as dist
+from unittest.mock import patch
 
 import deep_gemm
 from deep_gemm.utils import cast_to_ue4m3, transform_ue4m3_sf_into_required_layout
 from deep_gemm.utils.math import _quantize_to_fp4_e2m1
 from deep_gemm.utils.dist import dist_print, init_dist
+from utils import nvfp4_staging_variants
 
 GRAN_K = 16
 E4M3_MAX = 448.0
@@ -136,20 +139,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     def run(weights, l1_alphas=None, l2_alphas=None, expert_scales=None, tw=None,
             l2_act_scales=None):
-        deep_gemm.mega_moe_pre_dispatch(
-            x, topk_idx, topk_weights if tw is None else tw,
-            buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
-            num_tokens=num_tokens, group_size=GRAN_K, mma_type='nvfp4xnvfp4',
-            buf_x_scales=buffer.x_scales, expert_scales=expert_scales)
-        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.fp8_fp4_mega_moe(
-            y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
-            recipe=(1, 1, GRAN_K), activation='swiglu', fast_math=bool(args.fast_math),
-            use_x_scales=True, l1_alphas=l1_alphas, l2_alphas=l2_alphas,
-            l2_act_scales=l2_act_scales)
-        dist.barrier()
-        torch.cuda.synchronize()
-        return y
+        baseline = None
+        for stages in nvfp4_staging_variants() if args.check_staging else [None]:
+            env = {} if stages is None else dict(DG_MEGA_MOE_PULL_STAGES=str(stages))
+            with patch.dict(os.environ, env):
+                deep_gemm.mega_moe_pre_dispatch(
+                    x, topk_idx, topk_weights if tw is None else tw,
+                    buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
+                    num_tokens=num_tokens, group_size=GRAN_K, mma_type='nvfp4xnvfp4',
+                    buf_x_scales=buffer.x_scales, expert_scales=expert_scales)
+                y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                deep_gemm.fp8_fp4_mega_moe(
+                    y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
+                    recipe=(1, 1, GRAN_K), activation='swiglu', fast_math=bool(args.fast_math),
+                    use_x_scales=True, l1_alphas=l1_alphas, l2_alphas=l2_alphas,
+                    l2_act_scales=l2_act_scales)
+                dist.barrier()
+                torch.cuda.synchronize()
+                assert torch.isfinite(y).all(), 'non-finite output'
+                if baseline is None:
+                    baseline = y
+                torch.testing.assert_close(y, baseline, rtol=0, atol=0)
+        return baseline
 
     y_base = run(base_w)
     dist_print(f'Config: {num_ranks} ranks x {num_local_experts} local experts, '
@@ -223,6 +234,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         '`expert_scales` does not match a host-side fold — check the global expert index'
     dist_print(' > expert_scales: matches a host-side topk_weights fold', once_in_node=True)
 
+    if args.check_staging:
+        dist_print(f' > scale checks: pull stages {nvfp4_staging_variants()}: bitwise equal', once_in_node=True)
     dist_print('OK', once_in_node=True)
     dist.barrier()
     buffer.destroy()
@@ -240,6 +253,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=2)
     parser.add_argument('--x-scale', type=float, default=0.1)
     parser.add_argument('--fast-math', type=int, default=1)
+    parser.add_argument('--check-staging', action='store_true', help='Compare staged and unstaged NVFP4 kernels')
     parser.add_argument('--rel-tol', type=float, default=0.30)
     args = parser.parse_args()
     assert args.num_experts % args.num_processes == 0

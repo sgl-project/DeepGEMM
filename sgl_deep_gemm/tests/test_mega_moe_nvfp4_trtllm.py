@@ -5,14 +5,17 @@
 #       python3 sgl_deep_gemm/tests/test_mega_moe_nvfp4_trtllm.py --bench 60
 
 import argparse
+import os
 import sys
 import torch
 import torch.distributed as dist
 from typing import Tuple
+from unittest.mock import patch
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_nvfp4, transform_ue4m3_sf_into_required_layout
-from deep_gemm.utils.dist import dist_print, init_dist
+from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
+from utils import nvfp4_staging_variants
 
 GRAN_K = 16
 
@@ -74,19 +77,19 @@ def layout_of(arm: str) -> str:
 
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    assert num_ranks == 1, 'one rank stands in for one EP rank of a larger MoE'
-    torch.manual_seed(0)
+    torch.manual_seed(rank_idx)
 
     num_tokens, hidden, inter = args.num_tokens, args.hidden, args.intermediate_hidden
     num_experts, num_topk = args.num_experts, args.num_topk
-    num_global_experts = max(args.num_global_experts, num_experts)
+    num_kernel_experts = num_ranks * num_experts
+    num_global_experts = max(args.num_global_experts, num_kernel_experts)
 
     x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_packed, x_sf = per_token_cast_to_nvfp4(x, gran_k=GRAN_K, use_packed_ue4m3=True)
     scores = torch.randn((num_tokens, num_global_experts), dtype=torch.float, device='cuda')
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-    # Simulate one rank's expert slice.
-    topk_idx = torch.where(topk_idx < num_experts, topk_idx, torch.full_like(topk_idx, -1)).long()
+    # Mask experts outside the participating ranks when simulating a smaller EP group.
+    topk_idx = torch.where(topk_idx < num_kernel_experts, topk_idx, torch.full_like(topk_idx, -1)).long()
     topk_weights = topk_weights.masked_fill(topk_idx < 0, 0)
     num_pool_rows = int((topk_idx >= 0).sum())
 
@@ -96,7 +99,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l2_packed, l2_raw_sf = cast_weights(l2)
 
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        group, num_experts, args.num_max_tokens_per_rank, num_topk,
+        group, num_kernel_experts, args.num_max_tokens_per_rank, num_topk,
         hidden, inter, mma_type='nvfp4xnvfp4')
 
     (mm_l1, mm_l1_sf), (mm_l2, mm_l2_sf) = deep_gemm.transform_weights_for_mega_moe(
@@ -112,6 +115,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         arms['trtllm-local'] = tuple((localize_rows_if_aligned(w), localize_rows_if_aligned(sf))
                                      for w, sf in arms['trtllm'])
         assert all(not deep_gemm.is_localized(w) for w, _ in arms['trtllm-local'])
+        arms['megamoe-local'] = tuple((deep_gemm.localize(w), sf) for w, sf in arms['megamoe'])
+
+    norm_gain = .5 + (torch.arange(hidden, device='cuda') % 17).float() / 16 if args.post_expert_norm else None
+    routes = uneven_all_gather(topk_idx, group=group)
+    expected_stats = torch.bincount(routes[routes >= 0], minlength=num_kernel_experts)[
+        rank_idx * num_experts:(rank_idx + 1) * num_experts].int()
 
     def run(weights, layout: str) -> torch.Tensor:
         buffer.x[:num_tokens].copy_(x_packed)
@@ -119,11 +128,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        stats = torch.zeros(num_experts, dtype=torch.int, device='cuda')
         deep_gemm.fp8_fp4_mega_moe(
             y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
             recipe=(1, 1, GRAN_K), activation='swiglu',
-            fast_math=bool(args.fast_math), weight_layout=layout)
+            fast_math=bool(args.fast_math), weight_layout=layout,
+            cumulative_local_expert_recv_stats=stats,
+            post_expert_norm=args.post_expert_norm, post_expert_norm_weight=norm_gain,
+            post_expert_norm_weight_first=True, post_expert_norm_eps=1e-8)
         torch.cuda.synchronize()
+        assert torch.isfinite(y).all(), 'non-finite output'
+        assert torch.equal(stats, expected_stats), 'incorrect expert receive counts'
         return y
 
     dist_print(f'Config: {num_tokens} tokens, hidden={hidden}, inter={inter}, '
@@ -143,17 +158,36 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         else:
             raise AssertionError(f'L{layer + 1} accepted non-contiguous TRT scales')
 
-    y_mm = run(arms['megamoe'], 'megamoe')
-    y_trt = run(arms['trtllm'], 'trtllm')
-    assert y_mm.abs().sum() > 0, 'megamoe arm produced an all-zero output'
-    assert torch.equal(y_trt, y_mm), (
-        'trtllm layout differs from megamoe layout: '
-        f'max |delta| {(y_trt.float() - y_mm.float()).abs().max().item():.3e}')
-    dist_print(' > trtllm weights + scales == megamoe layout, bitwise', once_in_node=True)
-    if 'trtllm-local' in arms:
-        assert torch.equal(run(arms['trtllm-local'], 'trtllm'), y_mm), 'row-localized trtllm weights differ from megamoe layout'
-        localized = [t is not plain for local, trt in zip(arms['trtllm-local'], arms['trtllm']) for t, plain in zip(local, trt)]
-        dist_print(f' > row-localized trtllm (L1 w/sf, L2 w/sf localized: {localized}) == megamoe layout, bitwise', once_in_node=True)
+    baseline = None
+    variants = nvfp4_staging_variants() if args.check_staging else [None]
+    for stages in variants:
+        env = {} if stages is None else dict(DG_MEGA_MOE_PULL_STAGES=str(stages))
+        with patch.dict(os.environ, env):
+            for name, weights in arms.items():
+                for repeat in range(args.staging_repeats if args.check_staging else 1):
+                    y = run(weights, layout_of(name))
+                    assert y.abs().sum() > 0, f'{name} produced an all-zero output'
+                    if baseline is None:
+                        baseline = y.clone()
+                    label = f'{name}, pull stages={stages}, repeat={repeat}'
+                    if args.post_expert_norm:
+                        # The baseline norm atomically accumulates FP32 partials in CTA arrival order.
+                        delta = (y.float() - baseline.float())
+                        max_delta = delta.abs().max()
+                        relative_l2 = delta.norm() / baseline.float().norm().clamp_min(1e-20)
+                        tolerance = torch.finfo(torch.bfloat16).eps * baseline.float().abs().max()
+                        assert max_delta <= tolerance and relative_l2 < 1e-3, (label, max_delta, relative_l2)
+                        if name == 'megamoe' and stages == 0:
+                            errors = torch.stack((max_delta, relative_l2))
+                            dist.all_reduce(errors, op=dist.ReduceOp.MAX)
+                            dist_print(f' > baseline norm repeat {repeat}: max delta={errors[0].item():.3e}, '
+                                       f'rel-L2={errors[1].item():.3e}', once_in_node=True)
+                    else:
+                        torch.testing.assert_close(y, baseline, rtol=0, atol=0, msg=label)
+            equality = 'BF16 norm tolerance' if args.post_expert_norm else 'bitwise equal'
+            dist_print(f' > layouts/localization: pull stages={stages}, norm={args.post_expert_norm}: {equality}',
+                       once_in_node=True)
+    y_mm = baseline
 
     # Incorrect weights or scale packing must change the output.
     assert not torch.equal(run(((mm_l1, trt_l1_sf), arms['trtllm'][1]), 'trtllm'), y_mm), \
@@ -184,7 +218,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 deep_gemm.fp8_fp4_mega_moe(
                     y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
                     recipe=(1, 1, GRAN_K), activation='swiglu',
-                    fast_math=bool(args.fast_math), weight_layout=layout)
+                    fast_math=bool(args.fast_math), weight_layout=layout,
+                    post_expert_norm=args.post_expert_norm, post_expert_norm_weight=norm_gain,
+                    post_expert_norm_weight_first=True, post_expert_norm_eps=1e-8)
                 end.record()
                 torch.cuda.synchronize()
                 times.append(start.elapsed_time(end) * 1e3)
@@ -195,11 +231,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('OK', once_in_node=True)
     buffer.destroy()
+    deep_gemm.destroy_localizer()
     dist.destroy_process_group()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--num-processes', type=int, default=1)
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192)
     parser.add_argument('--num-tokens', type=int, default=2048)
     parser.add_argument('--hidden', type=int, default=4096)
@@ -208,11 +246,15 @@ if __name__ == '__main__':
     parser.add_argument('--num-global-experts', type=int, default=256)
     parser.add_argument('--num-topk', type=int, default=8)
     parser.add_argument('--fast-math', type=int, default=1)
+    parser.add_argument('--check-staging', action='store_true', help='Compare staged and unstaged NVFP4 kernels')
+    parser.add_argument('--staging-repeats', type=int, default=3)
+    parser.add_argument('--post-expert-norm', action='store_true', help='Use Muse Spark weighted, weight-first RMSNorm')
     parser.add_argument('--aa', action='store_true',
                         help='also bench a second canonical clone as an A/A control')
     parser.add_argument('--bench', type=int, default=0,
                         help='time the mega kernel N times per weight layout')
     args = parser.parse_args()
     assert args.num_tokens <= args.num_max_tokens_per_rank
-    torch.multiprocessing.spawn(test, args=(1, args), nprocs=1)
+    assert args.num_processes > 0 and args.staging_repeats > 0
+    torch.multiprocessing.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)
     sys.exit(0)

@@ -178,6 +178,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_nvfp4_alphas.py
+  test_mega_moe_nvfp4_trtllm.py
   test_mega_moe_global_tokens.py
   test_mega_moe_pre_dispatch.py
 )
@@ -228,11 +229,30 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
     [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${L1_NPROC}"
   done
   if [ "${NPROC}" -ge 2 ]; then
-    run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
+    run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}" --check-staging
     run_test test_mega_moe_global_tokens.py --num-processes "${NPROC}"
+    NVFP4_NPROC="${NPROC}"
+    if [ "${NVFP4_NPROC}" -gt 4 ]; then
+      NVFP4_NPROC=4
+    fi
+    NVFP4_ARGS=(--num-processes "${NVFP4_NPROC}" --num-max-tokens-per-rank 65 --num-tokens 65
+      --hidden 4096 --intermediate-hidden 4096 --num-experts 16 --num-topk 4
+      --patterns balanced,uneven,all_idle,shared_only)
+    for shared in 1 2; do
+      run_test test_mega_moe_global_tokens.py "${NVFP4_ARGS[@]}" --num-shared-experts "${shared}"
+      if (cd "${TESTS_DIR}" && "${PYTHON}" -c "import deep_gemm; assert deep_gemm.is_localization_available()") >/dev/null 2>&1; then
+        run_test test_mega_moe_global_tokens.py "${NVFP4_ARGS[@]}" --num-shared-experts "${shared}" --use-localization
+      fi
+    done
+    for norm in "" --post-expert-norm; do
+      run_test test_mega_moe_nvfp4_trtllm.py --num-processes "${NVFP4_NPROC}" --check-staging \
+        --num-tokens 65 --num-max-tokens-per-rank 256 --num-experts 4 \
+        --num-global-experts "$((NVFP4_NPROC * 4))" --num-topk 4 ${norm:+"${norm}"}
+    done
   else
     skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
     skip_test test_mega_moe_global_tokens.py "requires at least 2 ranks"
+    run_test test_mega_moe_nvfp4_trtllm.py --check-staging
   fi
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
   for t in "${MEGA_MOE_HOPPER[@]}"; do
