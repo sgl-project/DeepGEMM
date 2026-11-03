@@ -45,6 +45,13 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 1070)
+    constexpr bool kIsSM107 = true;
+#else
+    constexpr bool kIsSM107 = false;
+#endif
+
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
@@ -67,11 +74,6 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
-#if defined(__CUDA_ARCH__) and __CUDA_ARCH__ == 1070
-    constexpr bool kIsSM107 = true;
-#else
-    constexpr bool kIsSM107 = false;
-#endif
     constexpr uint32_t UMMA_K = (kIsMXF4 or (kIsSM107 and kIsMXF8KMajor and not is_k_grouped_contiguous(kGemmType))) ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
