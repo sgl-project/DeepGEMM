@@ -49,9 +49,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     // NOTES: an FP4xFP4 pair uses the dedicated MXF4 MMA (packed 4-bit operands, K-major only, UMMA_K=64);
-    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32)
+    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32, or 64 for K-major MXFP8 on SM107)
     constexpr bool kIsMXF4 = cute::is_same_v<a_dtype_t, cutlass::float_e2m1_t> and
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
+    constexpr bool kIsMXF8KMajor = cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
+                                   kGranKA == 32 and kGranKB == 32 and kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K;
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
     // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
@@ -70,10 +72,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 #else
     constexpr bool kIsSM107 = false;
 #endif
-    constexpr bool kUseWideK = kIsSM107 and cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
-                               kGranKA == 32 and kGranKB == 32 and kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K and
-                               not is_k_grouped_contiguous(kGemmType);
-    constexpr uint32_t UMMA_K = (kIsMXF4 or kUseWideK) ? 64 : 32;
+    constexpr uint32_t UMMA_K = (kIsMXF4 or (kIsSM107 and kIsMXF8KMajor and not is_k_grouped_contiguous(kGemmType))) ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t kPackFactor = get_smem_pack_factor<a_dtype_t>();
@@ -313,7 +312,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                                              UMMA_M, UMMA_N, kMajorB, kMajorA>()
                                   : cute::UMMA::make_instr_desc_block_scaled<a_dtype_t, b_dtype_t, float, cutlass::float_ue8m0_t,
                                                                              UMMA_M, UMMA_N, kMajorA, kMajorB>();
-        instr_desc.k_size_ = kUseWideK;
+        instr_desc.k_size_ = not kIsMXF4 and UMMA_K == 64;
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
