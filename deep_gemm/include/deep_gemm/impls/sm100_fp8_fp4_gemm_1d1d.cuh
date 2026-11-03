@@ -65,7 +65,16 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
-    constexpr uint32_t UMMA_K = kIsMXF4 ? 64 : 32;
+#if defined(__CUDA_ARCH__) and __CUDA_ARCH__ >= 1070 and __CUDA_ARCH__ < 1080
+    constexpr bool kIsSM107 = true;
+#else
+    constexpr bool kIsSM107 = false;
+#endif
+    constexpr bool kUseWideK = kIsSM107 and not kIsMXF4 and kGranKA == 32 and kGranKB == 32 and
+                               kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K and
+                               cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
+                               not is_k_grouped_contiguous(kGemmType) and (not kSwapAB or BLOCK_M >= 192);
+    constexpr uint32_t UMMA_K = (kIsMXF4 or kUseWideK) ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t kPackFactor = get_smem_pack_factor<a_dtype_t>();
@@ -305,6 +314,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                                              UMMA_M, UMMA_N, kMajorB, kMajorA>()
                                   : cute::UMMA::make_instr_desc_block_scaled<a_dtype_t, b_dtype_t, float, cutlass::float_ue8m0_t,
                                                                              UMMA_M, UMMA_N, kMajorA, kMajorB>();
+        instr_desc.k_size_ = kUseWideK;
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
