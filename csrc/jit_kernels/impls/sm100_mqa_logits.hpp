@@ -138,6 +138,12 @@ struct MQALogitsConfig {
         num_kv_stages = is_fp4 ? 8 : 3;
     }
 
+    // Paged FP4 on 10.7 runs 4-split chunks, and so a 4-stage KV ring, inside the 8-stage allocation
+    int splits_per_chunk() const {
+        const bool is_sm107 = jit->device.get_arch_pair() == std::make_pair(10, 7);
+        return is_fp4 and is_paged and is_sm107 ? 4 : kMQALogitsSplitsPerChunk;
+    }
+
     const char* qk_dtype_name() const {
         return is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
     }
@@ -359,7 +365,7 @@ static void __instantiate_kernel() {{
     page_kv,
     config.block_q, config.umma_n,
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
-    config.split_kv, kMQALogitsSplitsPerChunk,
+    config.split_kv, config.splits_per_chunk(),
     config.num_specialized_threads, config.num_math_threads,
     config.qk_dtype_name()));
 

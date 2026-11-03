@@ -52,7 +52,7 @@ CUTLASS_DEVICE void visit_tmem_head_chunks(const uint32_t& tmem_col, float* accu
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t UMMA_N,
-          uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages,
+          uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, uint32_t kNumKVRingStages,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename qk_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
@@ -89,7 +89,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     static constexpr uint32_t kNumUTCCPAlignedElems = SharedStorage::kNumUTCCPAlignedElems;
     static constexpr uint32_t UMMA_M = 128;
     static constexpr uint32_t BLOCK_QH = SharedStorage::BLOCK_QH;
-    static constexpr uint32_t UMMA_K = kIsFP4 ? 64 : 32;
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && __CUDA_ARCH_FAMILY_SPECIFIC__ == 1070
+    static constexpr bool kUseFP4K128 = kIsFP4 and kHeadDim % 128 == 0;
+#else
+    static constexpr bool kUseFP4K128 = false;
+#endif
+    static constexpr uint32_t UMMA_K = kUseFP4K128 ? 128 : (kIsFP4 ? 64 : 32);
     static constexpr uint32_t kNumSFQ = SharedStorage::kNumSFQ;
     static constexpr uint32_t kNumSFKV = SharedStorage::kNumSFKV;
     static constexpr uint32_t kNumQKBytesPerToken = SharedStorage::kNumQKBytesPerToken;
@@ -97,12 +102,13 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
     DG_STATIC_ASSERT(kNumTmemStages == kNumMathWarpGroups, "TMEM stages must match math warp groups");
+    DG_STATIC_ASSERT(kNumKVRingStages > 0 and kNumKVRingStages <= kNumKVStages, "Invalid KV ring");
 
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumTmemStages;
     constexpr uint32_t kNumSFQColsPerStage = kNumSFQ / 32;
     constexpr uint32_t kNumSFKVColsPerStage = kNumSFKV / 32;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumQStages * kNumSFQColsPerStage +
-                                                                       kNumKVStages * kNumSFKVColsPerStage>();
+                                                                       kNumKVRingStages * kNumSFKVColsPerStage>();
     constexpr uint32_t kTmemStartColOfSFQ = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFKV = kNumAccumTmemCols + kNumQStages * kNumSFQColsPerStage;
     DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
@@ -115,7 +121,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             smem.empty_q_barriers[i].init(kNumMathThreads + 32);
         }
         #pragma unroll
-        for (uint32_t i = 0; i < kNumKVStages; ++ i) {
+        for (uint32_t i = 0; i < kNumKVRingStages; ++ i) {
             smem.full_kv_barriers[i].init(2);
             smem.full_sf_kv_barriers[i].init(1);
             smem.empty_kv_barriers[i].init(1);
@@ -134,7 +140,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     __syncthreads();
 
     RingPipeline<kNumQStages> q_pipeline;
-    RingPipeline<kNumKVStages> kv_pipeline;
+    RingPipeline<kNumKVRingStages> kv_pipeline;
     RingPipeline<kNumTmemStages> tmem_pipeline;
 
     constexpr uint32_t kNumSpecializedRegisters = 56;
@@ -149,7 +155,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
     // Reuse a full KV ring when consecutive tasks share the same splits
     const auto reuses_kv_stages = [&](const sched::MQALogitsTask& task) {
-        return task.kv_shared_with_prev and task.num_kv_splits == kNumKVStages;
+        return task.kv_shared_with_prev and task.num_kv_splits == kNumKVRingStages;
     };
 
     // Shared KV/SF producer loop; the SF producer also drives Q
@@ -375,9 +381,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             constexpr uint32_t kQKSwizzleMode = kHeadDim / kPackFactor;
             constexpr uint32_t kNumUMMAK = kHeadDim / UMMA_K;
             // Advance descriptor low words by each stage's fixed offset
-            const auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+            auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 qk_dtype_t, qk_dtype_t, float, cutlass::float_ue8m0_t,
                 UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+            // The 10.7 mxf4 K=128 shape is K code 2: bit 3 set, bit 31 (`k_size_`) clear
+            if constexpr (kUseFP4K128)
+                instr_desc.desc_ |= 1u << 3;
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_kv[0], 0, 0);
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_q[0], 0, 0);
             const uint32_t a_desc_lo = a_desc.lo, b_desc_lo = b_desc.lo;
@@ -562,7 +571,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
 
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
-                               UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
+                               UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages, kNumKVStages,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
@@ -599,6 +608,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
                                UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
+                               (kSplitsPerChunk < kNumKVStages ? kSplitsPerChunk : kNumKVStages),
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
