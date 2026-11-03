@@ -519,10 +519,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                 for (uint32_t h = 0; h < 16; h += 4) {
                                     #pragma unroll
                                     for (uint32_t t = 0; t < 2; ++ t)
-                                        s0[t] = __hfma2(ptx::cvt_relu_bf16x2_f32(make_float2(x[t][h], x[t][h + 1])), weights[i + t][c * 8 + h / 2], s0[t]);
-                                    #pragma unroll
-                                    for (uint32_t t = 0; t < 2; ++ t)
-                                        s1[t] = __hfma2(ptx::cvt_relu_bf16x2_f32(make_float2(x[t][h + 2], x[t][h + 3])), weights[i + t][c * 8 + h / 2 + 1], s1[t]);
+                                        reduce_pairs(x[t] + h, weights[i + t] + c * 8 + h / 2, 4, s0[t], s1[t]);
                                 }
                             }
                             #pragma unroll
