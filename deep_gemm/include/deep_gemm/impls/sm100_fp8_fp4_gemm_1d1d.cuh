@@ -65,15 +65,14 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
-#if defined(__CUDA_ARCH__) and __CUDA_ARCH__ >= 1070 and __CUDA_ARCH__ < 1080
+#if defined(__CUDA_ARCH__) and __CUDA_ARCH__ == 1070
     constexpr bool kIsSM107 = true;
 #else
     constexpr bool kIsSM107 = false;
 #endif
-    constexpr bool kUseWideK = kIsSM107 and not kIsMXF4 and kGranKA == 32 and kGranKB == 32 and
-                               kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K and
-                               cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
-                               not is_k_grouped_contiguous(kGemmType) and (not kSwapAB or BLOCK_M >= 192);
+    constexpr bool kUseWideK = kIsSM107 and cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
+                               kGranKA == 32 and kGranKB == 32 and kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K and
+                               not is_k_grouped_contiguous(kGemmType);
     constexpr uint32_t UMMA_K = (kIsMXF4 or kUseWideK) ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
