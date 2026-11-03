@@ -496,24 +496,59 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
 
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                        auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
-                        auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
-                        const auto reduce_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
-                            constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
-                            constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
-                            // Release TMEM after its last load to overlap MMA with reduction
-                            if constexpr (kHeadBase + kNumChunkHeads == kNumHeads) {
-                                if (i == kNumValidTokens - 1) {
+                    if constexpr (not kIsPaged and kNumHeads % 16 == 0 and kNumValidTokens % 2 == 0) {
+                        const uint32_t col0 = tmem_stage_idx * UMMA_N;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; i += 2) {
+                            nv_bfloat162 s0[2], s1[2];
+                            #pragma unroll
+                            for (uint32_t t = 0; t < 2; ++ t)
+                                s0[t] = s1[t] = __floats2bfloat162_rn(0.0f, 0.0f);
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kNumHeads / 16; ++ c) {
+                                float x[2][16];
+                                #pragma unroll
+                                for (uint32_t t = 0; t < 2; ++ t)
+                                    ptx::tmem_load_32dp32b<16>(col0 + (i + t) * kNumHeads + c * 16, reinterpret_cast<uint32_t*>(x[t]));
+                                cutlass::arch::fence_view_async_tmem_load();
+                                if (c == kNumHeads / 16 - 1 and i + 2 == kNumValidTokens) {
                                     ptx::tcgen05_before_thread_sync();
                                     smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                                 }
+                                #pragma unroll
+                                for (uint32_t h = 0; h < 16; h += 4) {
+                                    #pragma unroll
+                                    for (uint32_t t = 0; t < 2; ++ t)
+                                        s0[t] = __hfma2(ptx::cvt_relu_bf16x2_f32(make_float2(x[t][h], x[t][h + 1])), weights[i + t][c * 8 + h / 2], s0[t]);
+                                    #pragma unroll
+                                    for (uint32_t t = 0; t < 2; ++ t)
+                                        s1[t] = __hfma2(ptx::cvt_relu_bf16x2_f32(make_float2(x[t][h + 2], x[t][h + 3])), weights[i + t][c * 8 + h / 2 + 1], s1[t]);
+                                }
                             }
-                            reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
-                        };
-                        visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
-                        store_token(i, kv_offset, sum_0, sum_1);
+                            #pragma unroll
+                            for (uint32_t t = 0; t < 2; ++ t)
+                                store_token(i + t, kv_offset, s0[t], s1[t]);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                            auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            const auto reduce_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
+                                constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
+                                constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
+                                // Release TMEM after its last load to overlap MMA with reduction
+                                if constexpr (kHeadBase + kNumChunkHeads == kNumHeads) {
+                                    if (i == kNumValidTokens - 1) {
+                                        ptx::tcgen05_before_thread_sync();
+                                        smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                                    }
+                                }
+                                reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
+                            };
+                            visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
+                            store_token(i, kv_offset, sum_0, sum_1);
+                        }
                     }
                 }
             };
