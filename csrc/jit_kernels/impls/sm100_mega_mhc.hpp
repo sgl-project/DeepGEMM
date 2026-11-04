@@ -100,8 +100,9 @@ static void sm100_mega_mhc(
         .y_bf16 = reinterpret_cast<nv_bfloat16*>(y_bf16.data_ptr()),
         .y_fp8 = y_fp8.has_value() ? reinterpret_cast<__nv_fp8_e4m3*>(y_fp8->data_ptr()) : nullptr,
         .y_primary_sf = y_primary_sf.has_value() ? reinterpret_cast<uint32_t*>(y_primary_sf->data_ptr<int32_t>()) : nullptr,
-        .y_primary_sf_stride_token = y_primary_sf.has_value() ? y_primary_sf->stride(0) : 0,
+        .y_primary_sf_stride_token = y_primary_sf.has_value() and y_primary_sf->dim() == 2 ? y_primary_sf->stride(0) : 0,
         .y_primary_sf_stride_word = y_primary_sf.has_value() ? y_primary_sf->stride(1) : 0,
+        .y_primary_sf_stride_mtile = y_primary_sf.has_value() and y_primary_sf->dim() == 4 ? y_primary_sf->stride(0) : 0,
         .y_shared_sf = y_shared_sf.has_value() ? reinterpret_cast<uint32_t*>(y_shared_sf->data_ptr<int32_t>()) : nullptr,
         .y_shared_sf_stride_word = y_shared_sf.has_value() ? y_shared_sf->stride(1) : 0,
     };
@@ -120,7 +121,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
         {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -128,7 +129,8 @@ static void __instantiate_kernel() {{
         mix_args.new_prev_mix != nullptr,
         store_bf16,
         norm_args.y_fp8 != nullptr,
-        shared_sf_block_m), compiler_options);
+        shared_sf_block_m,
+        norm_args.y_primary_sf_stride_mtile != 0), compiler_options);
 
     // Launch
     jit->launch(

@@ -9,7 +9,9 @@ from deep_gemm.testing import (
     get_arch_major,
     test_filter,
 )
-from deep_gemm.utils import align, per_token_cast_to_fp8
+from deep_gemm.utils import align, ceil_div, per_token_cast_to_fp8
+
+from utils import to_flashinfer_128x4_sf
 
 
 def enumerate_cases():
@@ -358,6 +360,26 @@ def test_mega_mhc() -> None:
     print()
 
 
+@test_filter(lambda: get_arch_major() == 10)
+@torch.no_grad()
+def test_mega_mhc_flashinfer_sf() -> None:
+    print('Testing Mega mHC with FlashInfer 128x4 SF:')
+    for is_shifted in (True, False):
+        for num_tokens, hidden in ((1, 4096), (200, 7168), (1025, 4096), (4096, 7168)):
+            inputs, _ = make_inputs(num_tokens, hidden, 2026 + num_tokens, is_shifted)
+            outputs = make_outputs(inputs, 'col')
+            run_mega_mhc(inputs, outputs)
+            y_fp8 = torch.empty_like(outputs['y_fp8'])
+            sf_4d = torch.full((ceil_div(num_tokens, 128), hidden // 128, 32, 4), -1, dtype=torch.int32, device='cuda')
+            run_mega_mhc(inputs, outputs, y_fp8=y_fp8, y_gemm_sf=sf_4d)
+            case = f'{is_shifted=}, T={num_tokens}, H={hidden}'
+            assert torch.equal(y_fp8.view(torch.uint8), outputs['y_fp8'].view(torch.uint8)), f'{case}: FP8'
+            assert torch.equal(sf_4d, to_flashinfer_128x4_sf(outputs['y_gemm_sf'])), f'{case}: SF'
+            print(f' > {case}: OK')
+    print()
+
+
 if __name__ == '__main__':
     test_mega_mhc_api_contract()
     test_mega_mhc()
+    test_mega_mhc_flashinfer_sf()

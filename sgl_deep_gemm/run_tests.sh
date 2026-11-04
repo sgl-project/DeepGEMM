@@ -230,6 +230,9 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   if [ "${NPROC}" -ge 2 ]; then
     run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
     run_test test_mega_moe_global_tokens.py --num-processes "${NPROC}"
+    run_test test_mega_moe_global_tokens.py --num-processes "${L1_NPROC}" --mma-type mxf4xmxf4 \
+      --num-tokens 4096 --num-max-tokens-per-rank 4096
+    run_test test_mega_moe_global_tokens.py --num-processes "${L1_NPROC}" --x-scales
   else
     skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
     skip_test test_mega_moe_global_tokens.py "requires at least 2 ranks"

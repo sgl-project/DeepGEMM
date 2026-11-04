@@ -99,7 +99,8 @@ public:
 
     EpilogueOperatorArgs make_epilogue_operator_args(const int& m, const int& n) const override {
         return {.sfd = static_cast<uint32_t*>(sfd.data_ptr()),
-                .sfd_stride = static_cast<uint32_t>(sfd.stride(-1)),
+                .sfd_stride = static_cast<uint32_t>(sfd.dim() == 4 ? sfd.stride(1) : sfd.stride(-1)),
+                .sfd_mn_tile_stride = static_cast<uint32_t>(sfd.dim() == 4 ? sfd.stride(0) : 0),
                 .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n),
                 .clamp_value = clamp_value.value_or(0.0f),
                 .clamped_count = clamped_count.has_value() ? static_cast<uint32_t*>(clamped_count->data_ptr()) : nullptr,

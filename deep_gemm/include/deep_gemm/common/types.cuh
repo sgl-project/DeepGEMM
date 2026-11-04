@@ -78,6 +78,8 @@ enum class KernelType {
 struct EpilogueOperatorArgs {
     uint32_t* sfd = nullptr;
     uint32_t sfd_stride = 0;
+    // Non-zero selects FlashInfer's 128x4 swizzled SFD: words between 128-row tiles
+    uint32_t sfd_mn_tile_stride = 0;
     uint32_t shape_m = 0, shape_n = 0;
     float alpha = 1.0f;
     float clamp_value = 0.0f;  // Zero disables clamping
