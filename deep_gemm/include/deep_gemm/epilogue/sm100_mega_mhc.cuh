@@ -124,7 +124,7 @@ CUTLASS_DEVICE uint32_t get_shared_sf_row_idx(const uint32_t& token_idx) {
 template <bool kSwizzledPrimarySF>
 CUTLASS_DEVICE int64_t primary_sf_token_offset(const NormArgs& norm_args, const uint32_t& token_idx) {
     if constexpr (kSwizzledPrimarySF)
-        return (token_idx >> 7) * norm_args.y_primary_sf_stride_mtile + (token_idx & 31u) * 4 + ((token_idx >> 5) & 3u);
+        return (token_idx >> 7) * static_cast<uint32_t>(norm_args.y_primary_sf_stride_mtile) + (token_idx & 31u) * 4 + ((token_idx >> 5) & 3u);
     return token_idx * norm_args.y_primary_sf_stride_token;
 }
 
@@ -384,7 +384,8 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
                 const uint32_t second_packed_sf = store_fp8_and_pack_sf(
                     norm_args, output_offset + kHidden, values[1], sf_exponents.y);
                 if (lane_idx % kNumLanesPerSFWord == 0) {
-                    norm_args.y_primary_sf[primary_sf_token_offset<kSwizzledPrimarySF>(norm_args, m_idx + 1) + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
+                    // `m_idx` is even, so the swizzled row of `m_idx + 1` is the next 16 B row
+                    norm_args.y_primary_sf[(kSwizzledPrimarySF ? primary_sf_token_offset<true>(norm_args, m_idx) + 4 : primary_sf_token_offset<false>(norm_args, m_idx + 1)) + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
                     if constexpr (SF_BLOCK_M > 0)
                         norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.y] = second_packed_sf;
                 }
