@@ -328,6 +328,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 ptx::tcgen05_before_thread_sync();
                 smem.full_q_barriers[q_stage_idx].arrive();
             }
+            #pragma unroll 1
             for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                 CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
                 smem.full_sf_kv_barriers[kv_stage_idx].wait(kv_phase);
@@ -396,6 +397,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 ptx::tcgen05_after_thread_sync();
                 const uint32_t b_desc_stage_lo = b_desc_lo + q_stage_idx * kNumQDescPerStage;
                 const uint32_t tmem_sfb = tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage;
+                #pragma unroll 1
                 for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                     CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
                     // The fence after the first empty-TMEM wait also orders this data
@@ -454,6 +456,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i)
                     output_bases[i] = logits + (task.q_token_base + i) * static_cast<uint64_t>(logits_stride) - seq_k_start[i];
+                // Keep the bases live in registers instead of recomputing them at every store
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                    asm volatile("" : "+l"(output_bases[i]));
 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
@@ -495,33 +501,34 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     ptx::tcgen05_after_thread_sync();
 
                     if constexpr (not kIsPaged and kNumHeads % 16 == 0 and kNumValidTokens % 2 == 0) {
+                        constexpr uint32_t kNumTokensPerGroup = kNumValidTokens % 4 == 0 ? 4 : 2;
                         const uint32_t col0 = tmem_base + tmem_stage_idx * UMMA_N;
                         #pragma unroll
-                        for (uint32_t i = 0; i < kNumValidTokens; i += 2) {
-                            nv_bfloat162 s0[2], s1[2];
+                        for (uint32_t i = 0; i < kNumValidTokens; i += kNumTokensPerGroup) {
+                            nv_bfloat162 s0[kNumTokensPerGroup], s1[kNumTokensPerGroup];
                             #pragma unroll
-                            for (uint32_t t = 0; t < 2; ++ t)
+                            for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
                                 s0[t] = s1[t] = __floats2bfloat162_rn(0.0f, 0.0f);
                             #pragma unroll
                             for (uint32_t c = 0; c < kNumHeads / 16; ++ c) {
-                                float x[2][16];
+                                float x[kNumTokensPerGroup][16];
                                 #pragma unroll
-                                for (uint32_t t = 0; t < 2; ++ t)
+                                for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
                                     ptx::tmem_load_32dp32b<16>(col0 + (i + t) * kNumHeads + c * 16, reinterpret_cast<uint32_t*>(x[t]));
                                 cutlass::arch::fence_view_async_tmem_load();
-                                if (c == kNumHeads / 16 - 1 and i + 2 == kNumValidTokens) {
+                                if (c == kNumHeads / 16 - 1 and i + kNumTokensPerGroup == kNumValidTokens) {
                                     ptx::tcgen05_before_thread_sync();
                                     smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                                 }
                                 #pragma unroll
                                 for (uint32_t h = 0; h < 16; h += 4) {
                                     #pragma unroll
-                                    for (uint32_t t = 0; t < 2; ++ t)
+                                    for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
                                         reduce_pairs(x[t] + h, weights[i + t] + c * 8 + h / 2, 4, s0[t], s1[t]);
                                 }
                             }
                             #pragma unroll
-                            for (uint32_t t = 0; t < 2; ++ t)
+                            for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
                                 store_token(i + t, kv_offset, s0[t], s1[t]);
                         }
                     } else {
