@@ -179,7 +179,6 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_l1_sentinel.py
   test_mega_moe_nvfp4_alphas.py
   test_mega_moe_global_tokens.py
-  test_mega_moe_simt_pull.py
   test_mega_moe_pre_dispatch.py
 )
 MEGA_MOE_HOPPER=(
@@ -231,11 +230,13 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   if [ "${NPROC}" -ge 2 ]; then
     run_test test_mega_moe_nvfp4_alphas.py --num-processes "${L1_NPROC}"
     run_test test_mega_moe_global_tokens.py --num-processes "${NPROC}"
+    run_test test_mega_moe_global_tokens.py --num-processes "${L1_NPROC}" --mma-type mxf4xmxf4 \
+      --num-tokens 4096 --num-max-tokens-per-rank 4096
+    run_test test_mega_moe_global_tokens.py --num-processes "${L1_NPROC}" --x-scales
   else
     skip_test test_mega_moe_nvfp4_alphas.py "requires at least 2 ranks"
     skip_test test_mega_moe_global_tokens.py "requires at least 2 ranks"
   fi
-  run_test test_mega_moe_simt_pull.py --num-processes "${L1_NPROC}"
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
   for t in "${MEGA_MOE_HOPPER[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM90-only, arch major ${ARCH_MAJOR}"
