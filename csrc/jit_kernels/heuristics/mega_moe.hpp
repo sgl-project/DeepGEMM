@@ -323,10 +323,14 @@ static MegaMoEConfig get_mega_moe_config(
     const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
         jit->device.get_arch_pair() == std::make_pair(10, 7) and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
     // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
-    // SMEM send buffers; on by default with the K=64 MMA, `DG_MEGA_MOE_SIMT_PULL=0/1` forces it (FP8 x FP4 only)
+    // SMEM send buffers; on by default with the K=64 MMA and for FP4 activations on CC 10.7,
+    // `DG_MEGA_MOE_SIMT_PULL=0/1` forces it
     const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
-    const bool use_simt_pull = mma_kind == MmaKind::MXFP8FP4 and (hidden * get_element_bits(mma_kind) / 8) % 512 == 0 and
-        (simt_pull_env < 0 ? use_sm107_k64 : simt_pull_env != 0);
+    const bool is_fp4_acts = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
+    const bool is_sm107 = jit->device.get_arch_pair() == std::make_pair(10, 7);
+    const bool use_simt_pull = (mma_kind == MmaKind::MXFP8FP4 or is_fp4_acts) and
+        (hidden * get_element_bits(mma_kind) / 8) % 512 == 0 and
+        (simt_pull_env < 0 ? (use_sm107_k64 or (is_fp4_acts and is_sm107)) : simt_pull_env != 0);
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
@@ -352,9 +356,9 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = std::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, global_num_tokens={}, num_topk={})",
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, global_num_tokens={}, num_topk={}, mma_kind={}, use_simt_pull={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens,
-            global_num_tokens.value_or(-1), num_topk);
+            global_num_tokens.value_or(-1), num_topk, static_cast<int>(mma_kind), config.use_simt_pull);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
