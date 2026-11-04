@@ -454,12 +454,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 // Offset warp-uniform output bases by -seq_k_start[i] for shared KV indexing
                 nv_bfloat16* output_bases[BLOCK_Q];
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
                     output_bases[i] = logits + (task.q_token_base + i) * static_cast<uint64_t>(logits_stride) - seq_k_start[i];
-                // Keep the bases live in registers instead of recomputing them at every store
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                    // Keep the base live in a register instead of recomputing it at every store
                     asm volatile("" : "+l"(output_bases[i]));
+                }
 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
