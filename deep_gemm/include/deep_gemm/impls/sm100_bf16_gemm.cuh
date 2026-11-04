@@ -53,7 +53,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t kNumStages = kNumStages_ / kNumStagesPerMerge;
 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, ptx::Allocator1Sm, ptx::Allocator2Sm>;
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");

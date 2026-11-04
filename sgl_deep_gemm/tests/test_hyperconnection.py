@@ -93,8 +93,7 @@ def _check_hc_prenorm_gemm_concurrent_streams() -> None:
     print('Concurrent HC-prenorm GEMM passed')
 
 
-# The TMEM-reserving fixture hangs on CC 10.7 even with one CTA, with or without the fix
-@test_filter(lambda: get_arch_major() == 10 and torch.cuda.get_device_capability()[1] != 7)
+@test_filter(lambda: get_arch_major() == 10)
 def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
     library_root = Path(deep_gemm.__file__).resolve().parent
     with tempfile.TemporaryDirectory() as directory:
@@ -102,11 +101,11 @@ def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
         shutil.copytree(library_root / 'include', include, symlinks=True)
         header = include / 'deep_gemm/impls/sm100_tf32_hc_prenorm_gemm.cuh'
         source = header.read_text()
-        allocation = '        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);\n'
+        allocation = '        ptx::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);\n'
         assert source.count(allocation) == 1
         source = source.replace(allocation,
-            '        cute::TMEM::Allocator1Sm().allocate(256, &reserved_tmem_base);\n' +
-            allocation + '        cute::TMEM::Allocator1Sm().release_allocation_lock();\n')
+            '        ptx::Allocator1Sm().allocate(256, &reserved_tmem_base);\n' +
+            allocation + '        ptx::Allocator1Sm().release_allocation_lock();\n')
         # Reserve half the TMEM in the same CTA so the kernel must use a nonzero base.
         initialization = '    // Initialize barriers\n'
         assert source.count(initialization) == 1
@@ -119,9 +118,9 @@ def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
                   '    DG_DEVICE_ASSERT(*tmem_ptr_in_smem != 0);\n' + source[synchronization:])
         # Free the fixture first, leaving the kernel's original deallocation untouched.
         source, count = re.subn(
-            r'        if \(warp_idx == 1\)\n(            cute::TMEM::Allocator1Sm\(\).free\([^\n]+\);)\n',
+            r'        if \(warp_idx == 1\)\n(            ptx::Allocator1Sm\(\).free\([^\n]+\);)\n',
             r'        if (warp_idx == 1) {\n'
-            r'            cute::TMEM::Allocator1Sm().free(reserved_tmem_base, 256);\n\1\n        }\n',
+            r'            ptx::Allocator1Sm().free(reserved_tmem_base, 256);\n\1\n        }\n',
             source)
         assert count == 1
         header.write_text(source)

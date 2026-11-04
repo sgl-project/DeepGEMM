@@ -241,7 +241,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
         cutlass::arch::fence_barrier_init();
     }
     if (warp_idx == kSFTransposeWarpIdx)
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
+        ptx::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
 
     // Zero padded Q scales for UTCCP
     constexpr uint32_t kNumSFQValues = BLOCK_Q * kNumHeads;
@@ -638,7 +638,7 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
         }
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
-            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
+            ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
     } else {
         cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
     }

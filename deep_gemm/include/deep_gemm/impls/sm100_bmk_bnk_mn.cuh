@@ -89,7 +89,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
         // Allocate tensor memory
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+        ptx::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
     const uint32_t tmem_base = ptx::ld_shared(tmem_ptr_in_smem);
@@ -257,7 +257,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
     // Deallocate tensor memory by warp 1
     // NOTES: warp 0 is doing TMA stores
     if (warp_idx == 1)
-        cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
+        ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

@@ -73,7 +73,7 @@ sm100_bf16_mega_moe_impl(void* y,
                          const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::TMEM::Allocator2Sm;
+    using Allocator = ptx::Allocator2Sm;
 
     // Use one domain when clusters cannot split evenly across device locality domains
     constexpr uint32_t kNumLocalityDomains =

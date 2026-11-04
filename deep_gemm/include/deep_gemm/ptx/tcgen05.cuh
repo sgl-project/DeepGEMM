@@ -248,4 +248,32 @@ CUTLASS_DEVICE void tcgen05_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
+/// Non-exclusive tensor memory allocators: `num_columns` must be a power of 2 in [32, 512]
+struct Allocator1Sm {
+    CUTLASS_DEVICE void allocate(const uint32_t& num_columns, uint32_t* dst_ptr) const {
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void free(const uint32_t& tmem_ptr, const uint32_t& num_columns) const {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_ptr), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void release_allocation_lock() const {
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+};
+
+/// Both peer CTAs must pass the same `dst_ptr`
+struct Allocator2Sm {
+    CUTLASS_DEVICE void allocate(const uint32_t& num_columns, uint32_t* dst_ptr) const {
+        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void free(const uint32_t& tmem_ptr, const uint32_t& num_columns) const {
+        asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_ptr), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void release_allocation_lock() const {
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+    }
+};
+
 } // namespace deep_gemm::ptx
