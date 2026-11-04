@@ -66,7 +66,7 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
  *     new_comb_res_mix               [T,hc_mult,hc_mult]               FP32
  *     y_bf16                         [T,H] BF16 | None
  *     y_fp8                          [T,H] E4M3 | None
- *     y_gemm_sf                      [T,H/128] int32 | None
+ *     y_gemm_sf                      [T,H/128] | [ceil(T/128),H/128,32,4] int32 | None
  *     y_routed_sf                    [T,H/128] int32 | None
  *     y_shared_sf                    [T,H/128] int32 | None
  *     shared_sf_block_m              int
@@ -82,7 +82,8 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
  *     UE8M0 scaling factors packed into each int32.
  *     y_bf16 and y_fp8 are independent optional outputs; at least one is required.
  *     With y_fp8, supply exactly either y_gemm_sf alone, or y_routed_sf and
- *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major,
+ *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major, or, when 4D,
+ *     FlashInfer's 128x4 swizzle (its flat uint8 view is FlashInfer's a_descale),
  *     y_routed_sf is contiguous row-major, and y_shared_sf is the Mega MoE
  *     shared-expert layout and requires shared_sf_block_m > 0.
  */
@@ -199,7 +200,14 @@ static void mega_mhc(const torch::Tensor& x,
         DG_HOST_ASSERT(tensor.device() == device);
     };
 
-    if (y_gemm_sf.has_value()) {
+    // A 4D `[ceil(T / 128), H / 128, 32, 4]` y_gemm_sf is FlashInfer's 128x4 swizzle
+    if (y_gemm_sf.has_value() and y_gemm_sf->dim() == 4) {
+        DG_HOST_ASSERT(y_gemm_sf->scalar_type() == torch::kInt and y_gemm_sf->device() == device);
+        DG_HOST_ASSERT(y_gemm_sf->is_contiguous());
+        DG_HOST_ASSERT(y_gemm_sf->size(0) == ceil_div(num_tokens, 128) and
+                       y_gemm_sf->size(1) == hidden / static_cast<int>(mhc_layout::kHiddenPerSFWord) and
+                       y_gemm_sf->size(2) == 32 and y_gemm_sf->size(3) == 4);
+    } else if (y_gemm_sf.has_value()) {
         check_sf(y_gemm_sf.value());
         DG_HOST_ASSERT(y_gemm_sf->stride(0) == 1);
         DG_HOST_ASSERT(y_gemm_sf->stride(1) >= num_tokens);

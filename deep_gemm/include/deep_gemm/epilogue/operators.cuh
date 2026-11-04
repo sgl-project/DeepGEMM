@@ -213,7 +213,9 @@ public:
         if (row_idx >= args.shape_m or group_n_idx >= args.shape_n)
             return;
         const auto sf_idx = (batch_idx * args.shape_n + group_n_idx) / kSFGranN;
-        const auto sf_word_ptr = args.sfd + (sf_idx / 4) * args.sfd_stride + row_idx;
+        const auto row_offset = args.sfd_mn_tile_stride == 0 ? row_idx :
+            (row_idx / 128) * args.sfd_mn_tile_stride + (row_idx % 32) * 4 + (row_idx / 32) % 4;
+        const auto sf_word_ptr = args.sfd + (sf_idx / 4) * args.sfd_stride + row_offset;
         const auto sf_ptr = reinterpret_cast<uint8_t*>(sf_word_ptr) + sf_idx % 4;
         *reinterpret_cast<sf_t*>(sf_ptr) = sf;
     }
