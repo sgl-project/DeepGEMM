@@ -93,7 +93,8 @@ def _check_hc_prenorm_gemm_concurrent_streams() -> None:
     print('Concurrent HC-prenorm GEMM passed')
 
 
-@test_filter(lambda: get_arch_major() == 10)
+# The TMEM-reserving fixture hangs on CC 10.7 even with one CTA, with or without the fix
+@test_filter(lambda: get_arch_major() == 10 and torch.cuda.get_device_capability()[1] != 7)
 def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
     library_root = Path(deep_gemm.__file__).resolve().parent
     with tempfile.TemporaryDirectory() as directory:
