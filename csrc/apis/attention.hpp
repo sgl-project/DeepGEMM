@@ -11,7 +11,6 @@
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/legacy/sm100_mqa_logits.hpp"
-#include "../jit_kernels/impls/legacy/sm100_bf16_mqa_logits.hpp"
 #include "../jit_kernels/impls/legacy/sm90_fp8_mqa_logits.hpp"
 #include "../jit_kernels/impls/legacy/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/legacy/sm120_paged_mqa_logits.hpp"
@@ -620,14 +619,15 @@ static torch::Tensor fp8_fp4_mqa_logits_legacy(const std::tuple<torch::Tensor, s
             seq_len >= 2048 and seq_len_kv >= 65536;
         const bool separate_cleanup = clean_logits and not schedule_meta.has_value() and
             (legacy_fp8_cleanup or long_mx_cleanup or long_legacy_h8_cleanup);
-        // MX scales with BF16 weights and compressed BF16 logits (uncleaned, unscheduled) take the kernel with
-        // separate KV / SF producers; it shares the 384-token split, so the logits layout above holds
+        // MX scales with BF16 weights and compressed BF16 logits (uncleaned, unscheduled) take the current
+        // contiguous kernel; it shares the 384-token split, so the logits layout above holds
         const bool bf16_mqa_kernel = is_mx_sf and weights.scalar_type() == torch::kBFloat16 and
             logits_dtype == torch::kBFloat16 and max_seqlen_k > 0 and not clean_logits and not schedule_meta.has_value();
         if (bf16_mqa_kernel) {
-            DG_HOST_ASSERT(block_kv == legacy::kBF16MQALogitsSplitKV);
-            legacy::sm100_bf16_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
-                                          seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, qk_dtype);
+            DG_HOST_ASSERT(block_kv == kMQALogitsSplitKV);
+            const MQALogitsConfig config(num_heads, head_dim, qk_dtype, false);
+            sm100_mqa_logits(config, q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
+                             logits, seq_len, seq_len_kv, stride_logits, std::nullopt);
         } else {
             legacy::sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                                      seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
