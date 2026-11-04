@@ -53,7 +53,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 #endif
 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, ptx::Allocator1Sm, ptx::Allocator2Sm>;
 
     // NOTES: an FP4xFP4 pair uses the dedicated MXF4 MMA (packed 4-bit operands, K-major only, UMMA_K=64);
     //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32, or 64 for K-major MXFP8 on SM107)

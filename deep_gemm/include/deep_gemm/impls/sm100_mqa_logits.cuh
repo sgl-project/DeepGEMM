@@ -130,7 +130,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     __syncwarp();
 
     if (warp_idx == kSpecWarpStart + 2)
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
+        ptx::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
     __syncthreads();
     // Load the allocated TMEM base to keep derived addresses in uniform registers
     const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
@@ -559,7 +559,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
-            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
+            ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
     }
 }
 

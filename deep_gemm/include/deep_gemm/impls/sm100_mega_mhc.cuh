@@ -51,7 +51,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         uint64_t* gmem_split_barriers) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using namespace mega_mhc;
-    using Allocator = cute::TMEM::Allocator1Sm;
+    using Allocator = ptx::Allocator1Sm;
     // Each Post worker occupies exactly one WG; the role dispatch hardwires two of them.
     constexpr uint32_t kNumPostWGs = 2;
 

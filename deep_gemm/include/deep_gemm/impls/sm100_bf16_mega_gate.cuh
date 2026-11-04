@@ -39,7 +39,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                           uint32_t num_tokens, uint32_t block_tokens, uint32_t num_stages,
                           uint32_t num_worker_groups, uint32_t num_token_blocks) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
-    using Allocator = cute::conditional_t<kNumMmaCtas == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    using Allocator = cute::conditional_t<kNumMmaCtas == 1, ptx::Allocator1Sm, ptx::Allocator2Sm>;
 
     constexpr uint32_t kNumNonEpilogueWarps = mega_gate_layout::kNumNonEpilogueThreads / 32;
     constexpr uint32_t kNumGateWarps = kNumGateThreads / 32;

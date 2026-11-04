@@ -119,7 +119,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
         // Allocate tensor memory
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+        ptx::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
     const uint32_t tmem_base = *tmem_ptr_in_smem;
@@ -265,7 +265,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         // Deallocate tensor memory by warp 1
         // NOTES: warp 0 is waiting TMA store
         if (warp_idx == 1)
-            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
+            ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
     } else {
         DG_STATIC_ASSERT(BLOCK_M == 64, "Invalid block M");
         DG_STATIC_ASSERT(kNumCastAndReduceThreads == 128, "Invalid cast-and-reduce threads");
