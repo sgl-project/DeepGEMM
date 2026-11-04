@@ -34,7 +34,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_operator_t, bool kUsePaddedSFLayout = true>
+          typename epilogue_operator_t, bool kUsePaddedSFLayout = true, bool kSplitSFTranspose = false, bool kSFFirst = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -87,7 +87,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT((kSwapAB and BLOCK_N == LAYOUT_AD_M) or
-                     (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
+                     (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M or BLOCK_M == 2 * LAYOUT_AD_M)), "Invalid block size");
+    // NOTES: with BLOCK_M = 256 (non-swap), each K step issues two MMAs that share B, one per 128-row half of A
+    constexpr uint32_t kNumMHalves = (not kSwapAB and BLOCK_M > LAYOUT_AD_M) ? BLOCK_M / LAYOUT_AD_M : 1;
+    DG_STATIC_ASSERT(kNumMHalves == 1 or (kMajorA == cute::UMMA::Major::K and not kIsMXF4 and kIsSM107 and kNumMulticast == 2),
+                     "Two M halves need K-major MXF8 A and 2-CTA MMA on SM107");
 
     // MXF4 only supports K-major operands and 32-element SF granularity
     DG_STATIC_ASSERT(not kIsMXF4 or (kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K), "MXF4 only supports K-major");
@@ -110,7 +114,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
     // Epilogue configs
     // Always enable pipeline for better performance
-    constexpr uint32_t kNumEpilogueStages = 2;
+    constexpr uint32_t kNumEpilogueStages = kNumMHalves == 2 ? 1 : 2;
     DG_STATIC_ASSERT(kNumTMAStoreStages == 1 or kNumTMAStoreStages == 2, "Invalid number of TMA store stages");
     // NOTES: To maximize epilogue threads utilization, process an entire BLOCK_N
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
@@ -123,18 +127,22 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t UMMA_A_SIZE_PER_STAGE = math::constexpr_align(LOAD_BLOCK_M, LAYOUT_AD_M) * BLOCK_K * sizeof(a_dtype_t) / kPackFactor;
 
     // Tensor memory size and offsets
-    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
+    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages * kNumMHalves;
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M * SF_BLOCK_K / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N * SF_BLOCK_K / 32;
     constexpr uint32_t kNumSFTmemCols = kNumSFATmemCols + kNumSFBTmemCols;
-    constexpr uint32_t kNumOverlappedTmemCols = cute::max<uint32_t>(kNumAccumTmemCols + kNumSFTmemCols, 512) - 512;
-    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFTmemCols - kNumOverlappedTmemCols>();
+    // NOTES: SM107 allows a single 576-column allocation, used only by the two-half tile
+    constexpr uint32_t kNumMaxTmemCols = (kIsSM107 and kNumMHalves == 2) ? 576 : 512;
+    constexpr uint32_t kNumOverlappedTmemCols = kNumMHalves == 2 ? 0 : cute::max<uint32_t>(kNumAccumTmemCols + kNumSFTmemCols, 512) - 512;
+    DG_STATIC_ASSERT(kNumAccumTmemCols + kNumSFTmemCols - kNumOverlappedTmemCols <= kNumMaxTmemCols, "Too many tensor memory columns");
+    constexpr uint32_t kNumTmemCols = kNumAccumTmemCols + kNumSFTmemCols > 512 ? kNumMaxTmemCols :
+                                      utils::get_num_aligned_tmem_cols<cute::min(kNumAccumTmemCols + kNumSFTmemCols - kNumOverlappedTmemCols, 512u)>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols - kNumOverlappedTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kTmemStartColOfSFA + kNumSFATmemCols;
     DG_STATIC_ASSERT(kNumOverlappedTmemCols <= UMMA_N, "Invalid overlapped tensor memory columns");
     DG_STATIC_ASSERT(kSwapAB or kNumOverlappedTmemCols == 0 or kNumOverlappedTmemCols <= STORE_BLOCK_N,
                      "Non-swap overlapped tensor memory columns must fit in the first epilogue store");
-    DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
+    DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= kNumMaxTmemCols, "Invalid tensor memory columns");
 
     // Synchronize the cluster before 2-CTA TMEM allocation
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
@@ -161,10 +169,15 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     const auto shape_sfa_k = math::ceil_div(shape_k, kGranKA * 4);
     const auto shape_sfb_k = math::ceil_div(shape_k, kGranKB * 4);
 
-    using SharedStorage = layout::SM100FP8FP4GemmSharedStorage<
-        kNumStages, kNumEpilogueStages, kNumTMAStoreStages, LOAD_BLOCK_M, LOAD_BLOCK_N, BLOCK_K,
-        STORE_BLOCK_M, STORE_BLOCK_N, SF_BLOCK_M, SF_BLOCK_N, SF_BLOCK_K,
-        a_dtype_t, b_dtype_t, cd_dtype_t>;
+    using SharedStorage = cute::conditional_t<kSFFirst,
+        layout::SM100FP8FP4GemmSharedStorageSFFirst<
+            kNumStages, kNumEpilogueStages, kNumTMAStoreStages, LOAD_BLOCK_M, LOAD_BLOCK_N, BLOCK_K,
+            STORE_BLOCK_M, STORE_BLOCK_N, SF_BLOCK_M, SF_BLOCK_N, SF_BLOCK_K,
+            a_dtype_t, b_dtype_t, cd_dtype_t>,
+        layout::SM100FP8FP4GemmSharedStorage<
+            kNumStages, kNumEpilogueStages, kNumTMAStoreStages, LOAD_BLOCK_M, LOAD_BLOCK_N, BLOCK_K,
+            STORE_BLOCK_M, STORE_BLOCK_N, SF_BLOCK_M, SF_BLOCK_N, SF_BLOCK_K,
+            a_dtype_t, b_dtype_t, cd_dtype_t>>;
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -444,6 +457,22 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                             mma_t::fma(b_desc, a_desc, accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc,
                                        tmem_col_sfb, tmem_col_sfa);
+                        } else if constexpr (kNumMHalves == 2) {
+                            // B is read once into the collector by the first half and released by the second
+                            #pragma unroll
+                            for (uint32_t h = 0; h < 2; ++ h) {
+                                a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                                    a_desc_base_lo + h * (LAYOUT_AD_M * BLOCK_K * sizeof(a_dtype_t) / kPackFactor) / 16, 0, offset);
+                                const auto tmem_c = h * UMMA_N;
+                                const auto scale_c = static_cast<uint32_t>(umma_k_idx > 0 or k_block_idx > 0);
+                                if (h == 0) {
+                                    ptx::SM107_MMA_MXF8F6F4_2x1SM_SS_COLLECT_B<false>::fma(a_desc, b_desc, tmem_c, scale_c, runtime_instr_desc,
+                                                                                         tmem_col_sfa, tmem_col_sfb);
+                                } else {
+                                    ptx::SM107_MMA_MXF8F6F4_2x1SM_SS_COLLECT_B<true>::fma(a_desc, b_desc, tmem_c, scale_c, runtime_instr_desc,
+                                                                                        tmem_col_sfa + 4, tmem_col_sfb);
+                                }
+                            }
                         } else {
                             mma_t::fma(a_desc, b_desc, accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc,
@@ -482,10 +511,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             smem.tmem_empty_barriers[iter_idx % kNumEpilogueStages].wait(accum_phase_idx);
         }
-    } else if (warp_idx == 2 or (SF_BLOCK_K == 2 and warp_idx == 3)) {
+    } else if (warp_idx == 2 or ((SF_BLOCK_K == 2 or kSplitSFTranspose) and warp_idx == 3)) {
         // UTCCP transposer
-        // NOTES: use up to 2 warps to transpose, one per SF sub-block on K (only warp 3 when SF_BLOCK_K == 2)
-        const uint32_t sf_k_subblock_idx = warp_idx - 2;
+        // NOTES: with 2 SF sub-blocks on K, each warp transposes one sub-block of every stage;
+        //        with 1 and `kSplitSFTranspose`, each warp owns every other stage (by stage index, so each warp waits every phase of its stages)
+        const uint32_t sf_k_subblock_idx = SF_BLOCK_K == 2 ? warp_idx - 2 : 0;
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
@@ -499,6 +529,9 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                if (SF_BLOCK_K == 1 and kSplitSFTranspose and (stage_idx & 1) != warp_idx - 2)
+                    continue;
+
                 // Wait SF TMA arrival
                 smem.sf_full_barriers[stage_idx].wait(phase);
 
@@ -540,9 +573,9 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             smem.tmem_full_barriers[accum_stage_idx].wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
 
-            const auto tmem_base_addr = accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols);
+            const auto tmem_base_addr = accum_stage_idx * (UMMA_N * kNumMHalves - kNumOverlappedTmemCols);
             const bool reverse_store_order = kNumOverlappedTmemCols > 0 and accum_stage_idx == 0;
-            DG_STATIC_ASSERT(kNumEpilogueStages == 2,
+            DG_STATIC_ASSERT(kNumEpilogueStages == 2 or kNumOverlappedTmemCols == 0,
                              "reverse_store_order depends on exactly 2 accumulator stages");
             // Whether the group offset is encoded in the flattened CD M coordinate
             constexpr bool kCDWithGroupOffset = not is_m_grouped_contiguous(kGemmType) and not is_k_grouped_contiguous(kGemmType);

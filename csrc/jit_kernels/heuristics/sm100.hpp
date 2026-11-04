@@ -3,6 +3,7 @@
 #include "../../runtime/runtime.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.cuh>
@@ -20,8 +21,49 @@ struct SM107ArchSpec {
     static bool is_current() { return jit->device.get_arch_pair() == std::make_pair(10, 7); }
 };
 
+struct DenseTuning {
+    bool oversized_smem = false;
+    bool sf_first = false;
+    bool split_sf_transpose = false;
+};
+
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
+
+    static bool use_dense_tuning(const GemmDesc& desc) {
+        return desc.gemm_type == GemmType::Normal and desc.kernel_type == KernelType::Kernel1D1D and
+               desc.get_mma_kind() == MmaKind::MXFP8FP4 and deep_jit::get_env<int>("DG_DENSE_TUNING", 1) != 0;
+    }
+
+    static bool use_sm107_dense_tuning(const GemmDesc& desc) {
+        return use_dense_tuning(desc) and SM107ArchSpec::is_current();
+    }
+
+    static bool use_sm107_two_half_tile(const GemmDesc& desc) {
+        return use_sm107_dense_tuning(desc) and desc.k >= 8192 and desc.m >= 2048 and
+               desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K and
+               desc.a_dtype == torch::kFloat8_e4m3fn and desc.b_dtype == torch::kFloat8_e4m3fn;
+    }
+
+    static DenseTuning get_dense_tuning(const GemmDesc& desc, const Layout& layout) {
+        DenseTuning tuning;
+        if (not use_dense_tuning(desc))
+            return tuning;
+        tuning.split_sf_transpose = get_layout_info(desc, layout).num_waves <= 2;
+        if (use_sm107_dense_tuning(desc) and not layout.swap_ab and layout.block_n >= 64) {
+            tuning.oversized_smem = true;
+            tuning.sf_first = layout.block_m == 128 and layout.block_n == 64;
+        }
+        return tuning;
+    }
+
+    static std::optional<int> get_smem_mode(const int& smem_size) {
+#if CUDA_VERSION >= 13040
+        if (smem_size > smem_capacity)
+            return CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+#endif
+        return std::nullopt;
+    }
 
     static std::pair<int, int> get_sf_uttcp_aligned_block_sizes(
         const int& block_m, const int& block_n, const MmaKind& mma_kind) {
@@ -52,6 +94,9 @@ struct SM100ArchSpec {
             std::vector<Layout> candidates = {layout};
             return candidates;
         }
+
+        if (use_sm107_two_half_tile(desc) and ceil_div(desc.m, 256) % 2 == 0 and desc.n % 256 == 0 and desc.num_sms % 2 == 0)
+            return {Layout{false, 256, 256, block_k, 2, 1}};
 
         // Large K-major batched projections benefit from the deeper non-overlapped
         // pipeline. Keep overlapping tiles for smaller/shallow projections and MN-major B.
@@ -193,6 +238,15 @@ struct SM100ArchSpec {
         }
 
         DG_HOST_ASSERT(not candidates.empty());
+
+        if (use_sm107_dense_tuning(desc) and desc.m > 128 and desc.m <= 256) {
+            std::vector<Layout> single_wave_non_swap;
+            for (const auto& c: candidates)
+                if (not c.swap_ab and get_layout_info(desc, c).num_waves == 1)
+                    single_wave_non_swap.push_back(c);
+            if (not single_wave_non_swap.empty())
+                candidates = std::move(single_wave_non_swap);
+        }
         return candidates;
     }
 
@@ -273,10 +327,11 @@ struct SM100ArchSpec {
         }
 
         // Calculate stages
-        int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
+        const auto tuning = get_dense_tuning(desc, layout);
+        int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr + (tuning.sf_first ? 1024 : 0);
         int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
         int num_stages = std::min(
-            (smem_capacity - smem_extra) / smem_per_stage,
+            ((tuning.oversized_smem ? SM107ArchSpec::oversized_smem_capacity : smem_capacity) - smem_extra) / smem_per_stage,
             kNumMaxStages);
         return {
             smem_extra + num_stages * smem_per_stage,

@@ -85,6 +85,40 @@ struct SM100_MMA_MXF8F6F4_2x1SM_SS {
     }
 };
 
+template <bool kLastUse>
+struct SM107_MMA_MXF8F6F4_2x1SM_SS_COLLECT_B {
+    CUTLASS_DEVICE static void
+    fma(uint64_t const& desc_a,
+        uint64_t const& desc_b,
+        uint32_t const& tmem_c,
+        uint32_t const& scale_c,
+        uint64_t const& desc,
+        uint32_t const& tmem_sfa,
+        uint32_t const& tmem_sfb) {
+        if constexpr (kLastUse) {
+            asm volatile(
+              "{\n\t"
+              ".reg .pred p;\n\t"
+              "setp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.collector::a::discard.collector::b::lastuse [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+              "}\n"
+              :
+              : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(static_cast<uint32_t>(desc >> 32)), "r"(scale_c),
+                "r"(tmem_sfa), "r"(tmem_sfb));
+        } else {
+            asm volatile(
+              "{\n\t"
+              ".reg .pred p;\n\t"
+              "setp.ne.b32 p, %4, 0;\n\t"
+              "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale.collector::a::discard.collector::b::fill [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+              "}\n"
+              :
+              : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(static_cast<uint32_t>(desc >> 32)), "r"(scale_c),
+                "r"(tmem_sfa), "r"(tmem_sfb));
+        }
+    }
+};
+
 struct SM100_MMA_F8F6F4_SS {
     CUTLASS_DEVICE static void
     fma(uint64_t const& desc_a,

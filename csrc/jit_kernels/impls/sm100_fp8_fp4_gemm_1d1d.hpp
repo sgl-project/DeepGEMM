@@ -31,6 +31,8 @@ public:
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
         CUtensorMap tensor_map_cd;
+        bool split_sf_transpose = false;
+        bool sf_first = false;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -58,7 +60,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {},
-        {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )",
@@ -77,10 +79,11 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         a_dtype, b_dtype, to_string(args.gemm_desc.cd_dtype),
-        args.epilogue_class->get_epilogue_operator_type(), args.use_padded_sf_layout), args.epilogue_class->compiler_options());
+        args.epilogue_class->get_epilogue_operator_type(), args.use_padded_sf_layout, args.split_sf_transpose, args.sf_first), args.epilogue_class->compiler_options());
 
         // Launch
-        jit->launch(
+        launch_with_shared_memory_mode(
+            SM100ArchSpec::get_smem_mode(args.gemm_config.pipeline_config.smem_size),
             kernel, args.options,
             args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.epilogue_class->make_epilogue_operator_args(args.gemm_desc.m, args.gemm_desc.n),
@@ -122,6 +125,7 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .max_gran_k = std::max(gran_k_a, gran_k_b)
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
+    const auto tuning = SM100ArchSpec::get_dense_tuning(desc, config.layout);
 
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -164,7 +168,9 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .split_sf_transpose = tuning.split_sf_transpose,
+        .sf_first = tuning.sf_first
     });
 }
 
