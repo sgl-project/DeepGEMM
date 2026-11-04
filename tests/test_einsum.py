@@ -15,6 +15,7 @@ from deep_gemm.utils.math import (
 from utils import (
     assert_direct_output_matches_fp32_accumulation,
     assert_stochastic_bf16_matches_fp32_accumulation,
+    to_flashinfer_128x4_sf,
 )
 
 
@@ -175,6 +176,14 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
                             restored_output = cast_back_from_fp8(
                                 output.view(b, h * d), sfd.contiguous(), gran_k=32, use_packed_ue8m0=True)
                             diff = calc_diff(restored_output, ref_z.reshape(b, h * d))
+
+                    # A 4D SFD holds the same SFs in FlashInfer's 128x4 swizzle
+                    deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output, sfd))
+                    output_4d = torch.empty_like(output)
+                    sfd_4d = torch.full((ceil_div(b, 128), h * d // 128, 32, 4), -1, device='cuda', dtype=torch.int32)
+                    deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output_4d, sfd_4d))
+                    assert torch.equal(output_4d.view(torch.uint8), output.view(torch.uint8)), f'{b=}: FP8 with 4D SF'
+                    assert torch.equal(sfd_4d, to_flashinfer_128x4_sf(sfd)), f'{b=}: 4D SF'
                 else:
                     output = z
                     deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output)

@@ -72,6 +72,8 @@ struct NormArgs {
     uint32_t* y_primary_sf;
     int64_t y_primary_sf_stride_token;
     int64_t y_primary_sf_stride_word;
+    // Non-zero selects FlashInfer's 128x4 swizzle: words between 128-token tiles
+    int64_t y_primary_sf_stride_mtile;
     uint32_t* y_shared_sf;
     int64_t y_shared_sf_stride_word;
 };
