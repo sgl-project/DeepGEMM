@@ -306,7 +306,16 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
     const uint32_t partition_idx = task_idx % num_partitions;
     const uint32_t hidden_pack_begin = partition_idx * kNumHiddenPacks / num_partitions;
     const uint32_t hidden_pack_end = (partition_idx + 1) * kNumHiddenPacks / num_partitions;
-    const uint32_t m_idx = task_idx / num_partitions * kNumTokensPerShiftedNormTask;
+    uint32_t m_idx = task_idx / num_partitions * kNumTokensPerShiftedNormTask;
+    if constexpr (kSwizzledPrimarySF) {
+        // A 32 B swizzled SF sector holds token pairs `p`, `p + 16`, `p + 32` and `p + 48` of a 128-token tile;
+        // hand `p` and `p + 16` to the same CTA so each sector has two writers, as in the MN-major layout
+        const uint32_t pair_idx = task_idx / num_partitions, pair_in_tile = pair_idx % 64;
+        m_idx = (pair_idx / 64 * 64 + (pair_in_tile & 1) * 16 + (pair_in_tile >> 1 & 15) + (pair_in_tile >> 5) * 32) *
+                kNumTokensPerShiftedNormTask;
+        if (m_idx >= norm_args.num_tokens)
+            return;
+    }
     const uint32_t m_block_idx = m_idx / BLOCK_M;
     const bool has_second_token = m_idx + 1 < norm_args.num_tokens;
     uint2 shared_sf_row_indices = {};
@@ -406,7 +415,8 @@ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace
                                             const uint32_t& lane_idx) {
     constexpr uint32_t kNumTasksPerGridWave = kNumSMs * kNumWarpsPerWG;
     constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
-    const uint32_t num_token_pairs = math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
+    const uint32_t num_token_pairs = kSwizzledPrimarySF ? math::ceil_div(norm_args.num_tokens, 128u) * 64 :
+                                     math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
     // Only subdivide underfilled FP8 grids when a token pair can span multiple CTAs.
     constexpr uint32_t kNumFP8Partitions =
         kNumSplits > kDefaultNumSplits and kNumHiddenPacks > 2 * kNumWarpsPerWG ? kNumHiddenPacks / 2 : 2;
