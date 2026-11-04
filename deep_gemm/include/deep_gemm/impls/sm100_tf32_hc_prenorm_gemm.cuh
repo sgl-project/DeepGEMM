@@ -122,6 +122,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
+    const uint32_t tmem_base = *tmem_ptr_in_smem;
 
     constexpr uint32_t kNumKBlocks = math::constexpr_ceil_div(SHAPE_K, BLOCK_K);
     constexpr uint32_t kNumKBlocksPerSplit = kNumKBlocks / kNumSplits;
@@ -200,7 +201,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                     const uint32_t& in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
                     const uint32_t& offset = atom_idx * BLOCK_N * BLOCK_SWIZZLED_BK;
                     b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(b_desc_base_lo, offset, in_atom_idx);
-                    umma_t::fma(BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, BLOCK_K * kNumCastStages, s > 0 or k > 0, runtime_instr_desc);
+                    umma_t::fma(tmem_base + BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, tmem_base + BLOCK_K * kNumCastStages, s > 0 or k > 0, runtime_instr_desc);
                 }
 
                 // Commit
@@ -232,7 +233,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         #pragma unroll
         for (uint32_t i = 0; i < BLOCK_N / kNumElemsPerBankGroup; ++ i) {
             // Source and destination memory address
-            uint32_t tmem_addr = BLOCK_K * kNumCastStages + i * kNumElemsPerBankGroup;
+            uint32_t tmem_addr = tmem_base + BLOCK_K * kNumCastStages + i * kNumElemsPerBankGroup;
             auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd) +                   // Base pointer
                             warp_idx * BLOCK_M / 4 * kSwizzleCDMode +               // Warp offset
                             get_swizzled_smem_offset<kSwizzleCDMode>(i, lane_idx);  // In-atom offset
@@ -264,7 +265,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         // Deallocate tensor memory by warp 1
         // NOTES: warp 0 is waiting TMA store
         if (warp_idx == 1)
-            cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+            cute::TMEM::Allocator1Sm().free(tmem_base, kNumTmemCols);
     } else {
         DG_STATIC_ASSERT(BLOCK_M == 64, "Invalid block M");
         DG_STATIC_ASSERT(kNumCastAndReduceThreads == 128, "Invalid cast-and-reduce threads");
@@ -321,7 +322,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 cute::SM100_TMEM_STORE_16dp256b1x::copy(
                     upper_view[idx_0], upper_view[idx_1],
                     lower_view[idx_0], lower_view[idx_1],
-                    cast_stage_idx * BLOCK_K + i * 8);
+                    tmem_base + cast_stage_idx * BLOCK_K + i * 8);
             }
             cutlass::arch::fence_view_async_tmem_store();
             cutlass::arch::fence_view_async_shared();

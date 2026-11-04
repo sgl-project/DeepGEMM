@@ -145,6 +145,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         Allocator().allocate(kNumTmemCols, &smem.tmem_ptr);
     }
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr);
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -306,10 +307,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                         b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
                                         b_desc_base_lo, atom_k_idx * LOAD_BLOCK_N * BLOCK_ATOM_K, inner_k_idx);
                         if (kSwapAB) {
-                            mma_t::fma(b_desc, a_desc, accum_stage_idx * UMMA_N,
+                            mma_t::fma(b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc);
                         } else {
-                            mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
+                            mma_t::fma(a_desc, b_desc, tmem_base + accum_stage_idx * UMMA_N,
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc);
                         }
                     };
@@ -371,9 +372,6 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
-        // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
-
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
 
@@ -387,7 +385,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             ptx::tcgen05_after_thread_sync();
 
             // Load from tensor memory into registers, and write shared memory with STSM
-            const auto tmem_base_addr = accum_stage_idx * UMMA_N;
+            const auto tmem_base_addr = tmem_base + accum_stage_idx * UMMA_N;
             // Whether the group offset is encoded in the flattened CD M coordinate
             constexpr bool kCDWithGroupOffset = not is_m_grouped_contiguous(kGemmType) and not is_k_grouped_contiguous(kGemmType);
             const auto base_m_idx = scheduler.template get_global_idx<
@@ -434,7 +432,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
     // Deallocate tensor memory
     if (warp_idx == 0)
-        Allocator().free(0, kNumTmemCols);
+        Allocator().free(tmem_base, kNumTmemCols);
 
     // Finalize the epilogue while the other warp deallocates tensor memory.
     if (epilogue_warp_idx < kNumUMMAStoreThreads / 32)

@@ -278,6 +278,7 @@ sm100_bf16_mega_moe_impl(void* y,
         Allocator().allocate(kNumTmemCols, &shared_storage.tmem_ptr_in_smem);
     }
     cute::cluster_sync();
+    const uint32_t tmem_base = ptx::ld_shared(&shared_storage.tmem_ptr_in_smem);
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -869,7 +870,7 @@ sm100_bf16_mega_moe_impl(void* y,
                                 b_desc.lo = mma::sm100::advance_umma_desc_lo<
                                     cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, umma_k_block_idx * UMMA_BLOCK_K * LOAD_BLOCK_N, k * UMMA_K);
                                 ptx::SM100_MMA_F16BF16_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    b_desc, a_desc, tmem_base + accum_stage_idx * UMMA_N,
                                     k_block_idx > 0 or umma_k_block_idx > 0 or k > 0,
                                     static_cast<uint64_t>(static_cast<uint32_t>(instr_desc)) << 32);
                             }
@@ -902,9 +903,6 @@ sm100_bf16_mega_moe_impl(void* y,
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
-        // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&shared_storage.tmem_ptr_in_smem) == 0);
-
         // GEMM epilogue warps
         const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const auto epilogue_wg_idx = epilogue_warp_idx / 4;
@@ -1005,7 +1003,7 @@ sm100_bf16_mega_moe_impl(void* y,
                         };
 
                         // Load from TMEM
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                        uint32_t tmem_addr = tmem_base + accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
@@ -1151,7 +1149,7 @@ sm100_bf16_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
                         // Start from lane index 0 and 16
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                        uint32_t tmem_addr = tmem_base + accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
@@ -1232,7 +1230,7 @@ sm100_bf16_mega_moe_impl(void* y,
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
         if (epilogue_warp_idx == 0)
-            Allocator().free(0, kNumTmemCols);
+            Allocator().free(tmem_base, kNumTmemCols);
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers

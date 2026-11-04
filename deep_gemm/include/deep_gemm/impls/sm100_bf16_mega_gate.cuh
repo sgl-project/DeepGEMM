@@ -118,6 +118,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
     kNumMmaCtas > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     cudaGridDependencySynchronize();
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr);
 
     using Workspace = mega_gate_layout::Workspace<kNumSplitK, kNumRoutedExperts>;
     const Workspace workspace(gmem_scratch, gmem_score_barriers);
@@ -127,7 +128,6 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
     // Persistent schedule: the `kNumLogicalCtas` CTAs of a worker group stride over the token blocks together
     const auto worker_group_idx = blockIdx.x / kNumLogicalCtas;
 
-    DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
     DG_TRAP_ONLY_DEVICE_ASSERT(num_stages <= mega_gate_layout::kNumMaxStages);
 
     // Dispatch warps into different roles
@@ -220,7 +220,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                         weight_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleMode, cutlass::bfloat16_t>(
                                             weight_desc_base_lo, 0, umma_k_idx * UMMA_K);
                         // NOTES: the weights are the A operand, so a TMEM lane holds one expert and a column one token
-                        mma_t::fma(weight_desc, x_desc, accum_stage_idx * UMMA_N,
+                        mma_t::fma(weight_desc, x_desc, tmem_base + accum_stage_idx * UMMA_N,
                                    umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc);
                     }
                 }
@@ -287,7 +287,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             epilogue::mega_gate::sm100_store_tmem_scores_to_global<
                                     kScoreOnStore, Workspace::kTokenStride, UMMA_M, kNumMmaCtas, kNumGateWarps>(
                                         workspace.get_score_ptr(token_base_idx, split_k_idx),
-                                        accum_stage_idx * UMMA_N,
+                                        tmem_base + accum_stage_idx * UMMA_N,
                                         effective_umma_n, expert_group_base_idx,
                                         mma_cta_rank, gate_warp_idx
                                     );
@@ -439,7 +439,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
     kNumMmaCtas > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     if (warp_idx == 0)
-        Allocator().free(0, kNumTmemCols);
+        Allocator().free(tmem_base, kNumTmemCols);
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
