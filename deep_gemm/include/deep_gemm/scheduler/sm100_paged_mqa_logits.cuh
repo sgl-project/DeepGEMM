@@ -162,6 +162,7 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_q_tokens_total,
 template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
 struct SM100PagedMQALogitsScheduler {
     static constexpr bool kIsPaged = true;
+    static constexpr uint32_t kNumSplitsPerChunk = kSplitsPerChunk;
     static constexpr uint32_t kPageKV = PAGE_KV;
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     // Cache one page coordinate per lane

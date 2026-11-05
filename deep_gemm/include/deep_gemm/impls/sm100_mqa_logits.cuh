@@ -52,7 +52,7 @@ CUTLASS_DEVICE void visit_tmem_head_chunks(const uint32_t& tmem_col, float* accu
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t UMMA_N,
-          uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages, uint32_t kNumKVRingStages,
+          uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename qk_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
@@ -67,6 +67,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
     using Scheduler = decltype(make_scheduler(0u));
     constexpr bool kIsPaged = Scheduler::kIsPaged;
+    constexpr uint32_t kNumKVRingStages = [] {
+        if constexpr (kIsPaged)
+            return math::constexpr_min(Scheduler::kNumSplitsPerChunk, kNumKVStages);
+        else
+            return kNumKVStages;
+    }();
 
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
@@ -102,7 +108,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
     DG_STATIC_ASSERT(kNumTmemStages == kNumMathWarpGroups, "TMEM stages must match math warp groups");
-    DG_STATIC_ASSERT(kNumKVRingStages > 0 and kNumKVRingStages <= kNumKVStages, "Invalid KV ring");
 
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumTmemStages;
     constexpr uint32_t kNumSFQColsPerStage = kNumSFQ / 32;
@@ -607,7 +612,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
 
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
-                               UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages, kNumKVStages,
+                               UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
@@ -644,7 +649,6 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
                                UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
-                               (kSplitsPerChunk < kNumKVStages ? kSplitsPerChunk : kNumKVStages),
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
