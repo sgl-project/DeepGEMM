@@ -7,6 +7,14 @@
 
 namespace deep_gemm::layout::mega_mhc {
 
+#if defined(__CUDACC__)
+// Exact BF16x2 widening: one shift and one mask, no PRMT
+CUTLASS_DEVICE float2 bf16x2_to_float2(const nv_bfloat162& value) {
+    const uint32_t bits = *reinterpret_cast<const uint32_t*>(&value);
+    return {__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u)};
+}
+#endif
+
 // Model geometry
 static constexpr uint32_t kNumRoutes = 4;
 static constexpr uint32_t kNumHCOutputs = kNumRoutes * (kNumRoutes + 2);
@@ -22,7 +30,7 @@ static constexpr uint32_t BLOCK_K = 64;
 static constexpr uint32_t kSwizzleMode = 128;
 static constexpr uint32_t kFnAtomK = kSwizzleMode / sizeof(float);
 static constexpr uint32_t kSwizzleAlignment = 8 * kSwizzleMode;
-static constexpr uint32_t kNumIOStages = 4;
+static constexpr uint32_t kNumIOStages = 3;
 static constexpr uint32_t kNumFnStages = 2;
 static constexpr uint32_t kNumAStages = 4;
 static constexpr uint32_t kNumAccumStages = 2;
@@ -174,5 +182,21 @@ struct SharedStorage {
     // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
     alignas(uint32_t) uint32_t next_norm_task_ticket;
 };
+
+// In-CTA Norm keeps several tasks' X1 tiles behind SharedStorage (VR oversized shared memory)
+static constexpr uint32_t kNumX1Buffers = 3;
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_offset() {
+    return (static_cast<uint32_t>(sizeof(SharedStorage)) + kSwizzleAlignment - 1) / kSwizzleAlignment * kSwizzleAlignment;
+}
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_size(const uint32_t& max_num_k_blocks_per_task) {
+    return kNumX1Buffers * max_num_k_blocks_per_task * BLOCK_M * BLOCK_K * static_cast<uint32_t>(sizeof(nv_bfloat16));
+}
+
+// The RMSNorm weight follows the X1 tiles, staged once per CTA
+CUTLASS_HOST_DEVICE constexpr uint32_t get_in_cta_norm_smem_size(const uint32_t& max_num_k_blocks_per_task, const uint32_t& hidden) {
+    return get_x1_tiles_smem_size(max_num_k_blocks_per_task) + hidden * static_cast<uint32_t>(sizeof(nv_bfloat16));
+}
 
 } // namespace deep_gemm::layout::mega_mhc

@@ -61,7 +61,8 @@ struct SplitBarrier {
         const auto current_barrier_base = encode_state(Epoch::get(gmem_split_barriers));
         const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
         // NOTES: unsigned distance rejects stale epoch tags but accepts any current-epoch arrival count.
-        while (ptx::ld_acq_gpu(split_barrier_ptr) - current_barrier_base >= kNumSplits);
+        while (ptx::ld_relaxed_gpu(split_barrier_ptr) - current_barrier_base >= kNumSplits);
+        ptx::ld_acq_gpu(split_barrier_ptr);
     }
 
     template <uint32_t kNumSplits>
@@ -75,7 +76,9 @@ struct SplitBarrier {
     static CUTLASS_DEVICE void wait(uint64_t* gmem_split_barriers, const uint32_t& m_block_idx) {
         const auto all_splits_arrived_state = encode_state(Epoch::get(gmem_split_barriers), kNumSplits);
         const auto split_barrier_ptr = get_ptr(gmem_split_barriers, m_block_idx);
-        while (ptx::ld_acq_gpu(split_barrier_ptr) != all_splits_arrived_state);
+        while (ptx::ld_relaxed_gpu(split_barrier_ptr) != all_splits_arrived_state)
+            __nanosleep(128);
+        ptx::ld_acq_gpu(split_barrier_ptr);
     }
 };
 
