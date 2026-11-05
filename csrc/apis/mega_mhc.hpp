@@ -262,8 +262,10 @@ static void mega_mhc(const torch::Tensor& x,
         mhc_layout::get_x1_tiles_smem_size(1);
     const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
                                            max_num_k_blocks_per_task);
+    // A CTA holding more than kNumX1Buffers splits of one m-block would wait on its own Post, so in-CTA Norm keeps
+    // grid-stride task ownership and needs a grid at least as wide as the split count
     in_cta_norm = in_cta_norm and ceil_div(hidden / static_cast<int>(mhc_layout::BLOCK_K), static_cast<int>(num_splits)) <=
-                                  static_cast<int>(max_num_k_blocks_per_task);
+                                  static_cast<int>(max_num_k_blocks_per_task) and num_splits <= static_cast<uint32_t>(num_sms);
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;

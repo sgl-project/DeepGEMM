@@ -61,6 +61,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                      "Splits must contain nonempty, aligned K blocks");
     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
     DG_STATIC_ASSERT(not kInCTANorm or kIsShifted, "In-CTA Norm needs Shifted X1");
+    DG_STATIC_ASSERT(not kInCTANorm or (not kUseTaskQueue and kNumSplits <= kNumSMs), "In-CTA Norm needs grid-stride task ownership");
 #if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 1070)
     constexpr bool kIsSM107 = true;
 #else
