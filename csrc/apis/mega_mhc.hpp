@@ -28,9 +28,10 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
         return math::ceil_div(num_m_blocks * s, num_sms) * math::ceil_div(num_k_blocks, s);
     };
     // Keep a split count whose tasks fit the in-CTA Norm buffers if the default one does
+    const bool keeps_x1_fit = x1_k_block_budget > 0 and
+                              mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits) <= x1_k_block_budget;
     const auto fits = [&](const uint32_t& s) {
-        return x1_k_block_budget == 0 or mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits) > x1_k_block_budget or
-               mhc_layout::get_max_num_k_blocks_per_task(hidden, s) <= x1_k_block_budget;
+        return not keeps_x1_fit or mhc_layout::get_max_num_k_blocks_per_task(hidden, s) <= x1_k_block_budget;
     };
     uint32_t best_num_splits = num_splits;
     for (uint32_t s = 1; s <= max_num_splits; ++ s) {
@@ -258,7 +259,7 @@ static void mega_mhc(const torch::Tensor& x,
                         num_m_blocks * mhc_layout::kDefaultNumSplits >= kMinNumTaskWavesForInCTANorm * static_cast<uint32_t>(num_sms));
     const uint32_t x1_k_block_budget = not in_cta_norm ? 0 :
         (SM107ArchSpec::oversized_smem_capacity - mhc_layout::get_x1_tiles_smem_offset() - kNumStaticSmemReserveBytes -
-         static_cast<uint32_t>(hidden) * sizeof(nv_bfloat16)) /
+         mhc_layout::get_in_cta_norm_smem_size(0, static_cast<uint32_t>(hidden))) /
         mhc_layout::get_x1_tiles_smem_size(1);
     const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
                                            x1_k_block_budget);

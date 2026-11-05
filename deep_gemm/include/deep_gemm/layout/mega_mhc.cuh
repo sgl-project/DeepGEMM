@@ -185,6 +185,14 @@ struct SharedStorage {
     alignas(uint32_t) uint32_t next_norm_task_ticket;
 };
 
+// BF16 pair offset in a `[BLOCK_M][BLOCK_K]` tile with the 128B swizzle, shared by the IO tiles and the X1 tiles
+CUTLASS_HOST_DEVICE constexpr uint32_t get_swizzled_bf16x2_offset(const uint32_t& row_idx, const uint32_t& col_idx) {
+    constexpr uint32_t kNumColsPerRow = kSwizzleMode / sizeof(nv_bfloat162);
+    constexpr uint32_t kNumColsPerBank = 16 / sizeof(nv_bfloat162);
+    const uint32_t bank_group_idx = (col_idx / kNumColsPerBank) ^ (row_idx & (kSwizzleMode / 16 - 1));
+    return row_idx * kNumColsPerRow + bank_group_idx * kNumColsPerBank + col_idx % kNumColsPerBank;
+}
+
 // In-CTA Norm keeps several tasks' X1 tiles behind SharedStorage (VR oversized shared memory)
 static constexpr uint32_t kNumX1Buffers = 3;
 

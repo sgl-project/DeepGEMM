@@ -135,7 +135,7 @@ static void __instantiate_kernel() {{
         shared_sf_block_m,
         norm_args.y_primary_sf_stride_mtile != 0,
         // A dynamic task queue only pays off when the producer tasks span more than two grid waves
-        not in_cta_norm and ceil_div(num_tokens, static_cast<int>(mhc_layout::BLOCK_M)) * num_splits > 2 * num_sms,
+        not in_cta_norm and mhc_layout::Workspace<>::get_num_m_blocks(num_tokens) * num_splits > 2u * num_sms,
         in_cta_norm), compiler_options);
 
     // Launch; shared memory above the portable capacity needs the oversized mode (SM107, CUDA 13.4+)

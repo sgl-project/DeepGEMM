@@ -302,7 +302,6 @@ CUTLASS_DEVICE void run_in_cta_norm_task(const Workspace<kNumSplits>& workspace,
     constexpr uint32_t kNumLanesPerRow = BLOCK_K / kHiddenPerNormLane;
     constexpr uint32_t kNumRowsPerStep = 32 / kNumLanesPerRow;
     constexpr uint32_t kNumPairsPerTile = BLOCK_M * BLOCK_K / 2;
-    constexpr uint32_t kNumPairsPerRow = kSwizzleMode / sizeof(nv_bfloat162);
     DG_STATIC_ASSERT(kNumRowsPerWarp <= 32 and kNumRowsPerWarp % kNumRowsPerStep == 0, "Invalid in-CTA Norm geometry");
     DG_STATIC_ASSERT(kNumLanesPerRow % kNumLanesPerSF == 0, "Scaling groups must not span rows");
 
@@ -336,11 +335,9 @@ CUTLASS_DEVICE void run_in_cta_norm_task(const Workspace<kNumSplits>& workspace,
             const uint32_t row_idx = first_row_idx + step * kNumRowsPerStep + row_in_step;
             const uint32_t token_idx = m_block_idx * BLOCK_M + row_idx;
             const bool is_valid_token = token_idx < norm_args.num_tokens;
-            const float row_rms_scale = __shfl_sync(0xffffffff, rms_scale, row_idx - first_row_idx);
+            const float row_rms_scale = ptx::exchange(rms_scale, row_idx - first_row_idx);
 
-            // The 16 B chunk is one swizzled bank group of the row
-            const uint32_t bank_group_idx = chunk_idx ^ (row_idx & (kSwizzleMode / 16 - 1));
-            const auto tile_chunk = reinterpret_cast<uint4*>(tile + row_idx * kNumPairsPerRow + bank_group_idx * kNumBF16PairsPerLane);
+            const auto tile_chunk = reinterpret_cast<uint4*>(tile + get_swizzled_bf16x2_offset(row_idx, chunk_idx * kNumBF16PairsPerLane));
             const uint4 x1 = *tile_chunk;
             const auto x1_pairs = reinterpret_cast<const nv_bfloat162*>(&x1);
             uint4 values;
@@ -595,16 +592,19 @@ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace
         }
     };
 
-    if constexpr (kStoreFP8 and kNumSplits <= kDefaultNumSplits and kNumHiddenPacks % 4 == 0) {
-        // Small grids finish Norm after Post: use the most partitions that keep about 3 tasks per Norm warp.
-        constexpr uint32_t kNumNormWarps = kNumSMs * 3 * kNumWarpsPerWG;
-        if (num_token_pairs * (kNumHiddenPacks / 2) * 4 <= kNumNormWarps * 13)
-            run_tasks(cute::Int<kNumHiddenPacks / 2>{});
-        else if (num_token_pairs * (kNumHiddenPacks / 4) * 4 <= kNumNormWarps * 13)
-            run_tasks(cute::Int<kNumHiddenPacks / 4>{});
-        else
-            run_tasks(cute::Int<kNumFP8Partitions>{});
-    } else if constexpr (kStoreFP8) {
+    if constexpr (kStoreFP8) {
+        if constexpr (kNumSplits <= kDefaultNumSplits and kNumHiddenPacks % 4 == 0) {
+            // Small grids finish Norm after Post: use the most partitions that keep at most 13/4 tasks per Norm warp
+            // (WG5 and the two retired Post WGs).
+            constexpr uint32_t kNumNormWarps = kNumSMs * 3 * kNumWarpsPerWG;
+            const auto fits_norm_warps = [&](const uint32_t& num_partitions) {
+                return num_token_pairs * num_partitions * 4 <= kNumNormWarps * 13;
+            };
+            if (fits_norm_warps(kNumHiddenPacks / 2))
+                return run_tasks(cute::Int<kNumHiddenPacks / 2>{});
+            if (fits_norm_warps(kNumHiddenPacks / 4))
+                return run_tasks(cute::Int<kNumHiddenPacks / 4>{});
+        }
         run_tasks(cute::Int<kNumFP8Partitions>{});
     } else {
         run_tasks(cute::max(math::ceil_div(kNumHiddenPacks, cute::max(

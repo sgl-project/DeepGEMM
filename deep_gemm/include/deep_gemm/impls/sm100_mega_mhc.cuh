@@ -135,9 +135,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     __shared__ uint32_t task_ring[kNumTaskSlots];
     __shared__ alignas(8) uint64_t task_barrier_storage[kNumTaskSlots];
     const auto full_task_barriers = reinterpret_cast<cutlass::arch::ClusterTransactionBarrier*>(task_barrier_storage);
-    constexpr bool use_task_queue = kUseTaskQueue;
     const auto take_task = [&](const uint32_t& iter) {
-        if constexpr (not use_task_queue)
+        if constexpr (not kUseTaskQueue)
             return blockIdx.x + iter * kNumSMs;
         full_task_barriers[iter % kNumTaskSlots].wait((iter / kNumTaskSlots) & 1u);
         return ptx::ld_shared(&task_ring[iter % kNumTaskSlots]);
@@ -239,7 +238,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 uint32_t num_published = 0, last_published = 0;
                 const auto publish_task = [&](const uint32_t& task) {
                     const uint32_t slot = num_published % kNumTaskSlots;
-                    if constexpr (use_task_queue) {
+                    if constexpr (kUseTaskQueue) {
                         ptx::st_shared(&task_ring[slot], task);
                         full_task_barriers[slot].arrive();
                     }
@@ -255,7 +254,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     const uint32_t task_idx = take_task(iter);
                     if (task_idx >= num_tasks)
                         break;
-                    const bool should_claim = kIsProducer and use_task_queue and last_published < num_tasks;
+                    const bool should_claim = kIsProducer and kUseTaskQueue and last_published < num_tasks;
                     uint32_t claimed = 0;
                     if (should_claim)
                         claimed = atomicAdd(task_counter, 1u);
@@ -408,7 +407,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     const bool should_prefetch_next_coeff =
                         k_block_idx == (kIsSM107 ? 0 : num_task_k_blocks - 1) and next_task_idx < num_tasks;
 
-                    // Wait for a reusable slot before entering the final store-drain overlap window.
+                    // Next-task coefficients: first k-block on SM107, last (store-drain overlap) elsewhere
                     if (should_prefetch_next_coeff)
                         next_coeff_stage_idx = advance_coeff_pipeline();
 
@@ -424,7 +423,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                               m_idx, cute::TMA::CacheHintSm100::EVICT_LAST);
 
                         cute::tma_store_arrive();
-                        // Issue next-task coefficients here to avoid competing with the task's main TMA wave.
                         if (should_prefetch_next_coeff)
                             issue_coeff_tma(next_task_idx / kNumSplits * BLOCK_M, next_coeff_stage_idx);
 
@@ -459,13 +457,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         }
     } else if (warp_idx < kWorkspaceEpilogueWGIdx * kNumWarpsPerWG) {
         // WG1-2: Post workers, one per WG
-        const auto get_bf16x2_offset = [](const uint32_t& row_idx, const uint32_t& col_idx) {
-            constexpr uint32_t kNumColsPerRow = kSwizzleMode / sizeof(nv_bfloat162);
-            constexpr uint32_t kNumColsPerBank = 16 / sizeof(nv_bfloat162);
-            const uint32_t bank_group_idx = (col_idx / kNumColsPerBank) ^ (row_idx & (kSwizzleMode / 16 - 1));
-            return row_idx * kNumColsPerRow + bank_group_idx * kNumColsPerBank + col_idx % kNumColsPerBank;
-        };
-
         // Comb rows use a separate 64B swizzle to distribute each four-float group across banks.
         const auto load_comb_coeff = [](const float* row, const uint32_t& row_idx, const uint32_t& coeff_idx) {
             const uint32_t bank_group_idx = (coeff_idx / 4) ^ ((row_idx / 2) & 3);
@@ -545,11 +536,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         #pragma unroll
                         for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
                             x[row_idx] = bf16x2_to_float2(
-                                smem.x[io_stage_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
+                                smem.x[io_stage_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
                             #pragma unroll
                             for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx)
                                 residual[row_idx][input_route_idx] = bf16x2_to_float2(
-                                    smem.residual[io_stage_idx][input_route_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
+                                    smem.residual[io_stage_idx][input_route_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
                         }
 
                         // Wait MMA release of this worker's next A stage
@@ -578,7 +569,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                 const nv_bfloat162 post_value_bf16 = __float22bfloat162_rn(post_value);
                                 post_value = bf16x2_to_float2(post_value_bf16);
                                 smem.residual[io_stage_idx][output_route_idx][
-                                    get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = post_value_bf16;
+                                    get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = post_value_bf16;
                                 hc_norm_sqr_sums[row_idx] = __ffma2_rn(post_value, post_value, hc_norm_sqr_sums[row_idx]);
                                 if constexpr (kIsShifted) {
                                     const float2 pre = row_pre_coeff[output_route_idx];
@@ -603,9 +594,9 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                 ptx::accumulate_square(x1_sqr_sums[row_idx], x1_bf16);
                                 if constexpr (kInCTANorm)
                                     get_x1_task_tiles(iter)[k_block_idx * kNumX1PairsPerTile +
-                                                            get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
+                                                            get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
                                 else
-                                    smem.x[io_stage_idx][get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
+                                    smem.x[io_stage_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
                             }
                         }
 
