@@ -61,6 +61,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                      "Splits must contain nonempty, aligned K blocks");
     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
     DG_STATIC_ASSERT(not kInCTANorm or kIsShifted, "In-CTA Norm needs Shifted X1");
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 1070)
+    constexpr bool kIsSM107 = true;
+#else
+    constexpr bool kIsSM107 = false;
+#endif
 
     // MMA and tensor memory configs
     constexpr uint32_t kNumTmemColumnsPerAStage = kNumRoutes * UMMA_K;
@@ -400,7 +405,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     const uint32_t k_idx = get_task_k_begin(split_idx) + k_block_idx * BLOCK_K;
                     const uint32_t m_idx = m_block_idx * BLOCK_M;
                     const bool should_prefetch_next_coeff =
-                        k_block_idx == 0 and next_task_idx < num_tasks;
+                        k_block_idx == (kIsSM107 ? 0 : num_task_k_blocks - 1) and next_task_idx < num_tasks;
 
                     // Wait for a reusable slot before entering the final store-drain overlap window.
                     if (should_prefetch_next_coeff)
@@ -468,7 +473,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
         DG_STATIC_ASSERT(UMMA_K % kNumLanesPerRowGroup == 0, "Invalid Post geometry");
 
-        const auto run_post_worker = [&](const uint32_t kPostWorkerIdx) {
+        const auto run_post_worker = [&](const auto post_worker_idx) {
+            const uint32_t kPostWorkerIdx = post_worker_idx;
             cutlass::arch::warpgroup_reg_alloc<kNumPostRegisters>();
             const uint32_t col_pair_idx = lane_idx & (kNumLanesPerRowGroup - 1);
             const uint32_t first_row_idx = get_first_row_idx();
@@ -647,7 +653,13 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 __syncwarp();
             }
         };
-        run_post_worker(__shfl_sync(0xffffffff, warp_idx / kNumWarpsPerWG - kFirstPostWGIdx, 0));
+        // SM107: one Post code path with a runtime worker index; other SM100: one copy per worker
+        if constexpr (kIsSM107) {
+            run_post_worker(__shfl_sync(0xffffffff, warp_idx / kNumWarpsPerWG - kFirstPostWGIdx, 0));
+        } else {
+            warp_idx < (kFirstPostWGIdx + 1) * kNumWarpsPerWG ?
+                run_post_worker(cute::Int<0>{}) : run_post_worker(cute::Int<1>{});
+        }
         cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
     } else if (warp_idx < kMixWGIdx * kNumWarpsPerWG) {
         // WG3: workspace-epilogue worker, draining one split accumulator block per grid-stride task
