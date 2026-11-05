@@ -47,12 +47,14 @@ static constexpr uint32_t kNumSplitBarriers = 2;
 static constexpr uint64_t kSplitBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
 static constexpr uint32_t kNumMaxMBlocks = math::constexpr_ceil_div(kNumMaxTokens, BLOCK_M);
-// A barrier line holds one 8-byte state; the execution epoch and the exit count
+// A barrier line holds one 8-byte state; the execution epoch, the exit count and the task queue counter
 // live in the unused tail of the buffer's first line, so the buffer is unchanged.
+// The task queue counter relies on the per-launch memset of the active barrier lines to start at zero.
 static constexpr uint64_t kSplitBarrierEpochOffset = kSplitBarrierLineBytes / 2;
 static constexpr uint64_t kSplitBarrierExitCountOffset = kSplitBarrierEpochOffset + sizeof(uint64_t);
-DG_STATIC_ASSERT(kSplitBarrierExitCountOffset + sizeof(uint32_t) <= kSplitBarrierLineBytes,
-                 "Epoch and exit count must fit in the first barrier line");
+static constexpr uint64_t kSplitBarrierTaskCounterOffset = kSplitBarrierExitCountOffset + sizeof(uint64_t);
+DG_STATIC_ASSERT(kSplitBarrierTaskCounterOffset + sizeof(uint32_t) <= kSplitBarrierLineBytes,
+                 "Epoch, exit count and task counter must fit in the first barrier line");
 
 // Host/device ABI payloads for the two consumer domains. Tensor maps remain
 // standalone kernel parameters so TMA descriptors keep direct grid-constant access.
@@ -187,7 +189,11 @@ struct SharedStorage {
 static constexpr uint32_t kNumX1Buffers = 3;
 
 CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_offset() {
-    return (static_cast<uint32_t>(sizeof(SharedStorage)) + kSwizzleAlignment - 1) / kSwizzleAlignment * kSwizzleAlignment;
+    return math::constexpr_align(static_cast<uint32_t>(sizeof(SharedStorage)), kSwizzleAlignment);
+}
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_max_num_k_blocks_per_task(const uint32_t& hidden, const uint32_t& num_splits) {
+    return math::constexpr_ceil_div(hidden / BLOCK_K, num_splits);
 }
 
 CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_size(const uint32_t& max_num_k_blocks_per_task) {

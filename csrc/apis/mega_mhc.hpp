@@ -13,7 +13,7 @@ namespace deep_gemm::mega_mhc {
 namespace mhc_layout = layout::mega_mhc;
 
 static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms,
-                               const uint32_t max_num_k_blocks_per_task = 0) {
+                               const uint32_t x1_k_block_budget = 0) {
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
@@ -29,8 +29,8 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
     };
     // Keep a split count whose tasks fit the in-CTA Norm buffers if the default one does
     const auto fits = [&](const uint32_t& s) {
-        return max_num_k_blocks_per_task == 0 or math::ceil_div(num_k_blocks, num_splits) > max_num_k_blocks_per_task or
-               math::ceil_div(num_k_blocks, s) <= max_num_k_blocks_per_task;
+        return x1_k_block_budget == 0 or mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits) > x1_k_block_budget or
+               mhc_layout::get_max_num_k_blocks_per_task(hidden, s) <= x1_k_block_budget;
     };
     uint32_t best_num_splits = num_splits;
     for (uint32_t s = 1; s <= max_num_splits; ++ s) {
@@ -256,19 +256,19 @@ static void mega_mhc(const torch::Tensor& x,
     bool in_cta_norm = CUDA_VERSION >= 13040 and is_shifted and SM107ArchSpec::is_current() and
                        (in_cta_norm_env >= 0 ? in_cta_norm_env != 0 :
                         num_m_blocks * mhc_layout::kDefaultNumSplits >= kMinNumTaskWavesForInCTANorm * static_cast<uint32_t>(num_sms));
-    const uint32_t max_num_k_blocks_per_task = not in_cta_norm ? 0 :
+    const uint32_t x1_k_block_budget = not in_cta_norm ? 0 :
         (SM107ArchSpec::oversized_smem_capacity - mhc_layout::get_x1_tiles_smem_offset() - kNumStaticSmemReserveBytes -
          static_cast<uint32_t>(hidden) * sizeof(nv_bfloat16)) /
         mhc_layout::get_x1_tiles_smem_size(1);
     const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
-                                           max_num_k_blocks_per_task);
+                                           x1_k_block_budget);
     // A CTA holding more than kNumX1Buffers splits of one m-block would wait on its own Post, so in-CTA Norm keeps
     // grid-stride task ownership and needs a grid at least as wide as the split count
-    in_cta_norm = in_cta_norm and ceil_div(hidden / static_cast<int>(mhc_layout::BLOCK_K), static_cast<int>(num_splits)) <=
-                                  static_cast<int>(max_num_k_blocks_per_task) and num_splits <= static_cast<uint32_t>(num_sms);
+    in_cta_norm = in_cta_norm and num_splits <= static_cast<uint32_t>(num_sms) and
+                  mhc_layout::get_max_num_k_blocks_per_task(static_cast<uint32_t>(hidden), num_splits) <= x1_k_block_budget;
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
-    const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
+    const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted and not in_cta_norm;
     const auto num_bf16_scratch_bytes = needs_bf16_scratch ? static_cast<int64_t>(num_tokens) * hidden * x.element_size() : 0;
     // Reject an unwarmed stream before allocating temporary capture storage.
     const auto& split_barriers = get_split_barriers(x.options());
@@ -281,7 +281,8 @@ static void mega_mhc(const torch::Tensor& x,
         0, num_m_blocks * mhc_layout::kSplitBarrierLineBytes, mhc_layout::kNumSplitBarriers,
         at::cuda::getCurrentCUDAStream()));
 
-    // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
+    // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary;
+    // in-CTA Norm keeps the rounded BF16 in shared memory instead.
     const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).
                                                      view(torch::kBFloat16).view({num_tokens, hidden})
                                                    : y_bf16.value_or(x);

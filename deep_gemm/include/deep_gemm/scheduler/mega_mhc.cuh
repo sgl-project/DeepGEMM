@@ -13,6 +13,10 @@ using namespace layout::mega_mhc;
 // replays, so a waiter could accept the previous replay's completed state and read
 // its stale split partials. Every CTA reads the same epoch after
 // cudaGridDependencySynchronize, and the last CTA to retire advances it.
+CUTLASS_DEVICE uint32_t* get_task_counter_ptr(uint64_t* gmem_split_barriers) {
+    return math::advance_ptr<uint32_t>(gmem_split_barriers, kSplitBarrierTaskCounterOffset);
+}
+
 struct Epoch {
     static CUTLASS_DEVICE uint64_t* get_epoch_ptr(uint64_t* gmem_split_barriers) {
         return math::advance_ptr<uint64_t>(gmem_split_barriers, kSplitBarrierEpochOffset);

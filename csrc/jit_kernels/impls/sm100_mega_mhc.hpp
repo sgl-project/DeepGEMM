@@ -50,7 +50,7 @@ static void sm100_mega_mhc(
             static_cast<int>(tensor.stride(0)), swizzle_mode);
     };
 
-    const auto max_num_k_blocks_per_task = ceil_div(hidden / static_cast<int>(mhc_layout::BLOCK_K), num_splits);
+    const auto max_num_k_blocks_per_task = mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits);
     const auto smem_size = in_cta_norm ? static_cast<int>(mhc_layout::get_x1_tiles_smem_offset() +
                                                           mhc_layout::get_in_cta_norm_smem_size(max_num_k_blocks_per_task, hidden))
                                        : static_cast<int>(sizeof(mhc_layout::SharedStorage));
@@ -144,7 +144,6 @@ static void __instantiate_kernel() {{
     if (smem_size > SM100ArchSpec::smem_capacity)
         smem_mode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
 #endif
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity or smem_mode.has_value());
     launch_with_shared_memory_mode(
         smem_mode, kernel, {
             .num_smem_bytes = smem_size,

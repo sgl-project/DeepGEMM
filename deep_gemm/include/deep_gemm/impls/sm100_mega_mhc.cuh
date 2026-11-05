@@ -146,7 +146,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     // In-CTA Norm: Post leaves each task's X1 slice in one of kNumX1Buffers tile buffers behind SharedStorage, and WG5
     // normalizes it once every split of the m-block has committed its statistics.
     constexpr uint32_t kNumX1PairsPerTile = BLOCK_M * BLOCK_K / 2;
-    constexpr uint32_t kMaxNumKBlocksPerTask = kNumKBlocksPerSplit + (kNumLongSplits > 0 ? 1 : 0);
+    constexpr uint32_t kMaxNumKBlocksPerTask = get_max_num_k_blocks_per_task(kHidden, kNumSplits);
     const auto x1_tiles = reinterpret_cast<nv_bfloat162*>(smem_buffer + get_x1_tiles_smem_offset());
     __shared__ alignas(8) uint64_t x1_barrier_storage[kInCTANorm ? 2 * kNumX1Buffers : 1];
     const auto full_x1_barriers = reinterpret_cast<cutlass::arch::ClusterTransactionBarrier*>(x1_barrier_storage);
@@ -229,7 +229,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         // WG0: producer pipelines
         cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
 
-        // IO and Fn warp workers follow the same task traversal; only their hidden-block copies differ.
+        // IO and Fn warp workers follow the same task traversal; the IO worker also claims queued tasks.
         const auto run_tma_load_worker = [&](auto& empty_barriers, const auto& load_hidden_block, auto is_producer) {
             constexpr uint32_t kNumStages = sizeof(empty_barriers) / sizeof(empty_barriers[0]);
             constexpr bool kIsProducer = decltype(is_producer)::value;
@@ -245,7 +245,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     }
                     ++ num_published, last_published = task;
                 };
-                const auto task_counter = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(gmem_split_barriers) + 80);
+                const auto task_counter = sched::mega_mhc::get_task_counter_ptr(gmem_split_barriers);
                 if constexpr (kIsProducer) {
                     publish_task(blockIdx.x);
                     if (blockIdx.x < num_tasks)
