@@ -45,13 +45,22 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 1070)
+    constexpr bool kIsSM107 = true;
+#else
+    constexpr bool kIsSM107 = false;
+#endif
+
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, ptx::Allocator1Sm, ptx::Allocator2Sm>;
 
     // NOTES: an FP4xFP4 pair uses the dedicated MXF4 MMA (packed 4-bit operands, K-major only, UMMA_K=64);
-    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32)
+    //        all other combinations use the MXF8F6F4 MMA (unpacked operands, UMMA_K=32, or 64 for K-major MXFP8 on SM107)
     constexpr bool kIsMXF4 = cute::is_same_v<a_dtype_t, cutlass::float_e2m1_t> and
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
+    constexpr bool kIsMXF8KMajor = cute::is_same_v<a_dtype_t, cutlass::float_e4m3_t> and cute::is_same_v<b_dtype_t, cutlass::float_e4m3_t> and
+                                   kGranKA == 32 and kGranKB == 32 and kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K;
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
     // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
@@ -65,7 +74,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
-    constexpr uint32_t UMMA_K = kIsMXF4 ? 64 : 32;
+    constexpr uint32_t UMMA_K = (kIsMXF4 or (kIsSM107 and kIsMXF8KMajor and not is_k_grouped_contiguous(kGemmType))) ? 64 : 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t kPackFactor = get_smem_pack_factor<a_dtype_t>();
@@ -187,6 +196,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         Allocator().allocate(kNumTmemCols, &smem.tmem_ptr);
     }
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr);
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -305,6 +315,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                                              UMMA_M, UMMA_N, kMajorB, kMajorA>()
                                   : cute::UMMA::make_instr_desc_block_scaled<a_dtype_t, b_dtype_t, float, cutlass::float_ue8m0_t,
                                                                              UMMA_M, UMMA_N, kMajorA, kMajorB>();
+        instr_desc.k_size_ = not kIsMXF4 and UMMA_K == 64;
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
@@ -377,7 +388,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         for (uint32_t i = 0; i < SF_BLOCK_K * SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
                             auto smem_ptr = smem.sfa[stage_idx] + i * kNumUTCCPAlignedElems;
                             mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                            cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
+                            cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFA + i * 4);
                         }
                     }
                     if (sfb_stage_in_group_idx == 0) {
@@ -385,7 +396,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         for (uint32_t i = 0; i < SF_BLOCK_K * SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                             auto smem_ptr = smem.sfb[stage_idx] + i * kNumUTCCPAlignedElems;
                             mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                            cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                            cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFB + i * 4);
                         }
                     }
 
@@ -420,8 +431,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         //            consumes two 32-element SFs per UMMA K=64 step, hence a step of 2);
                         //   gran-128 uses the per-load stage id (whole 512-K SF span).
                         const uint32_t sf_id_in_subblock = (offset % kNumUTCCPAlignedElems) / 32;
-                        const uint32_t tmem_col_sfa = kTmemStartColOfSFA + subblock_idx * SF_BLOCK_M / 32;
-                        const uint32_t tmem_col_sfb = kTmemStartColOfSFB + subblock_idx * SF_BLOCK_N / 32;
+                        const uint32_t tmem_col_sfa = tmem_base + kTmemStartColOfSFA + subblock_idx * SF_BLOCK_M / 32;
+                        const uint32_t tmem_col_sfb = tmem_base + kTmemStartColOfSFB + subblock_idx * SF_BLOCK_N / 32;
                         const uint32_t sfa_id = (kGranKA == 32 ? sf_id_in_subblock : sfa_stage_in_group_idx);
                         const uint32_t sfb_id = (kGranKB == 32 ? sf_id_in_subblock : sfb_stage_in_group_idx);
                         const auto runtime_instr_desc = kSwapAB ?
@@ -431,11 +442,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, 0, offset);
                         b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, offset);
                         if constexpr (kSwapAB) {
-                            mma_t::fma(b_desc, a_desc, accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
+                            mma_t::fma(b_desc, a_desc, tmem_base + accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc,
                                        tmem_col_sfb, tmem_col_sfa);
                         } else {
-                            mma_t::fma(a_desc, b_desc, accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
+                            mma_t::fma(a_desc, b_desc, tmem_base + accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols),
                                        umma_k_idx > 0 or k_block_idx > 0, runtime_instr_desc,
                                        tmem_col_sfa, tmem_col_sfb);
                         }
@@ -515,9 +526,6 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
-        // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
-
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
 
@@ -530,7 +538,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             smem.tmem_full_barriers[accum_stage_idx].wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
 
-            const auto tmem_base_addr = accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols);
+            const auto tmem_base_addr = tmem_base + accum_stage_idx * (UMMA_N - kNumOverlappedTmemCols);
             const bool reverse_store_order = kNumOverlappedTmemCols > 0 and accum_stage_idx == 0;
             DG_STATIC_ASSERT(kNumEpilogueStages == 2,
                              "reverse_store_order depends on exactly 2 accumulator stages");
@@ -581,7 +589,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
     // Deallocate tensor memory
     if (warp_idx == 0)
-        Allocator().free(0, kNumTmemCols);
+        Allocator().free(tmem_base, kNumTmemCols);
 
     // Finalize the epilogue while the other warp deallocates tensor memory.
     if (epilogue_warp_idx < kNumUMMAStoreThreads / 32)

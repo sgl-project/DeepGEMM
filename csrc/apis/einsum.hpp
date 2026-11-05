@@ -237,7 +237,14 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         //    nor a packed 4-SF word may cross a batch boundary
         DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
         DG_HOST_ASSERT(d_tensor.stride(0) == n and n % 128 == 0);
-        check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
+        // A 4D `[ceil(m / 128), n_total / 128, 32, 4]` SFD is FlashInfer's 128x4 swizzle
+        if (sfd->dim() == 4) {
+            DG_HOST_ASSERT(sfd->scalar_type() == torch::kInt and sfd->is_contiguous());
+            DG_HOST_ASSERT(sfd->size(0) == ceil_div(m, 128) and sfd->size(1) == batch_size * n / 128 and
+                           sfd->size(2) == 32 and sfd->size(3) == 4);
+        } else {
+            check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
+        }
     }
 
     // Early return for trivial cases

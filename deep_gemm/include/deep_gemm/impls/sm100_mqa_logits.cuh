@@ -136,8 +136,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     __syncwarp();
 
     if (warp_idx == kSpecWarpStart + 2)
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
+        ptx::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
     __syncthreads();
+    // Load the allocated TMEM base to keep derived addresses in uniform registers
+    const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
 
     RingPipeline<kNumQStages> q_pipeline;
     RingPipeline<kNumKVRingStages> kv_pipeline;
@@ -289,7 +291,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         produce_kv(cute::false_type{});
     } else if (warp_idx == kSpecWarpStart + 2) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr_in_smem) == 0);
 
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
@@ -326,13 +327,14 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                 if (cute::elect_one_sync())
                     cute::SM100_UTCCP_4x32dp128bit_1cta::copy(
-                        sf_desc, kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage + i * 4);
+                        sf_desc, tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage + i * 4);
                 __syncwarp();
             }
             if (cute::elect_one_sync()) {
                 ptx::tcgen05_before_thread_sync();
                 smem.full_q_barriers[q_stage_idx].arrive();
             }
+            #pragma unroll 1
             for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                 CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
                 smem.full_sf_kv_barriers[kv_stage_idx].wait(kv_phase);
@@ -361,7 +363,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         auto smem_ptr = smem.smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
                         mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
                         cute::SM100_UTCCP_4x32dp128bit_1cta::copy(
-                            sf_desc, kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + i * 4);
+                            sf_desc, tmem_base + kTmemStartColOfSFKV + kv_stage_idx * kNumSFKVColsPerStage + i * 4);
                     }
                     ptx::tcgen05_before_thread_sync();
                     smem.full_kv_barriers[kv_stage_idx].arrive();
@@ -371,9 +373,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        // Load the allocated TMEM base to keep derived addresses in uniform registers
-        const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
-        DG_TRAP_ONLY_DEVICE_ASSERT(tmem_base == 0);
         if (cute::elect_one_sync()) {
             using mma_op_t = cute::conditional_t<kIsFP4, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF8F6F4_SS>;
             DG_STATIC_ASSERT((not kIsFP4 and kHeadDim == 32) or kHeadDim == 64 or kHeadDim == 128, "Invalid head dim");
@@ -407,6 +406,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 ptx::tcgen05_after_thread_sync();
                 const uint32_t b_desc_stage_lo = b_desc_lo + q_stage_idx * kNumQDescPerStage;
                 const uint32_t tmem_sfb = tmem_base + kTmemStartColOfSFQ + q_stage_idx * kNumSFQColsPerStage;
+                #pragma unroll 1
                 for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                     CUTE_TIE_DECL(kv_pipeline.advance(), kv_stage_idx, kv_phase);
                     // The fence after the first empty-TMEM wait also orders this data
@@ -463,8 +463,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 // Offset warp-uniform output bases by -seq_k_start[i] for shared KV indexing
                 nv_bfloat16* output_bases[BLOCK_Q];
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumValidTokens; ++ i)
+                for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
                     output_bases[i] = logits + (task.q_token_base + i) * static_cast<uint64_t>(logits_stride) - seq_k_start[i];
+                    // Keep the base live in a register instead of recomputing it at every store
+                    asm volatile("" : "+l"(output_bases[i]));
+                }
 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
@@ -505,24 +508,57 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
 
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                        auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
-                        auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
-                        const auto reduce_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
-                            constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
-                            constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
-                            // Release TMEM after its last load to overlap MMA with reduction
-                            if constexpr (kHeadBase + kNumChunkHeads == kNumHeads) {
-                                if (i == kNumValidTokens - 1) {
+                    if constexpr (not kIsPaged and kNumHeads % 16 == 0 and kNumValidTokens % 2 == 0) {
+                        constexpr uint32_t kNumTokensPerGroup = kNumValidTokens % 4 == 0 ? 4 : 2;
+                        const uint32_t col0 = tmem_base + tmem_stage_idx * UMMA_N;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; i += kNumTokensPerGroup) {
+                            nv_bfloat162 s0[kNumTokensPerGroup], s1[kNumTokensPerGroup];
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
+                                s0[t] = s1[t] = __floats2bfloat162_rn(0.0f, 0.0f);
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kNumHeads / 16; ++ c) {
+                                float x[kNumTokensPerGroup][16];
+                                #pragma unroll
+                                for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
+                                    ptx::tmem_load_32dp32b<16>(col0 + (i + t) * kNumHeads + c * 16, reinterpret_cast<uint32_t*>(x[t]));
+                                cutlass::arch::fence_view_async_tmem_load();
+                                if (c == kNumHeads / 16 - 1 and i + kNumTokensPerGroup == kNumValidTokens) {
                                     ptx::tcgen05_before_thread_sync();
                                     smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                                 }
+                                #pragma unroll
+                                for (uint32_t h = 0; h < 16; h += 4) {
+                                    #pragma unroll
+                                    for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
+                                        reduce_pairs(x[t] + h, weights[i + t] + c * 8 + h / 2, 4, s0[t], s1[t]);
+                                }
                             }
-                            reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
-                        };
-                        visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
-                        store_token(i, kv_offset, sum_0, sum_1);
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kNumTokensPerGroup; ++ t)
+                                store_token(i + t, kv_offset, s0[t], s1[t]);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                            auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                            const auto reduce_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
+                                constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
+                                constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
+                                // Release TMEM after its last load to overlap MMA with reduction
+                                if constexpr (kHeadBase + kNumChunkHeads == kNumHeads) {
+                                    if (i == kNumValidTokens - 1) {
+                                        ptx::tcgen05_before_thread_sync();
+                                        smem.empty_tmem_barriers[tmem_stage_idx].arrive();
+                                    }
+                                }
+                                reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
+                            };
+                            visit_tmem_head_chunks<kNumHeads>(tmem_base + tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
+                            store_token(i, kv_offset, sum_0, sum_1);
+                        }
                     }
                 }
             };
@@ -538,7 +574,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
-            cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+            ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
     }
 }
 

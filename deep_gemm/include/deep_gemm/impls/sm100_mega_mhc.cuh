@@ -35,7 +35,7 @@ constexpr uint32_t kNumTokenRowsPerLane = 2;
 // Persistent mHC with static grid-stride roles and TMA-native layouts.
 // Norm receives one arrival only after Shifted X1 stores and statistics are committed.
 template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
-          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M>
+          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     sm100_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_x,
@@ -51,7 +51,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         uint64_t* gmem_split_barriers) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using namespace mega_mhc;
-    using Allocator = cute::TMEM::Allocator1Sm;
+    using Allocator = ptx::Allocator1Sm;
     // Each Post worker occupies exactly one WG; the role dispatch hardwires two of them.
     constexpr uint32_t kNumPostWGs = 2;
 
@@ -676,7 +676,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         cutlass::arch::NamedBarrier::sync(128, 1 + wg_idx_in_cta);
         cutlass::arch::warpgroup_reg_alloc<kNumNormalRegisters>();
 
-        epilogue::mega_mhc::run_normal_worker<kHidden, kNumSMs, kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+        epilogue::mega_mhc::run_normal_worker<kHidden, kNumSMs, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
             smem, workspace, wg_idx_in_cta, warp_idx % kNumWarpsPerWG, lane_idx,
             gmem_split_barriers, mix_args, norm_args);
         cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
@@ -685,7 +685,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
         const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
         if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
             epilogue::mega_mhc::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
-                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
                 smem, workspace, gmem_split_barriers, norm_args, lane_idx);
         }
     }

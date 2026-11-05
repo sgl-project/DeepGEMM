@@ -121,6 +121,13 @@ CUTLASS_DEVICE uint32_t get_shared_sf_row_idx(const uint32_t& token_idx) {
            (idx & ~127u) + (idx & 31u) * 4 + ((idx >> 5) & 3u);
 }
 
+template <bool kSwizzledPrimarySF>
+CUTLASS_DEVICE int64_t primary_sf_token_offset(const NormArgs& norm_args, const uint32_t& token_idx) {
+    if constexpr (kSwizzledPrimarySF)
+        return (token_idx >> 7) * static_cast<uint32_t>(norm_args.y_primary_sf_stride_mtile) + (token_idx & 31u) * 4 + ((token_idx >> 5) & 3u);
+    return token_idx * norm_args.y_primary_sf_stride_token;
+}
+
 CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const uint64_t& output_offset,
                                               const uint4& values, const uint32_t& sf_exp) {
     const auto bf16x2 = reinterpret_cast<const nv_bfloat162*>(&values);
@@ -137,7 +144,7 @@ CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const u
 
 // A Normal task fuses Mix, Pre, and RMSNorm for one token.
 template <uint32_t kHidden, uint32_t kNumSMs, bool kStoreBF16, bool kStoreFP8,
-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+          uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF, uint32_t kNumSplits>
 CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
                                       const uint32_t& wg_idx_in_cta,
                                       const uint32_t& warp_idx_in_wg, const uint32_t& lane_idx,
@@ -251,7 +258,7 @@ CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumS
                     math::get_ue8m0_sf_exp(amax));
                 if constexpr (SF_BLOCK_M > 0) {
                     if (lane_idx % kNumLanesPerSFWord == 0) {
-                        norm_args.y_primary_sf[token_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = packed_sf;
+                        norm_args.y_primary_sf[primary_sf_token_offset<kSwizzledPrimarySF>(norm_args, token_idx) + sf_word_idx * norm_args.y_primary_sf_stride_word] = packed_sf;
                         norm_args.y_shared_sf[shared_sf_row_idx + sf_word_idx * norm_args.y_shared_sf_stride_word] = packed_sf;
                     }
                 } else {
@@ -267,7 +274,7 @@ CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumS
         if constexpr (kStoreFP8 and SF_BLOCK_M == 0) {
             if (lane_idx % kNumLanesPerSFWord == 0) {
                 const int64_t sf_word_stride = norm_args.y_primary_sf_stride_word;
-                auto sf_ptr = norm_args.y_primary_sf + token_idx * norm_args.y_primary_sf_stride_token +
+                auto sf_ptr = norm_args.y_primary_sf + primary_sf_token_offset<kSwizzledPrimarySF>(norm_args, token_idx) +
                               (hidden_pack_begin * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord) * sf_word_stride;
 
                 #pragma unroll
@@ -288,7 +295,8 @@ struct ShiftedNormPack {
     uint4 weight;
 };
 
-template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF,
+          uint32_t kNumSplits>
 CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
                                           const NormArgs& norm_args,
                                           const uint32_t& task_idx,
@@ -298,7 +306,16 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
     const uint32_t partition_idx = task_idx % num_partitions;
     const uint32_t hidden_pack_begin = partition_idx * kNumHiddenPacks / num_partitions;
     const uint32_t hidden_pack_end = (partition_idx + 1) * kNumHiddenPacks / num_partitions;
-    const uint32_t m_idx = task_idx / num_partitions * kNumTokensPerShiftedNormTask;
+    uint32_t m_idx = task_idx / num_partitions * kNumTokensPerShiftedNormTask;
+    if constexpr (kSwizzledPrimarySF) {
+        // A 32 B swizzled SF sector holds token pairs `p`, `p + 16`, `p + 32` and `p + 48` of a 128-token tile;
+        // hand `p` and `p + 16` to the same CTA so each sector has two writers, as in the MN-major layout
+        const uint32_t pair_idx = task_idx / num_partitions, pair_in_tile = pair_idx % 64;
+        m_idx = (pair_idx / 64 * 64 + (pair_in_tile & 1) * 16 + (pair_in_tile >> 1 & 15) + (pair_in_tile >> 5) * 32) *
+                kNumTokensPerShiftedNormTask;
+        if (m_idx >= norm_args.num_tokens)
+            return;
+    }
     const uint32_t m_block_idx = m_idx / BLOCK_M;
     const bool has_second_token = m_idx + 1 < norm_args.num_tokens;
     uint2 shared_sf_row_indices = {};
@@ -368,7 +385,7 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
             const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
             const uint32_t first_packed_sf = store_fp8_and_pack_sf(norm_args, output_offset, values[0], sf_exponents.x);
             if (lane_idx % kNumLanesPerSFWord == 0) {
-                norm_args.y_primary_sf[m_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
+                norm_args.y_primary_sf[primary_sf_token_offset<kSwizzledPrimarySF>(norm_args, m_idx) + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
                 if constexpr (SF_BLOCK_M > 0)
                     norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.x] = first_packed_sf;
             }
@@ -376,7 +393,8 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
                 const uint32_t second_packed_sf = store_fp8_and_pack_sf(
                     norm_args, output_offset + kHidden, values[1], sf_exponents.y);
                 if (lane_idx % kNumLanesPerSFWord == 0) {
-                    norm_args.y_primary_sf[(m_idx + 1) * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
+                    // `m_idx` is even, so the swizzled row of `m_idx + 1` is the next 16 B row
+                    norm_args.y_primary_sf[(kSwizzledPrimarySF ? primary_sf_token_offset<true>(norm_args, m_idx) + 4 : primary_sf_token_offset<false>(norm_args, m_idx + 1)) + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
                     if constexpr (SF_BLOCK_M > 0)
                         norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.y] = second_packed_sf;
                 }
@@ -390,14 +408,15 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
 }
 
 template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumRegisters, bool kStoreBF16, bool kStoreFP8,
-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
+          uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF, uint32_t kNumSplits>
 CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
                                             uint64_t* gmem_split_barriers,
                                             const NormArgs& norm_args,
                                             const uint32_t& lane_idx) {
     constexpr uint32_t kNumTasksPerGridWave = kNumSMs * kNumWarpsPerWG;
     constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
-    const uint32_t num_token_pairs = math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
+    const uint32_t num_token_pairs = kSwizzledPrimarySF ? math::ceil_div(norm_args.num_tokens, 128u) * 64 :
+                                     math::ceil_div(norm_args.num_tokens, kNumTokensPerShiftedNormTask);
     // Only subdivide underfilled FP8 grids when a token pair can span multiple CTAs.
     constexpr uint32_t kNumFP8Partitions =
         kNumSplits > kDefaultNumSplits and kNumHiddenPacks > 2 * kNumWarpsPerWG ? kNumHiddenPacks / 2 : 2;
@@ -420,7 +439,7 @@ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace
                                   task_ticket / kNumWarpsPerWG * kNumTasksPerGridWave;
         if (task_idx >= num_tasks)
             return;
-        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M>(
+        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
             workspace, gmem_split_barriers, norm_args, task_idx, num_partitions, lane_idx);
     }
 }
