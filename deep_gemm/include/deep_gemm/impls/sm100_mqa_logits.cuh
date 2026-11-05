@@ -67,6 +67,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
     using Scheduler = decltype(make_scheduler(0u));
     constexpr bool kIsPaged = Scheduler::kIsPaged;
+    constexpr uint32_t kNumKVRingStages = [] {
+        if constexpr (kIsPaged)
+            return math::constexpr_min(Scheduler::kNumSplitsPerChunk, kNumKVStages);
+        else
+            return kNumKVStages;
+    }();
 
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
@@ -89,7 +95,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     static constexpr uint32_t kNumUTCCPAlignedElems = SharedStorage::kNumUTCCPAlignedElems;
     static constexpr uint32_t UMMA_M = 128;
     static constexpr uint32_t BLOCK_QH = SharedStorage::BLOCK_QH;
-    static constexpr uint32_t UMMA_K = kIsFP4 ? 64 : 32;
+#if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && __CUDA_ARCH_FAMILY_SPECIFIC__ == 1070
+    static constexpr bool kUseFP4K128 = kIsFP4 and kHeadDim % 128 == 0;
+#else
+    static constexpr bool kUseFP4K128 = false;
+#endif
+    static constexpr uint32_t UMMA_K = kUseFP4K128 ? 128 : (kIsFP4 ? 64 : 32);
     static constexpr uint32_t kNumSFQ = SharedStorage::kNumSFQ;
     static constexpr uint32_t kNumSFKV = SharedStorage::kNumSFKV;
     static constexpr uint32_t kNumQKBytesPerToken = SharedStorage::kNumQKBytesPerToken;
@@ -102,7 +113,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     constexpr uint32_t kNumSFQColsPerStage = kNumSFQ / 32;
     constexpr uint32_t kNumSFKVColsPerStage = kNumSFKV / 32;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumQStages * kNumSFQColsPerStage +
-                                                                       kNumKVStages * kNumSFKVColsPerStage>();
+                                                                       kNumKVRingStages * kNumSFKVColsPerStage>();
     constexpr uint32_t kTmemStartColOfSFQ = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFKV = kNumAccumTmemCols + kNumQStages * kNumSFQColsPerStage;
     DG_STATIC_ASSERT(kNumTmemCols <= 512, "Too many tensor memory");
@@ -115,7 +126,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             smem.empty_q_barriers[i].init(kNumMathThreads + 32);
         }
         #pragma unroll
-        for (uint32_t i = 0; i < kNumKVStages; ++ i) {
+        for (uint32_t i = 0; i < kNumKVRingStages; ++ i) {
             smem.full_kv_barriers[i].init(2);
             smem.full_sf_kv_barriers[i].init(1);
             smem.empty_kv_barriers[i].init(1);
@@ -136,7 +147,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     const uint32_t tmem_base = ptx::ld_shared(&smem.tmem_ptr_in_smem);
 
     RingPipeline<kNumQStages> q_pipeline;
-    RingPipeline<kNumKVStages> kv_pipeline;
+    RingPipeline<kNumKVRingStages> kv_pipeline;
     RingPipeline<kNumTmemStages> tmem_pipeline;
 
     constexpr uint32_t kNumSpecializedRegisters = 56;
@@ -151,7 +162,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
     // Reuse a full KV ring when consecutive tasks share the same splits
     const auto reuses_kv_stages = [&](const sched::MQALogitsTask& task) {
-        return task.kv_shared_with_prev and task.num_kv_splits == kNumKVStages;
+        return task.kv_shared_with_prev and task.num_kv_splits == kNumKVRingStages;
     };
 
     // Shared KV/SF producer loop; the SF producer also drives Q
@@ -374,9 +385,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             constexpr uint32_t kQKSwizzleMode = kHeadDim / kPackFactor;
             constexpr uint32_t kNumUMMAK = kHeadDim / UMMA_K;
             // Advance descriptor low words by each stage's fixed offset
-            const auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+            auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                 qk_dtype_t, qk_dtype_t, float, cutlass::float_ue8m0_t,
                 UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+            // The 10.7 mxf4 K=128 shape is K code 2: bit 3 set, bit 31 (`k_size_`) clear
+            if constexpr (kUseFP4K128)
+                instr_desc.desc_ |= 1u << 3;
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_kv[0], 0, 0);
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kQKSwizzleMode>(smem.smem_q[0], 0, 0);
             const uint32_t a_desc_lo = a_desc.lo, b_desc_lo = b_desc.lo;

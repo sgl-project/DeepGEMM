@@ -119,7 +119,7 @@ static void __instantiate_kernel() {{
 struct MQALogitsConfig {
     bool is_fp4, is_paged;
     int num_heads, head_dim, block_q, umma_n;
-    int num_q_stages, num_kv_stages;
+    int num_q_stages, num_kv_stages, splits_per_chunk;
     static constexpr int split_kv = kMQALogitsSplitKV;
     static constexpr int num_tmem_stages = kMQALogitsNumTmemStages;
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
@@ -136,6 +136,8 @@ struct MQALogitsConfig {
         umma_n = align(block_q * num_heads, 8);
         num_q_stages = is_fp4 ? 2 : 3;
         num_kv_stages = is_fp4 ? 8 : 3;
+        // Paged FP4 on 10.7 runs 4-split chunks, and so a 4-stage KV ring, inside the 8-stage allocation
+        splits_per_chunk = is_fp4 and is_paged and SM107ArchSpec::is_current() ? 4 : kMQALogitsSplitsPerChunk;
     }
 
     const char* qk_dtype_name() const {
@@ -359,7 +361,7 @@ static void __instantiate_kernel() {{
     page_kv,
     config.block_q, config.umma_n,
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
-    config.split_kv, kMQALogitsSplitsPerChunk,
+    config.split_kv, config.splits_per_chunk,
     config.num_specialized_threads, config.num_math_threads,
     config.qk_dtype_name()));
 
