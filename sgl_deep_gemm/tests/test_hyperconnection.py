@@ -1,3 +1,4 @@
+import os
 import torch
 import random
 import re
@@ -94,6 +95,47 @@ def _check_hc_prenorm_gemm_concurrent_streams() -> None:
 
 
 @test_filter(lambda: get_arch_major() == 10)
+def test_hc_prenorm_gemm_dual() -> None:
+    print('Testing dual hyperconnection prenorm GEMM:')
+    n, k = 24, 20480
+    for m in (13, 137, 512, 1024, 4096):
+        for num_splits in (None, 8, 16):
+            a = torch.randn((m, k), dtype=torch.bfloat16, device='cuda')
+            w = torch.randn((n, k), dtype=torch.float, device='cuda') * 0.02
+            b = w.bfloat16().float()
+            b2 = (w - b).contiguous()
+
+            def empty():
+                d_shape = (m, n) if num_splits is None else (num_splits, m, n)
+                s_shape = (m, ) if num_splits is None else (num_splits, m)
+                return torch.empty(d_shape, dtype=torch.float, device='cuda'), \
+                    torch.empty(s_shape, dtype=torch.float, device='cuda')
+
+            d, s = empty()
+            d2, s2 = empty()
+            deep_gemm.tf32_hc_prenorm_gemm(a, b, d, s, num_splits=num_splits)
+            deep_gemm.tf32_hc_prenorm_gemm(a, b2, d2, s2, num_splits=num_splits)
+            dual_d, dual_s = empty()
+            dual_d2, _ = empty()
+            deep_gemm.tf32_hc_prenorm_gemm_dual(a, b, b2, dual_d, dual_d2, dual_s, num_splits=num_splits)
+            assert torch.equal(dual_d, d) and torch.equal(dual_d2, d2) and torch.equal(dual_s, s), f'{m=}, {num_splits=}'
+
+            os.environ['DG_HC_PRENORM_BLOCK_M'] = '64'
+            try:
+                bm64_d, bm64_s = empty()
+                bm64_d2, _ = empty()
+                deep_gemm.tf32_hc_prenorm_gemm_dual(a, b, b2, bm64_d, bm64_d2, bm64_s, num_splits=num_splits)
+            finally:
+                del os.environ['DG_HC_PRENORM_BLOCK_M']
+            assert torch.equal(bm64_d, d) and torch.equal(bm64_d2, d2) and torch.equal(bm64_s, s), f'{m=}, {num_splits=}'
+
+            t = bench_kineto(lambda: deep_gemm.tf32_hc_prenorm_gemm_dual(a, b, b2, dual_d, dual_d2, dual_s, num_splits=num_splits),
+                             'tf32_hc_prenorm_gemm', suppress_kineto_output=True)
+            print(f' > Perf (m={m:5}, n={n:5}, k={k:5}, num_splits={(num_splits or 0):2}): {t * 1e6:4.0f} us')
+    print()
+
+
+@test_filter(lambda: get_arch_major() == 10)
 def test_hc_prenorm_gemm_nonzero_tmem_base() -> None:
     library_root = Path(deep_gemm.__file__).resolve().parent
     with tempfile.TemporaryDirectory() as directory:
@@ -140,4 +182,5 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_hc_prenorm_gemm()
+    test_hc_prenorm_gemm_dual()
     test_hc_prenorm_gemm_nonzero_tmem_base()

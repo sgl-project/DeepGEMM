@@ -38,13 +38,16 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumSplits,
           uint32_t kSwizzleCDMode,
           uint32_t kNumStages,
-          uint32_t kNumMMAThreads, uint32_t kNumCastAndReduceThreads>
+          uint32_t kNumMMAThreads, uint32_t kNumCastAndReduceThreads,
+          uint32_t kNumB = 1>
 CUTLASS_GLOBAL void __launch_bounds__(kNumMMAThreads + kNumCastAndReduceThreads, 1)
 sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                                float* sqr_sum) {
+                                float* sqr_sum,
+                                const __grid_constant__ cute::TmaDescriptor tensor_map_b2,
+                                const __grid_constant__ cute::TmaDescriptor tensor_map_d2) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -57,6 +60,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     DG_STATIC_ASSERT(kNumCastStages <= kNumStages, "Invalid cast stages");
     DG_STATIC_ASSERT(kSwizzleCDMode / sizeof(float) == BLOCK_N, "Invalid block N");
     DG_STATIC_ASSERT(kNumMMAThreads == 128, "Invalid MMA threads");
+    DG_STATIC_ASSERT(kNumB == 1 or kNumB == 2, "Invalid number of B operands");
 
     // Utils
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
@@ -69,31 +73,40 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     constexpr uint32_t SMEM_CD_SIZE = BLOCK_M * kSwizzleCDMode;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(nv_bfloat16);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(float);
+    constexpr uint32_t SMEM_B_STAGE_STRIDE = kNumB * SMEM_B_SIZE_PER_STAGE;
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
+    DG_STATIC_ASSERT(SMEM_B_SIZE_PER_STAGE % 1024 == 0, "Shared memory of B must be aligned to 1024 bytes");
 
     // Real tensor memory size and offsets
-    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<BLOCK_K * kNumCastStages + BLOCK_N>();
+    constexpr uint32_t kTmemAccumCol = BLOCK_K * kNumCastStages;
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kTmemAccumCol + kNumB * BLOCK_N>();
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_d);
+        if constexpr (kNumB == 2) {
+            cute::prefetch_tma_descriptor(&tensor_map_b2);
+            cute::prefetch_tma_descriptor(&tensor_map_d2);
+        }
     }
 
     // Data on shared memory (layout as ordered below)
     // Fill D/A/B pointers
-    auto smem_cd = reinterpret_cast<float*>(smem_buffer);
+    auto smem_cd = utils::PatternVisitor([&](const uint32_t& j) {
+        return reinterpret_cast<float*>(smem_buffer + j * SMEM_CD_SIZE);
+    });
     auto smem_a = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<nv_bfloat16*>(smem_buffer + (SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE));
+        return reinterpret_cast<nv_bfloat16*>(smem_buffer + (kNumB * SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE));
     });
     auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<float*>(smem_buffer + (SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
+        return reinterpret_cast<float*>(smem_buffer + (kNumB * SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_STAGE_STRIDE));
     });
 
     // Fill barriers
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE +
-        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + kNumB * SMEM_CD_SIZE +
+        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_STAGE_STRIDE));
     auto full_barriers           = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto full_cast_barriers      = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
     auto empty_barriers          = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
@@ -153,9 +166,11 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 // Issue TMAs
                 tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx);
                 tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, 0);
+                if constexpr (kNumB == 2)
+                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b2, full_barriers[stage_idx], smem_b[stage_idx] + BLOCK_N * BLOCK_K, k_idx, 0);
 
                 // Arrive at full barriers
-                constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
+                constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_STAGE_STRIDE;
                 full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes);
             }
         }
@@ -175,7 +190,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
             auto b_desc = mma::sm100::make_umma_desc<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK, kSwizzleBMode>(smem_b[0], 0, 0);
-            const uint32_t& b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
+            const uint32_t& b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_STAGE_STRIDE / 16 : 0u;
 
             // Checks for MMA instructions
             // NOTES: CUTLASS does not have such checks except the MMA traits, but we are not using these traits
@@ -200,8 +215,13 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                     const uint32_t& atom_idx = (k * UMMA_K) / BLOCK_SWIZZLED_BK;
                     const uint32_t& in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
                     const uint32_t& offset = atom_idx * BLOCK_N * BLOCK_SWIZZLED_BK;
-                    b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(b_desc_base_lo, offset, in_atom_idx);
-                    umma_t::fma(tmem_base + BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, tmem_base + BLOCK_K * kNumCastStages, s > 0 or k > 0, runtime_instr_desc);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumB; ++ j) {
+                        b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(
+                            b_desc_base_lo + j * SMEM_B_SIZE_PER_STAGE / 16, offset, in_atom_idx);
+                        umma_t::fma(tmem_base + BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc,
+                                    tmem_base + kTmemAccumCol + j * BLOCK_N, s > 0 or k > 0, runtime_instr_desc);
+                    }
                 }
 
                 // Commit
@@ -231,33 +251,40 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
         // Store into shared memory
         #pragma unroll
-        for (uint32_t i = 0; i < BLOCK_N / kNumElemsPerBankGroup; ++ i) {
-            // Source and destination memory address
-            uint32_t tmem_addr = tmem_base + BLOCK_K * kNumCastStages + i * kNumElemsPerBankGroup;
-            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd) +                   // Base pointer
-                            warp_idx * BLOCK_M / 4 * kSwizzleCDMode +               // Warp offset
-                            get_swizzled_smem_offset<kSwizzleCDMode>(i, lane_idx);  // In-atom offset
+        for (uint32_t j = 0; j < kNumB; ++ j) {
+            #pragma unroll
+            for (uint32_t i = 0; i < BLOCK_N / kNumElemsPerBankGroup; ++ i) {
+                // Source and destination memory address
+                uint32_t tmem_addr = tmem_base + kTmemAccumCol + j * BLOCK_N + i * kNumElemsPerBankGroup;
+                auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[j]) +                // Base pointer
+                                warp_idx * BLOCK_M / 4 * kSwizzleCDMode +               // Warp offset
+                                get_swizzled_smem_offset<kSwizzleCDMode>(i, lane_idx);  // In-atom offset
 
-            // Load from tensor memory, store into shared memory
-            uint32_t values[kNumElemsPerBankGroup];
-            DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-            cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
-                values[0], values[1], values[2], values[3]);
-            cutlass::arch::fence_view_async_tmem_load();
-            if (BLOCK_M == 128 or (BLOCK_M == 64 and lane_idx < 16))
-                ptx::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
-            if constexpr (BLOCK_M == 64)
-                __syncwarp();
+                // Load from tensor memory, store into shared memory
+                uint32_t values[kNumElemsPerBankGroup];
+                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
+                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
+                    values[0], values[1], values[2], values[3]);
+                cutlass::arch::fence_view_async_tmem_load();
+                if (BLOCK_M == 128 or (BLOCK_M == 64 and lane_idx < 16))
+                    ptx::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                if constexpr (BLOCK_M == 64)
+                    __syncwarp();
+            }
         }
 
         // Synchronize all threads and issue TMA
         cute::tma_store_fence();
         cutlass::arch::NamedBarrier::sync(kNumMMAThreads, 0);
         if (warp_idx == 0 and cute::elect_one_sync()) {
-            if constexpr (kNumSplits == 1) {
-                cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_cd, 0, m_block_idx * BLOCK_M);
-            } else {
-                cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_cd, 0, m_block_idx * BLOCK_M, k_split_idx);
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumB; ++ j) {
+                const auto* map_d = j == 0 ? &tensor_map_d : &tensor_map_d2;
+                if constexpr (kNumSplits == 1) {
+                    cute::SM90_TMA_STORE_2D::copy(map_d, smem_cd[j], 0, m_block_idx * BLOCK_M);
+                } else {
+                    cute::SM90_TMA_STORE_3D::copy(map_d, smem_cd[j], 0, m_block_idx * BLOCK_M, k_split_idx);
+                }
             }
             cute::tma_store_arrive();
         }
@@ -267,16 +294,21 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         if (warp_idx == 1)
             ptx::Allocator1Sm().free(tmem_base, kNumTmemCols);
     } else {
-        DG_STATIC_ASSERT(BLOCK_M == 64, "Invalid block M");
+        DG_STATIC_ASSERT(BLOCK_M == 64 or BLOCK_M == 128, "Invalid block M");
         DG_STATIC_ASSERT(kNumCastAndReduceThreads == 128, "Invalid cast-and-reduce threads");
         constexpr uint32_t BLOCK_M_PER_WARP = BLOCK_M / 4;
+        // Each warp owns its 32-lane TMEM sub-partition; a `.16x256b` store covers 16 rows of it
+        constexpr uint32_t kNumRowGroups = BLOCK_M_PER_WARP / 16;
         const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
 
         // TODO: make even larger block K
         DG_STATIC_ASSERT(BLOCK_K * sizeof(nv_bfloat16) == kSwizzleAMode, "Invalid block K");
 
         // Launch reductions
-        float2 sum[2] = {float2{0, 0}, float2{0, 0}};
+        float2 sum[kNumRowGroups][2];
+        #pragma unroll
+        for (uint32_t g = 0; g < kNumRowGroups; ++ g)
+            sum[g][0] = sum[g][1] = float2{0, 0};
         #pragma unroll kNumStages
         for (uint32_t s = 0; s < num_total_stages; ++ s) {
             // Wait TMA arrival
@@ -287,42 +319,47 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             constexpr uint32_t kNumBankGroupBytes = 16;
             constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(nv_bfloat16);
             constexpr uint32_t kNumLoads = BLOCK_K / kNumElemsPerBankGroup;
-            const auto& smem_base_ptr = reinterpret_cast<uint8_t*>(smem_a[stage_idx]) +    // Base pointer
-                                        sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleAMode;   // Warp offset
-
-            // 4 lanes shared a bank group
-            uint32_t uint32_values[2][kNumLoads];
             DG_STATIC_ASSERT(kNumLoads % 2 == 0, "Invalid number of loads");
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumLoads; i += 2) {
-                auto smem_ptr = smem_base_ptr + get_swizzled_smem_offset<kSwizzleAMode>(i + lane_idx / 16, lane_idx % 16);
-                ptx::SM90_U32x4_LDSM_N::copy(uint32_values[0][i + 0], uint32_values[1][i + 0],
-                                             uint32_values[0][i + 1], uint32_values[1][i + 1],
-                                             smem_ptr);
-            }
-
-            // Wait tensor memory empty
             const auto& cast_stage_idx = s % kNumCastStages;
-            empty_cast_barriers[cast_stage_idx]->wait(((s / kNumCastStages) & 1) ^ 1);
 
-            // Cast, reduce and store into tensor memory
-            float2 fp32x2_values[2][kNumLoads];
-            const auto& upper_view = reinterpret_cast<uint32_t*>(&fp32x2_values[0]);
-            const auto& lower_view = reinterpret_cast<uint32_t*>(&fp32x2_values[1]);
             #pragma unroll
-            for (uint32_t i = 0; i < kNumLoads; ++ i) {
+            for (uint32_t g = 0; g < kNumRowGroups; ++ g) {
+                const auto& smem_base_ptr = reinterpret_cast<uint8_t*>(smem_a[stage_idx]) +             // Base pointer
+                                            (sub_warp_idx * BLOCK_M_PER_WARP + g * 16) * kSwizzleAMode;  // Row-group offset
+
+                // 4 lanes shared a bank group
+                uint32_t uint32_values[2][kNumLoads];
                 #pragma unroll
-                for (uint32_t u = 0; u < 2; ++ u) {
-                    fp32x2_values[u][i] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&uint32_values[u][i]));
-                    sum[u] = __ffma2_rn(fp32x2_values[u][i], fp32x2_values[u][i], sum[u]);
+                for (uint32_t i = 0; i < kNumLoads; i += 2) {
+                    auto smem_ptr = smem_base_ptr + get_swizzled_smem_offset<kSwizzleAMode>(i + lane_idx / 16, lane_idx % 16);
+                    ptx::SM90_U32x4_LDSM_N::copy(uint32_values[0][i + 0], uint32_values[1][i + 0],
+                                                 uint32_values[0][i + 1], uint32_values[1][i + 1],
+                                                 smem_ptr);
                 }
 
-                // Store upper and lower part at the same time
-                const auto idx_0 = i * 2, idx_1 = i * 2 + 1;
-                cute::SM100_TMEM_STORE_16dp256b1x::copy(
-                    upper_view[idx_0], upper_view[idx_1],
-                    lower_view[idx_0], lower_view[idx_1],
-                    tmem_base + cast_stage_idx * BLOCK_K + i * 8);
+                // Wait tensor memory empty
+                if (g == 0)
+                    empty_cast_barriers[cast_stage_idx]->wait(((s / kNumCastStages) & 1) ^ 1);
+
+                // Cast, reduce and store into tensor memory
+                float2 fp32x2_values[2][kNumLoads];
+                const auto& upper_view = reinterpret_cast<uint32_t*>(&fp32x2_values[0]);
+                const auto& lower_view = reinterpret_cast<uint32_t*>(&fp32x2_values[1]);
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumLoads; ++ i) {
+                    #pragma unroll
+                    for (uint32_t u = 0; u < 2; ++ u) {
+                        fp32x2_values[u][i] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&uint32_values[u][i]));
+                        sum[g][u] = __ffma2_rn(fp32x2_values[u][i], fp32x2_values[u][i], sum[g][u]);
+                    }
+
+                    // Store upper and lower part at the same time
+                    const auto idx_0 = i * 2, idx_1 = i * 2 + 1;
+                    cute::SM100_TMEM_STORE_16dp256b1x::copy(
+                        upper_view[idx_0], upper_view[idx_1],
+                        lower_view[idx_0], lower_view[idx_1],
+                        (tmem_base + cast_stage_idx * BLOCK_K + i * 8) | ((g * 16) << 16));
+                }
             }
             cutlass::arch::fence_view_async_tmem_store();
             cutlass::arch::fence_view_async_shared();
@@ -334,11 +371,14 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
         // Intra-warp reduction and write back
         #pragma unroll
-        for (uint32_t u = 0; u < 2; ++ u) {
-            const auto reduced_sum = math::warp_reduce_sum<4>(sum[u].x + sum[u].y);
-            const auto m_idx = m_block_idx * BLOCK_M + sub_warp_idx * BLOCK_M_PER_WARP + lane_idx / 4 + u * 8;
-            if (lane_idx % 4 == 0 and m_idx < shape_m)
-                sqr_sum[m_offset + m_idx] = reduced_sum;
+        for (uint32_t g = 0; g < kNumRowGroups; ++ g) {
+            #pragma unroll
+            for (uint32_t u = 0; u < 2; ++ u) {
+                const auto reduced_sum = math::warp_reduce_sum<4>(sum[g][u].x + sum[g][u].y);
+                const auto m_idx = m_block_idx * BLOCK_M + sub_warp_idx * BLOCK_M_PER_WARP + g * 16 + lane_idx / 4 + u * 8;
+                if (lane_idx % 4 == 0 and m_idx < shape_m)
+                    sqr_sum[m_offset + m_idx] = reduced_sum;
+            }
         }
     }
 #else

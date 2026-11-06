@@ -401,6 +401,11 @@ void dg_tf32_hc_prenorm_gemm(const Tensor& a, const Tensor& b, const Tensor& d,
     hyperconnection::tf32_hc_prenorm_gemm(a, b, d, sqr_sum, to_optional_int(num_splits));
 }
 
+void dg_tf32_hc_prenorm_gemm_dual(const Tensor& a, const Tensor& b, const Tensor& b2, const Tensor& d,
+                                  const Tensor& d2, const Tensor& sqr_sum, std::optional<int64_t> num_splits) {
+    hyperconnection::tf32_hc_prenorm_gemm_dual(a, b, b2, d, d2, sqr_sum, to_optional_int(num_splits));
+}
+
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
@@ -818,6 +823,7 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_einsum(str expr, Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, Tensor(a!) d, "
           "Tensor(b!)? d_sf, Tensor? c, int[] recipe, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()");
     m.def("tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(a!) d, Tensor(b!) sqr_sum, int? num_splits) -> ()");
+    m.def("tf32_hc_prenorm_gemm_dual(Tensor a, Tensor b, Tensor b2, Tensor(a!) d, Tensor(b!) d2, Tensor(c!) sqr_sum, int? num_splits) -> ()");
 
     // Attention
     m.def("get_paged_mqa_logits_metadata(Tensor context_lens, int block_kv, int num_sms, Tensor? indices) -> Tensor");
@@ -926,6 +932,7 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("einsum", &dg_einsum);
     m.impl("fp8_einsum", &dg_fp8_einsum);
     m.impl("tf32_hc_prenorm_gemm", &dg_tf32_hc_prenorm_gemm);
+    m.impl("tf32_hc_prenorm_gemm_dual", &dg_tf32_hc_prenorm_gemm_dual);
 
     m.impl("get_paged_mqa_logits_metadata", &dg_get_paged_mqa_logits_metadata);
     m.impl("fp8_fp4_mqa_logits", &dg_fp8_fp4_mqa_logits);
