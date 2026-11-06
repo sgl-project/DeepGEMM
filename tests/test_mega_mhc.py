@@ -297,6 +297,25 @@ def test_mega_mhc_api_contract() -> None:
         for name in names:
             assert_bitwise_equal(outputs[name], expected[name], f'FP8-only: {name}')
 
+    # FP8-only calls large enough to rotate every CTA's in-CTA Norm X1 buffers many times
+    inputs, _ = make_inputs(8192, 5120, 2029, True)
+    outputs = make_outputs(inputs, 'col')
+    run_mega_mhc(inputs, outputs)
+    names = ('y_fp8', 'y_gemm_sf')
+    expected = {name: outputs[name].clone() for name in names}
+    num_sms = deep_gemm.get_num_sms()
+    try:
+        for test_num_sms in (num_sms, 16):
+            deep_gemm.set_num_sms(test_num_sms)
+            for _ in range(8):
+                for name in names:
+                    outputs[name].zero_()
+                run_mega_mhc(inputs, outputs, y_bf16=None)
+                for name in names:
+                    assert_bitwise_equal(outputs[name], expected[name], f'FP8-only, {test_num_sms} SMs: {name}')
+    finally:
+        deep_gemm.set_num_sms(num_sms)
+
     # Concurrent kernels on different streams use independent split barriers
     inputs, _ = make_inputs(num_tokens, hidden, 2028, False)
     expected_outputs = make_outputs(inputs, 'bf16')

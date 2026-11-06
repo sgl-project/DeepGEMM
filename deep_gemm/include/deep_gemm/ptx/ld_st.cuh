@@ -450,6 +450,12 @@ CUTLASS_DEVICE uint64_t ld_acq_gpu(const uint64_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE uint64_t ld_relaxed_gpu(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
 /// Predicated loads
 CUTLASS_DEVICE longlong4_t ld_gez_pred(const longlong4_t* ptr, const int& pred) {
     longlong4_t ret = make_longlong4_t(0, 0, 0, 0);

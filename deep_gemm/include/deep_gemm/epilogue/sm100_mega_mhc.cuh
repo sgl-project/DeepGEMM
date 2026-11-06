@@ -110,7 +110,7 @@ constexpr uint32_t kNumLanesPerSFWord = kHiddenPerSFWord / kHiddenPerNormLane;
 
 // Shared normalization and FP8 output helpers.
 CUTLASS_DEVICE nv_bfloat162 normalize_bf16_pair(const nv_bfloat162& input, const nv_bfloat162& weight, const float& scale) {
-    return __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(__bfloat1622float2(input), {scale, scale}), __bfloat1622float2(weight)));
+    return __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(bf16x2_to_float2(input), {scale, scale}), bf16x2_to_float2(weight)));
 }
 
 template <uint32_t SF_BLOCK_M>
@@ -207,12 +207,12 @@ CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumS
                 const auto pairs = reinterpret_cast<const nv_bfloat162*>(&input);
                 #pragma unroll
                 for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
-                    values[pair_idx] = __ffma2_rn(__bfloat1622float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
+                    values[pair_idx] = __ffma2_rn(bf16x2_to_float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
             }
             #pragma unroll
             for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx) {
                 output[pair_idx] = __float22bfloat162_rn(values[pair_idx]);
-                values[pair_idx] = __bfloat1622float2(output[pair_idx]);
+                values[pair_idx] = bf16x2_to_float2(output[pair_idx]);
                 sqr_sum = __ffma2_rn(values[pair_idx], values[pair_idx], sqr_sum);
             }
         }
@@ -287,8 +287,126 @@ CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumS
     }
 }
 
+// In-CTA Norm: normalize the X1 slice that this CTA's Post workers left in shared memory for one task.
+// X1 tiles are `[num_k_blocks][BLOCK_M x BLOCK_K]` BF16 with the Post 128B swizzle; each warp owns 16 rows,
+// and each lane holds 8 contiguous hidden elements (four lanes per FP8 scaling group).
+template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF,
+          uint32_t kNumSplits>
+CUTLASS_DEVICE void run_in_cta_norm_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
+                                         const NormArgs& norm_args, nv_bfloat162* x1_tiles, const nv_bfloat16* smem_weight,
+                                         const void* tensor_map_y_bf16, const uint32_t& barrier_idx,
+                                         const uint32_t& m_block_idx, const uint32_t& k_begin,
+                                         const uint32_t& num_k_blocks,
+                                         const uint32_t& warp_idx_in_wg, const uint32_t& lane_idx) {
+    constexpr uint32_t kNumRowsPerWarp = BLOCK_M / kNumWarpsPerWG;
+    constexpr uint32_t kNumLanesPerRow = BLOCK_K / kHiddenPerNormLane;
+    constexpr uint32_t kNumRowsPerStep = 32 / kNumLanesPerRow;
+    constexpr uint32_t kNumPairsPerTile = BLOCK_M * BLOCK_K / 2;
+    DG_STATIC_ASSERT(kNumRowsPerWarp <= 32 and kNumRowsPerWarp % kNumRowsPerStep == 0, "Invalid in-CTA Norm geometry");
+    DG_STATIC_ASSERT(kNumLanesPerRow % kNumLanesPerSF == 0, "Scaling groups must not span rows");
+
+    sched::mega_mhc::Norm::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
+
+    // Row statistics from every split, summed in split order like the global Norm path
+    const uint32_t first_row_idx = warp_idx_in_wg * kNumRowsPerWarp;
+    float x1_sqr_sum = 0.0f;
+    if (lane_idx < kNumRowsPerWarp) {
+        const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
+        #pragma unroll
+        for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
+            x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask + first_row_idx + lane_idx];
+    }
+    constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
+    const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
+
+    const uint32_t chunk_idx = lane_idx % kNumLanesPerRow;
+    const uint32_t row_in_step = lane_idx / kNumLanesPerRow;
+    // SF halves of an even k-block wait for the odd one, so a word inside the task is stored once
+    uint32_t pending_sf_halves[kNumRowsPerWarp / kNumRowsPerStep] = {};
+    #pragma unroll 1
+    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; ++ k_block_idx) {
+        const uint32_t hidden_idx = k_begin + k_block_idx * BLOCK_K + chunk_idx * kHiddenPerNormLane;
+        const uint4 weight = ptx::ld_shared(reinterpret_cast<const uint4*>(smem_weight + hidden_idx));
+        const auto weight_pairs = reinterpret_cast<const nv_bfloat162*>(&weight);
+        const auto tile = x1_tiles + k_block_idx * kNumPairsPerTile;
+
+        #pragma unroll
+        for (uint32_t step = 0; step < kNumRowsPerWarp / kNumRowsPerStep; ++ step) {
+            const uint32_t row_idx = first_row_idx + step * kNumRowsPerStep + row_in_step;
+            const uint32_t token_idx = m_block_idx * BLOCK_M + row_idx;
+            const bool is_valid_token = token_idx < norm_args.num_tokens;
+            const float row_rms_scale = ptx::exchange(rms_scale, row_idx - first_row_idx);
+
+            const auto tile_chunk = reinterpret_cast<uint4*>(tile + get_swizzled_bf16x2_offset(row_idx, chunk_idx * kNumBF16PairsPerLane));
+            const uint4 x1 = *tile_chunk;
+            const auto x1_pairs = reinterpret_cast<const nv_bfloat162*>(&x1);
+            uint4 values;
+            const auto output = reinterpret_cast<nv_bfloat162*>(&values);
+            #pragma unroll
+            for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
+                output[pair_idx] = normalize_bf16_pair(x1_pairs[pair_idx], weight_pairs[pair_idx], row_rms_scale);
+
+            const uint64_t output_offset = static_cast<uint64_t>(token_idx) * kHidden + hidden_idx;
+            // BF16 output replaces X1 in place and leaves through one TMA store per tile
+            if constexpr (kStoreBF16)
+                *tile_chunk = values;
+            if constexpr (kStoreFP8) {
+                const nv_bfloat16 lane_amax = math::get_packed_bf16_amax(reinterpret_cast<const nv_bfloat162(&)[4]>(values));
+                const nv_bfloat16 amax = math::warp_reduce_max<kNumLanesPerSF>(nv_bfloat162(lane_amax, lane_amax)).x;
+                const uint32_t sf_exp = math::get_ue8m0_sf_exp(amax);
+                const auto sf_inv = __bfloat162bfloat162(math::get_ue8m0_sf_inv<nv_bfloat16>(sf_exp));
+                const uint2 fp8_values = {math::scale_bf16x2_into_fp8x4(output[0], output[1], sf_inv, sf_inv),
+                                          math::scale_bf16x2_into_fp8x4(output[2], output[3], sf_inv, sf_inv)};
+                if (is_valid_token)
+                    *reinterpret_cast<uint2*>(norm_args.y_fp8 + output_offset) = fp8_values;
+                // A k-block holds two whole scaling groups (one half of an SF word), stored as one 16-bit value
+                const uint32_t next_sf_exp = __shfl_down_sync(0xffffffff, sf_exp, kNumLanesPerSF);
+                const uint32_t sf_group_idx = hidden_idx / kHiddenPerSF;
+                const uint32_t sf_word_idx = sf_group_idx / (kHiddenPerSFWord / kHiddenPerSF);
+                const uint32_t sf_half_idx = sf_group_idx % (kHiddenPerSFWord / kHiddenPerSF) / 2;
+                const uint32_t sf_half = (sf_exp & 0xffu) | ((next_sf_exp & 0xffu) << 8);
+                const bool is_word_start_pending = sf_half_idx == 0 and k_block_idx + 1 < num_k_blocks;
+                const bool has_pending_low_half = sf_half_idx == 1 and k_block_idx > 0;
+                if (is_valid_token and chunk_idx == 0 and not is_word_start_pending) {
+                    const auto store_sf = [&](uint32_t* sf_word_ptr) {
+                        if (has_pending_low_half)
+                            *sf_word_ptr = pending_sf_halves[step] | (sf_half << 16);
+                        else
+                            reinterpret_cast<uint16_t*>(sf_word_ptr)[sf_half_idx] = static_cast<uint16_t>(sf_half);
+                    };
+                    if constexpr (SF_BLOCK_M > 0) {
+                        store_sf(norm_args.y_primary_sf + primary_sf_token_offset<false>(norm_args, token_idx) +
+                                 sf_word_idx * norm_args.y_primary_sf_stride_word);
+                        store_sf(norm_args.y_shared_sf + get_shared_sf_row_idx<SF_BLOCK_M>(token_idx) +
+                                 static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word);
+                    } else {
+                        store_sf(norm_args.y_primary_sf + primary_sf_token_offset<kSwizzledPrimarySF>(norm_args, token_idx) +
+                                 sf_word_idx * norm_args.y_primary_sf_stride_word);
+                    }
+                }
+                pending_sf_halves[step] = sf_half;
+            }
+        }
+    }
+    if constexpr (kStoreBF16)
+        cute::tma_store_fence();
+    // Every warp is done with the X1 tiles before warp 0 stores or releases them
+    cutlass::arch::NamedBarrier::sync(kNumWarpsPerWG * 32, barrier_idx);
+    if constexpr (kStoreBF16) {
+        if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+            for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; ++ k_block_idx)
+                ptx::tma_store_2d(tensor_map_y_bf16, x1_tiles + k_block_idx * kNumPairsPerTile,
+                                  k_begin + k_block_idx * BLOCK_K, m_block_idx * BLOCK_M);
+            cute::tma_store_arrive();
+            cute::tma_store_wait<0>();
+        }
+        __syncwarp();
+    }
+}
+
 // Shifted Norm consumes materialized X1 and handles two tokens per task.
 constexpr uint32_t kNumTokensPerShiftedNormTask = 2;
+constexpr uint32_t kNumNormPrefetchPacks = 4;
 
 struct ShiftedNormPack {
     uint4 x1[kNumTokensPerShiftedNormTask];
@@ -300,7 +418,7 @@ template <uint32_t kHidden, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M
 CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
                                           const NormArgs& norm_args,
                                           const uint32_t& task_idx,
-                                          const uint32_t& num_partitions, const uint32_t& lane_idx) {
+                                          const auto& num_partitions, const uint32_t& lane_idx) {
     constexpr uint32_t kNumHiddenPacks = kHidden / kHiddenPerNormPack;
     // task_idx flattens [token pair, hidden-pack partition].
     const uint32_t partition_idx = task_idx % num_partitions;
@@ -329,36 +447,11 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
             *reinterpret_cast<const uint4*>(norm_args.weight + hidden_idx)};
     };
 
-    // Keep current/next packs in registers and prefetch two ahead to hide the BF16 reread.
-    ShiftedNormPack pack, next_pack;
     const uint32_t first_hidden_idx = hidden_pack_begin * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
     const uint64_t first_output_offset = static_cast<uint64_t>(m_idx) * kHidden + first_hidden_idx;
-    pack = load_pack(first_output_offset, first_hidden_idx);
-    if (hidden_pack_begin + 1 < hidden_pack_end)
-        next_pack = load_pack(first_output_offset + kHiddenPerNormPack, first_hidden_idx + kHiddenPerNormPack);
-
-    float x1_sqr_sum = 0.0f;
-    if (lane_idx < kNumTokensPerShiftedNormTask and m_idx + lane_idx < norm_args.num_tokens) {
-        const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
-        #pragma unroll
-        for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
-            x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask +
-                                               m_idx % BLOCK_M + lane_idx];
-    }
-    constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
-    const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
-    const float2 rms_scales = {ptx::exchange(rms_scale, 0), ptx::exchange(rms_scale, 1)};
-    if constexpr (SF_BLOCK_M > 0) {
-        shared_sf_row_indices.x = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx);
-        shared_sf_row_indices.y = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx + 1);
-    }
-    for (uint32_t hidden_pack_idx = hidden_pack_begin; hidden_pack_idx < hidden_pack_end; ++ hidden_pack_idx) {
+    const auto process_pack = [&](const ShiftedNormPack& pack, const uint32_t& hidden_pack_idx, const float2& rms_scales) {
         const uint32_t hidden_idx = hidden_pack_idx * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
         const uint64_t output_offset = static_cast<uint64_t>(m_idx) * kHidden + hidden_idx;
-        const bool has_prefetch = hidden_pack_idx + 2 < hidden_pack_end;
-        ShiftedNormPack prefetch_pack;
-        if (has_prefetch)
-            prefetch_pack = load_pack(output_offset + 2 * kHiddenPerNormPack, hidden_idx + 2 * kHiddenPerNormPack);
         uint4 values[kNumTokensPerShiftedNormTask] = {};
         const auto input = reinterpret_cast<const nv_bfloat162*>(pack.x1);
         const auto weight = reinterpret_cast<const nv_bfloat162*>(&pack.weight);
@@ -400,10 +493,69 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
                 }
             }
         }
-        if (hidden_pack_idx + 1 < hidden_pack_end)
-            pack = next_pack;
-        if (has_prefetch)
-            next_pack = prefetch_pack;
+    };
+
+    const auto load_rms_scales = [&]() {
+        float x1_sqr_sum = 0.0f;
+        if (lane_idx < kNumTokensPerShiftedNormTask and m_idx + lane_idx < norm_args.num_tokens) {
+            const auto x1_sqr_sum_partials = workspace.get_x1_sqr_sum_partial_ptr(m_block_idx * kNumSplits);
+            #pragma unroll
+            for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
+                x1_sqr_sum += x1_sqr_sum_partials[k_split_idx * kNumSqrSumPartialElementsPerTask +
+                                                   m_idx % BLOCK_M + lane_idx];
+        }
+        constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
+        const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
+        if constexpr (SF_BLOCK_M > 0) {
+            shared_sf_row_indices.x = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx);
+            shared_sf_row_indices.y = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx + 1);
+        }
+        return float2{ptx::exchange(rms_scale, 0), ptx::exchange(rms_scale, 1)};
+    };
+
+    using partitions_t = std::decay_t<decltype(num_partitions)>;
+    constexpr bool kIsShortTask = [] {
+        if constexpr (std::is_empty_v<partitions_t>)
+            return kNumHiddenPacks / partitions_t::value <= kNumNormPrefetchPacks;
+        return false;
+    }();
+    if constexpr (kIsShortTask) {
+        // Compile-time partitions: the whole task is unrolled and keeps a ring of packs in flight.
+        constexpr uint32_t kNumPacksPerTask = kNumHiddenPacks / partitions_t::value;
+        constexpr uint32_t kDepth = cute::min(kNumNormPrefetchPacks, kNumPacksPerTask);
+        DG_STATIC_ASSERT(kNumHiddenPacks % partitions_t::value == 0, "Partitions must split packs evenly");
+        ShiftedNormPack ring[kDepth];
+        #pragma unroll
+        for (uint32_t i = 0; i < kDepth; ++ i)
+            ring[i] = load_pack(first_output_offset + i * kHiddenPerNormPack, first_hidden_idx + i * kHiddenPerNormPack);
+        const float2 rms_scales = load_rms_scales();
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumPacksPerTask; ++ i) {
+            const ShiftedNormPack pack = ring[i % kDepth];
+            if (i + kDepth < kNumPacksPerTask)
+                ring[i % kDepth] = load_pack(first_output_offset + (i + kDepth) * kHiddenPerNormPack,
+                                             first_hidden_idx + (i + kDepth) * kHiddenPerNormPack);
+            process_pack(pack, hidden_pack_begin + i, rms_scales);
+        }
+    } else {
+        ShiftedNormPack pack, next_pack;
+        pack = load_pack(first_output_offset, first_hidden_idx);
+        if (hidden_pack_begin + 1 < hidden_pack_end)
+            next_pack = load_pack(first_output_offset + kHiddenPerNormPack, first_hidden_idx + kHiddenPerNormPack);
+        const float2 rms_scales = load_rms_scales();
+        for (uint32_t hidden_pack_idx = hidden_pack_begin; hidden_pack_idx < hidden_pack_end; ++ hidden_pack_idx) {
+            const uint32_t hidden_idx = hidden_pack_idx * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
+            const uint64_t output_offset = static_cast<uint64_t>(m_idx) * kHidden + hidden_idx;
+            const bool has_prefetch = hidden_pack_idx + 2 < hidden_pack_end;
+            ShiftedNormPack prefetch_pack;
+            if (has_prefetch)
+                prefetch_pack = load_pack(output_offset + 2 * kHiddenPerNormPack, hidden_idx + 2 * kHiddenPerNormPack);
+            process_pack(pack, hidden_pack_idx, rms_scales);
+            if (hidden_pack_idx + 1 < hidden_pack_end)
+                pack = next_pack;
+            if (has_prefetch)
+                next_pack = prefetch_pack;
+        }
     }
 }
 
@@ -420,27 +572,45 @@ CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace
     // Only subdivide underfilled FP8 grids when a token pair can span multiple CTAs.
     constexpr uint32_t kNumFP8Partitions =
         kNumSplits > kDefaultNumSplits and kNumHiddenPacks > 2 * kNumWarpsPerWG ? kNumHiddenPacks / 2 : 2;
-    const uint32_t num_partitions = kStoreFP8 ? kNumFP8Partitions : cute::max(
-        math::ceil_div(kNumHiddenPacks, cute::max(
-            1u, num_token_pairs * kNumHiddenPacks / kNumTasksPerGridWave)), 2u);
-    const uint32_t num_tasks = num_token_pairs * num_partitions;
     const uint32_t cta_task_base = blockIdx.x * kNumWarpsPerWG;
-    if (cta_task_base >= num_tasks)
-        return;
-
-    cutlass::arch::warpgroup_reg_alloc<kNumRegisters>();
-    while (true) {
-        uint32_t task_ticket;
-        if (cute::elect_one_sync())
-            task_ticket = atomicAdd(&smem.next_norm_task_ticket, 1u);
-        task_ticket = ptx::exchange(task_ticket, 0);
-        // Preserve the four CTA-local warp residue classes, then advance by one grid-wide worker wave.
-        const uint32_t task_idx = cta_task_base + task_ticket % kNumWarpsPerWG +
-                                  task_ticket / kNumWarpsPerWG * kNumTasksPerGridWave;
-        if (task_idx >= num_tasks)
+    const auto run_tasks = [&](const auto& num_partitions) {
+        const uint32_t num_tasks = num_token_pairs * num_partitions;
+        if (cta_task_base >= num_tasks)
             return;
-        run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
-            workspace, gmem_split_barriers, norm_args, task_idx, num_partitions, lane_idx);
+
+        cutlass::arch::warpgroup_reg_alloc<kNumRegisters>();
+        while (true) {
+            uint32_t task_ticket;
+            if (cute::elect_one_sync())
+                task_ticket = atomicAdd(&smem.next_norm_task_ticket, 1u);
+            task_ticket = ptx::exchange(task_ticket, 0);
+            // Preserve the four CTA-local warp residue classes, then advance by one grid-wide worker wave.
+            const uint32_t task_idx = cta_task_base + task_ticket % kNumWarpsPerWG +
+                                      task_ticket / kNumWarpsPerWG * kNumTasksPerGridWave;
+            if (task_idx >= num_tasks)
+                return;
+            run_shifted_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
+                workspace, gmem_split_barriers, norm_args, task_idx, num_partitions, lane_idx);
+        }
+    };
+
+    if constexpr (kStoreFP8) {
+        if constexpr (kNumSplits <= kDefaultNumSplits and kNumHiddenPacks % 4 == 0) {
+            // Small grids finish Norm after Post: use the most partitions that keep at most 13/4 tasks per Norm warp
+            // (WG5 and the two retired Post WGs).
+            constexpr uint32_t kNumNormWarps = kNumSMs * 3 * kNumWarpsPerWG;
+            const auto fits_norm_warps = [&](const uint32_t& num_partitions) {
+                return num_token_pairs * num_partitions * 4 <= kNumNormWarps * 13;
+            };
+            if (fits_norm_warps(kNumHiddenPacks / 2))
+                return run_tasks(cute::Int<kNumHiddenPacks / 2>{});
+            if (fits_norm_warps(kNumHiddenPacks / 4))
+                return run_tasks(cute::Int<kNumHiddenPacks / 4>{});
+        }
+        run_tasks(cute::Int<kNumFP8Partitions>{});
+    } else {
+        run_tasks(cute::max(math::ceil_div(kNumHiddenPacks, cute::max(
+            1u, num_token_pairs * kNumHiddenPacks / kNumTasksPerGridWave)), 2u));
     }
 }
 
