@@ -388,9 +388,11 @@ CUTLASS_DEVICE void run_in_cta_norm_task(const Workspace<kNumSplits>& workspace,
             }
         }
     }
-    if constexpr (kStoreBF16) {
+    if constexpr (kStoreBF16)
         cute::tma_store_fence();
-        cutlass::arch::NamedBarrier::sync(kNumWarpsPerWG * 32, barrier_idx);
+    // Every warp is done with the X1 tiles before warp 0 stores or releases them
+    cutlass::arch::NamedBarrier::sync(kNumWarpsPerWG * 32, barrier_idx);
+    if constexpr (kStoreBF16) {
         if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; ++ k_block_idx)
                 ptx::tma_store_2d(tensor_map_y_bf16, x1_tiles + k_block_idx * kNumPairsPerTile,

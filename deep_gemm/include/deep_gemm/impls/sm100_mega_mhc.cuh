@@ -793,7 +793,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         workspace, gmem_split_barriers, norm_args, get_x1_task_tiles(iter), smem_weight,
                         &tensor_map_y_bf16, 1 + kNormWGIdx, task_idx / kNumSplits,
                         get_task_k_begin(split_idx), get_num_task_k_blocks(split_idx), warp_idx % kNumWarpsPerWG, lane_idx);
-                    // Warp 0 has waited for the TMA reads of the tiles; the other warps are past the WG barrier
+                    // Every Norm warp has passed the WG barrier after its last X1 read, and warp 0 has waited for the BF16 TMA reads
                     if (warp_idx % kNumWarpsPerWG == 0 and cute::elect_one_sync())
                         empty_x1_barriers[iter % kNumX1Buffers].arrive();
                     __syncwarp();
