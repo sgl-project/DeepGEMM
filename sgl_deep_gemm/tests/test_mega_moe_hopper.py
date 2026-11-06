@@ -402,6 +402,7 @@ def _run_accuracy_scenario(
     masked_ratio = cfg.get("masked_ratio", 0.0)
     activation_clamp = cfg.get("activation_clamp", 10.0)
     fast_math = cfg.get("fast_math", True)
+    diff_tol = min(diff_tol, cfg.get("diff_tol", diff_tol))
 
     assert num_experts % num_ranks == 0, (
         f"{name}: experts {num_experts} not divisible by ranks {num_ranks}"
@@ -513,7 +514,7 @@ def _run_accuracy_scenario(
     dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
     ok = bool(ok.item())
     dist_print(
-        f"  [{name:<32}] diff={diff:.4f} (tol={diff_tol:.2f}) "
+        f"  [{name:<32}] diff={diff:.3g} (tol={diff_tol:.3g}) "
         f"{'OK' if ok else 'FAIL'}",
         once_in_node=True,
     )
@@ -590,6 +591,14 @@ def _accuracy_layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[
         cfg = dict(base)
         cfg.update(num_max_tokens_per_rank=tokens, num_tokens=tokens)
         out.append((f"L2.heur.{label}.t{tokens}", cfg))
+    # Long K at the M64/M128 boundary; the default tolerance misses FP22 loss.
+    for tokens in (63, 64):
+        out.append((f"L2.heur.accum.t{tokens}", dict(
+            hidden=4096, intermediate_hidden=2048,
+            num_experts=num_ranks, num_topk=1,
+            num_max_tokens_per_rank=128, num_tokens=tokens,
+            diff_tol=3e-5,
+        )))
     return out
 
 
