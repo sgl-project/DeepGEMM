@@ -1,25 +1,22 @@
 #pragma once
 
+#include <format>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/layout.hpp"
-#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 #include "sm90_fp8_fp4_gemm_1d2d_rs.hpp"
 
 namespace deep_gemm {
 
-class SM90FP8FP4Gemm1D1DRuntime final: public LaunchRuntime<SM90FP8FP4Gemm1D1DRuntime> {
+class SM90FP8FP4Gemm1D1DRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
 
         void *gmem_b_ptr;
         void *gmem_d_ptr;
@@ -30,8 +27,8 @@ public:
         CUtensorMap tensor_map_cd;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -61,27 +58,27 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype));
-    }
+        to_string(args.gemm_desc.cd_dtype)));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        jit->launch(
+            kernel, args.options,
             nullptr, args.gmem_b_ptr,
             args.gmem_d_ptr, args.grouped_layout,
             nullptr,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_cd));
+            args.tensor_map_cd
+        );
     }
 };
 
-class SM90FP8FP4Gemm1D2DRuntime final: public LaunchRuntime<SM90FP8FP4Gemm1D2DRuntime> {
+class SM90FP8FP4Gemm1D2DRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
 
         cute::UMMA::Major major_sfb;
         void *gmem_b_ptr;
@@ -94,8 +91,8 @@ public:
         CUtensorMap tensor_map_sfa;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
@@ -127,14 +124,14 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        get_default_epilogue_type(std::nullopt));
-    }
+        "epilogue::transform::EpilogueIdentity"));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        jit->launch(
+            kernel, args.options,
             args.gmem_b_ptr, args.sfb, args.grouped_layout, args.gmem_d_ptr,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.tensor_map_sfa));
+            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.tensor_map_sfa
+        );
     }
 };
 
@@ -144,7 +141,7 @@ static void sm90_fp8_fp4_gemm_1d1d_fused(const std::pair<torch::Tensor, torch::T
                                          const std::optional<torch::Tensor>& c,
                                          const int& gran_k,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(gran_k == 128);
     DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
@@ -181,8 +178,8 @@ static void sm90_fp8_fp4_gemm_1d1d_fused(const std::pair<torch::Tensor, torch::T
         .major_a = cute::UMMA::Major::K,
         .major_b = cute::UMMA::Major::K,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
     auto config = get_best_config<SM90ArchSpec>(desc);
@@ -205,9 +202,12 @@ static void sm90_fp8_fp4_gemm_1d1d_fused(const std::pair<torch::Tensor, torch::T
     const SM90FP8FP4Gemm1D1DRuntime::Args& args = {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .grouped_layout = nullptr,
@@ -216,9 +216,7 @@ static void sm90_fp8_fp4_gemm_1d1d_fused(const std::pair<torch::Tensor, torch::T
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
     };
-    const auto code = SM90FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_fp4_gemm_1d1d_fused", code);
-    SM90FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    SM90FP8FP4Gemm1D1DRuntime::compile_and_launch("sm90_fp8_fp4_gemm_1d1d_fused", args);
 }
 
 static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
@@ -230,7 +228,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         const std::string& compiled_dims,
         const bool& use_psum_layout,
         const std::optional<int>& expected_m_for_psum_layout) {
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(gran_k == 128);
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(a.second.scalar_type() == torch::kFloat);
@@ -286,8 +284,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
             .major_a = cute::UMMA::Major::K,
             .major_b = cute::UMMA::Major::K,
             .with_accumulation = false,
-            .num_sms = device_runtime->get_num_sms(),
-            .tc_util = device_runtime->get_tc_util(),
+            .num_sms = runtime->get_num_sms(),
+            .tc_util = runtime->get_tc_util(),
             .compiled_dims = compiled_dims,
             .expected_m = expected_m_for_psum_layout.value_or(m),
             .expected_n = n,
@@ -315,9 +313,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         const SM90FP8FP4Gemm1D1DRuntime::Args& args = {
             .gemm_desc = desc,
             .gemm_config = config,
-            .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                      config.pipeline_config.smem_size,
-                                      config.layout.get_cluster_size()),
+            .options = {
+                .num_smem_bytes = config.pipeline_config.smem_size,
+                .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+                .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+                .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+            },
             .gmem_b_ptr = b.first.data_ptr(),
             .gmem_d_ptr = d.data_ptr(),
             .grouped_layout = grouped_layout.data_ptr(),
@@ -326,9 +327,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
             .tensor_map_sfb = tensor_map_sfb,
             .tensor_map_cd = tensor_map_cd,
         };
-        const auto code = SM90FP8FP4Gemm1D1DRuntime::generate(args);
-        const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused", code);
-        SM90FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+        SM90FP8FP4Gemm1D1DRuntime::compile_and_launch(
+            "sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused", args);
         return;
     }
 
@@ -342,8 +342,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         .major_a = cute::UMMA::Major::K,
         .major_b = cute::UMMA::Major::K,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n,
@@ -472,9 +472,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     const SM90FP8FP4Gemm1D2DRuntime::Args& args = {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .major_sfb = get_major_type_ab(sfb),
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
@@ -485,9 +488,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
     };
-    const auto code = SM90FP8FP4Gemm1D2DRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_contiguous_1d2d_fused", code);
-    SM90FP8FP4Gemm1D2DRuntime::launch(runtime, args);
+    SM90FP8FP4Gemm1D2DRuntime::compile_and_launch(
+        "sm90_m_grouped_fp8_fp4_gemm_contiguous_1d2d_fused", args);
 }
 
 static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
@@ -514,7 +516,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         //   * Many active groups + high max_m → fan-out (BM ladder, BN=256) wins
         // Falls back to old behavior (max_hint only) when not provided.
         const std::optional<int>& active_groups_hint = std::nullopt) {
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     const int gran_k_a_requested = gran_k_a_override.value_or(gran_k);
     const int gran_k_b_requested = gran_k_b_override.value_or(gran_k);
     DG_HOST_ASSERT(gran_k_a_requested == 128);
@@ -563,8 +565,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .major_a = cute::UMMA::Major::K,
         .major_b = cute::UMMA::Major::K,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .expected_m = expected_m,
         .expected_n = n,
@@ -890,9 +892,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const SM90FP8FP4Gemm1D2DRSRuntime::Args& rs_args = {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .major_sfb = get_major_type_ab(sfb),
         .scale_b_direct_load = scale_b_direct_load,
         .k32_quad_reduce = k32_quad_reduce,
@@ -911,9 +916,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .tensor_map_d = tensor_map_d,
         .tensor_map_sfa = tensor_map_sfa,
     };
-    const auto code = SM90FP8FP4Gemm1D2DRSRuntime::generate(rs_args);
-    const auto runtime = compiler->build("sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_fused", code);
-    SM90FP8FP4Gemm1D2DRSRuntime::launch(runtime, rs_args);
+    SM90FP8FP4Gemm1D2DRSRuntime::compile_and_launch(
+        "sm90_m_grouped_fp8_fp4_gemm_masked_1d2d_rs_fused", rs_args);
 }
 
 }  // namespace deep_gemm

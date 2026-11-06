@@ -1,14 +1,11 @@
 #pragma once
 
+#include <format>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/layout.hpp"
-#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -20,12 +17,12 @@ namespace deep_gemm {
 // kernel its own JIT artifact and entry point so subsequent steps (S3+) can
 // safely diverge the device code without affecting the SS path or the
 // contiguous host route.
-class SM90FP8FP4Gemm1D2DRSRuntime final: public LaunchRuntime<SM90FP8FP4Gemm1D2DRSRuntime> {
+class SM90FP8FP4Gemm1D2DRSRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
 
         cute::UMMA::Major major_sfb;
         bool scale_b_direct_load;
@@ -51,8 +48,8 @@ public:
         CUtensorMap tensor_map_sfa;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_gemm_1d2d_rs.cuh>
 
 using namespace deep_gemm;
@@ -154,7 +151,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type),
-        get_default_epilogue_type(std::nullopt),
+        "epilogue::transform::EpilogueIdentity",
         "false",
         "false",
         "false",
@@ -218,14 +215,14 @@ static void __instantiate_kernel() {{
         args.b_is_int4_sym ? "true" : "false",
         args.scale_b_bf16 ? "true" : "false",
         args.scale_b_e8m0 ? "true" : "false",
-        "false");
-    }
+        "false"));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        jit->launch(
+            kernel, args.options,
             args.gmem_b_ptr, args.sfb, args.grouped_layout, args.gmem_d_ptr,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.tensor_map_sfa));
+            args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.tensor_map_sfa
+        );
     }
 };
 } // namespace deep_gemm

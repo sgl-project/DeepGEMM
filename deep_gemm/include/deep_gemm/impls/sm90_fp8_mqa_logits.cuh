@@ -20,7 +20,6 @@
 namespace deep_gemm {
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -28,7 +27,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
-                         const uint32_t max_seqlen_k, const uint32_t stride_logits,
+                         const uint32_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
                          uint32_t* cu_seq_len_k_end,
                          logits_dtype_t* logits,
@@ -305,15 +304,10 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                     // Store into the global memory
                     const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
-                    if constexpr (kIsCompressedLogits) {
-                        if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
-                        if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
-                    } else {
-                        logits[q_offset + kv_offset + v_0_offset] = static_cast<logits_dtype_t>(v_0);
-                        logits[q_offset + kv_offset + v_1_offset] = static_cast<logits_dtype_t>(v_1);
-                    }
+                    if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
+                        logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
+                    if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
+                        logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
                 }
             }
             num_total_kv_blocks += num_kv_blocks;

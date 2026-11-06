@@ -17,7 +17,6 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/mma/sm90.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
@@ -156,6 +155,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
 
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if (is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
+                    continue;
+
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
@@ -220,6 +222,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            if (is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
+                continue;
+
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
             float accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
@@ -368,13 +373,13 @@ sm90_bf16_gemm_impl(int* grouped_layout,
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 if constexpr (kGemmType == GemmType::Batched) {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                        cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_ptr,
                                      n_block_idx * BLOCK_N + in_block_n_offset,
                                      m_idx, scheduler.current_group_idx);
                 } else {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                        cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_ptr,
                                      n_block_idx * BLOCK_N + in_block_n_offset, m_idx);
                 }

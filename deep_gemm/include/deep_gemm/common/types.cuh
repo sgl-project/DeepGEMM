@@ -7,15 +7,8 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    MXF4        = 2,
 };
-
-constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
-    switch (mma_kind) {
-        case MmaKind::BF16:     return 2;
-        case MmaKind::MXFP8FP4: return 1;
-        default: return 0;
-    }
-}
 
 enum class GemmType {
     Normal                              = 0,
@@ -48,5 +41,19 @@ enum class KernelType {
     Kernel1D2D = 1,
     KernelNoSF = 2
 };
+
+// Host-provided epilogue parameters. Operators keep their per-thread state separately;
+// only the fields consumed by the selected operator are meaningful.
+struct EpilogueOperatorArgs {
+    uint32_t* sfd = nullptr;
+    uint32_t sfd_stride = 0;
+    uint32_t shape_m = 0, shape_n = 0;
+    float alpha = 1.0f;
+    float clamp_value = 0.0f;  // Zero disables clamping
+    uint32_t* clamped_count = nullptr;
+    uint32_t* clamp_count_ready = nullptr;  // Per-stream GPU launch tag for in-kernel initialization
+};
+
+static constexpr uint32_t kNumDeviceLocalityDomains = 2;
 
 } // namespace deep_gemm

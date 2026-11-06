@@ -1,323 +1,282 @@
 #pragma once
 
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/scheduler/sm100_mqa_logits.cuh>
 
-// SM100 paged scheduler: metadata emits per-SM (q_token_idx, kv_split_idx) starts
-// Device traversal walks chunk-outer / Q-block-inner tasks
+// SM100 paged-KV scheduler with per-SM ranges balanced by estimated split cost
 
 namespace deep_gemm::sched {
 
-// Per-request geometry accessor; this is where varlen and non-varlen diverge
-template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
-          uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV>
+// Geometry of one request
+template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV>
 struct RequestInfo {
-    uint32_t q_token_start;       // request_q_token_start
-    uint32_t num_q_tokens;        // request_num_q_tokens
-    uint32_t num_q_blocks;        // request_num_q_blocks
-    uint32_t num_kv_splits;       // request_num_kv_splits  = ceil(context_len / SPLIT_KV)
-    uint32_t num_kv_pages;        // = ceil(context_len / PAGE_KV); page-level bound for the last partial split
+    uint32_t q_token_start;
+    uint32_t num_q_tokens;
+    uint32_t num_q_blocks;
+    uint32_t num_kv_splits;
+    uint32_t num_kv_pages;
 
-    // Resolve the request that starts at `q_token_idx`
+    CUTLASS_DEVICE RequestInfo() = default;
+
+    CUTLASS_DEVICE RequestInfo(const uint32_t& q_token_start, const uint32_t& num_q_tokens,
+                               const uint32_t& context_len):
+        q_token_start(q_token_start), num_q_tokens(num_q_tokens),
+        num_q_blocks(math::ceil_div(num_q_tokens, BLOCK_Q)),
+        num_kv_splits(math::ceil_div(context_len, SPLIT_KV)),
+        num_kv_pages(math::ceil_div(context_len, PAGE_KV)) {}
+
+    // Group consecutive equal indices; the last token has the longest context
     CUTLASS_DEVICE static RequestInfo from_q_token(const uint32_t& q_token_idx,
                                                    const uint32_t& num_q_tokens_total,
                                                    const uint32_t* context_lens,
                                                    const uint32_t* indices) {
-        RequestInfo info;
-        info.q_token_start = q_token_idx;
-        uint32_t context_len;
-        if constexpr (kIsVarlen) {
-            // Varlen request = maximal run of equal `indices`
-            const uint32_t request_id = indices[q_token_idx];
-            uint32_t t = q_token_idx;
-            while (t + 1 < num_q_tokens_total and indices[t + 1] == request_id)
-                ++ t;
-            info.num_q_tokens = t - q_token_idx + 1;
-            context_len = context_lens[t];
-        } else {
-            // Regular grid: request = q_token_idx / next_n, next_n tokens each
-            const uint32_t request_id = q_token_idx / kNextN;
-            info.num_q_tokens = kNextN;
-            const uint32_t lens_idx = kIsContextLens2D ? request_id * kNextN + kNextN - 1 : request_id;
-            context_len = context_lens[lens_idx];
-        }
-        info.num_q_blocks = math::ceil_div(info.num_q_tokens, BLOCK_Q);
-        info.num_kv_splits = math::ceil_div(context_len, SPLIT_KV);
-        info.num_kv_pages = math::ceil_div(context_len, PAGE_KV);
-        return info;
+        const uint32_t request_id = indices[q_token_idx];
+        uint32_t q_token_end_idx = q_token_idx + 1;
+        while (q_token_end_idx < num_q_tokens_total and indices[q_token_end_idx] == request_id)
+            ++ q_token_end_idx;
+        return RequestInfo(q_token_idx, q_token_end_idx - q_token_idx, context_lens[q_token_end_idx - 1]);
     }
 
-    // Average q-token partition across Q-blocks; returns both offset and count
-    CUTLASS_DEVICE void get_q_block_span(const uint32_t& q, uint32_t& token_offset, uint32_t& num_tokens) const {
-        const uint32_t base = num_q_tokens / num_q_blocks, rem = num_q_tokens % num_q_blocks;
-        token_offset = q * base + (q < rem ? q : rem);
-        num_tokens = base + (q < rem ? 1 : 0);
-    }
-
-    // block_table row for this request: request id for non-varlen, token row for varlen
-    CUTLASS_DEVICE uint32_t get_block_table_row() const {
-        if constexpr (kIsVarlen)
-            return q_token_start;
-        else
-            return q_token_start / kNextN;
+    // Distribute request tokens evenly across Q blocks
+    CUTLASS_DEVICE void get_q_block_span(const uint32_t& q_block_idx, uint32_t& token_offset, uint32_t& num_tokens) const {
+        const uint32_t base = num_q_tokens / num_q_blocks, remainder = num_q_tokens % num_q_blocks;
+        token_offset = q_block_idx * base + cute::min(q_block_idx, remainder);
+        num_tokens = base + (q_block_idx < remainder ? 1 : 0);
     }
 };
 
-// Metadata kernel balances work across SMs via a prefix sum over request work
-template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
-          uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs>
-CUTLASS_GLOBAL __launch_bounds__(256, 1)
-void sm100_paged_mqa_logits_metadata(const uint32_t num_requests,
-                                     const uint32_t num_q_tokens_total,
+// Metadata builder, one CTA: request runs, work prefix sums, per-SM start points
+template <uint32_t SPLIT_KV, uint32_t kNumSMs, uint32_t BLOCK_Q, uint32_t kNumThreads>
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1)
+void sm100_paged_mqa_logits_metadata(const uint32_t num_q_tokens_total,
                                      const uint32_t* context_lens,
                                      const uint32_t* indices,
                                      uint32_t* schedule_meta) {
-    // PAGE_KV is unused for metadata; pass SPLIT_KV as a placeholder
-    using Info = RequestInfo<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_Q, SPLIT_KV, SPLIT_KV>;
-
-    cudaGridDependencySynchronize();  // wait for the primary kernel (CDP launch)
-
+    DG_STATIC_ASSERT(kNumThreads > 0 and kNumThreads <= 1024 and kNumThreads % 32 == 0, "Invalid thread count");
+    DG_STATIC_ASSERT(BLOCK_Q > 0, "Invalid Q block size");
+    constexpr uint32_t kNumWarps = kNumThreads / 32;
     const uint32_t thread_idx = threadIdx.x;
-    const uint32_t lane_idx = ptx::get_lane_idx();
-    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
-    const uint32_t num_threads = blockDim.x;
+    DG_DEVICE_ASSERT(blockDim.x == kNumThreads);
+    cudaGridDependencySynchronize();
+    if (cutlass::canonical_warp_idx_sync() == 0 and cute::elect_one_sync())
+        cutlass::arch::launch_dependent_grids();
 
-    // smem: per-request work prefix sum + request start token
     extern __shared__ uint32_t smem[];
-    uint32_t* prefix_work = smem;                       // [num_requests]
-    uint32_t* request_q_token_start = smem + num_requests;  // [num_requests]
+    const auto request_q_token_start_idx = smem;                                        // [num_q_tokens_total]
+    const auto request_work_prefix = request_q_token_start_idx + num_q_tokens_total;    // [num_q_tokens_total]
+    const auto warp_sums = request_work_prefix + num_q_tokens_total;                     // [kNumWarps]
+    const auto num_requests_shared = warp_sums + kNumWarps;
 
-    // Logical requests are regular requests for non-varlen and index runs for varlen
-    uint32_t num_logical_requests;
-    if constexpr (kIsVarlen) {
-        if (thread_idx == 0) {
-            uint32_t r = 0, t = 0;
-            while (t < num_q_tokens_total) {
-                request_q_token_start[r] = t;
-                const uint32_t request_id = indices[t];
-                while (t < num_q_tokens_total and indices[t] == request_id)
-                    ++ t;
-                ++ r;
-            }
-            // Temporarily stash run count for broadcast
-            prefix_work[0] = r;  // temporary: run count
+    // Scan changes in indices twice: count request starts, then write them
+    DG_DEVICE_ASSERT(reinterpret_cast<uintptr_t>(indices) % 8 == 0);
+    const auto indices_vec2 = reinterpret_cast<const uint2*>(indices);
+    const uint32_t num_tokens_per_thread = math::ceil_div(num_q_tokens_total, kNumThreads * 2) * 2;
+    const uint32_t token_begin_idx = cute::min(thread_idx * num_tokens_per_thread, num_q_tokens_total);
+    const uint32_t token_end_idx = cute::min(token_begin_idx + num_tokens_per_thread, num_q_tokens_total);
+    const auto scan_request_starts = [&](auto&& on_start) {
+        uint32_t prev_id = token_begin_idx > 0 and token_begin_idx < token_end_idx ? indices[token_begin_idx - 1] : 0u;
+        uint32_t token_idx = token_begin_idx;
+        for (; token_idx + 2 <= token_end_idx; token_idx += 2) {
+            const uint2 ids = indices_vec2[token_idx / 2];
+            if (token_idx == 0 or ids.x != prev_id)
+                on_start(token_idx);
+            if (ids.y != ids.x)
+                on_start(token_idx + 1);
+            prev_id = ids.y;
         }
-        __syncthreads();
-        num_logical_requests = prefix_work[0];
-        __syncthreads();
-    } else {
-        num_logical_requests = num_requests;
-        for (uint32_t r = thread_idx; r < num_logical_requests; r += num_threads)
-            request_q_token_start[r] = r * kNextN;
-        __syncthreads();
-    }
+        if (token_idx < token_end_idx and (token_idx == 0 or indices[token_idx] != prev_id))
+            on_start(token_idx);
+    };
+    uint32_t num_request_starts = 0;
+    scan_request_starts([&](const uint32_t&) { ++ num_request_starts; });
+    uint32_t request_idx = math::cta_exclusive_sum<kNumThreads>(num_request_starts, warp_sums);
+    scan_request_starts([&](const uint32_t& token_idx) { request_q_token_start_idx[request_idx ++] = token_idx; });
+    if (thread_idx == kNumThreads - 1)
+        *num_requests_shared = request_idx;
+    __syncthreads();
+    const uint32_t num_requests = *num_requests_shared;
 
-    // Work per request before prefix sum
-    for (uint32_t r = thread_idx; r < num_logical_requests; r += num_threads) {
-        const auto info = Info::from_q_token(request_q_token_start[r],
-                                             num_q_tokens_total, context_lens, indices);
-        prefix_work[r] = info.num_kv_splits * info.num_q_tokens;
+    const auto get_request_info = [&](const uint32_t& request_idx,
+                                      uint32_t& q_token_start_idx, uint32_t& num_q_tokens, uint32_t& context_len) {
+        q_token_start_idx = request_q_token_start_idx[request_idx];
+        const uint32_t q_token_end_idx = request_idx + 1 < num_requests ?
+                                             request_q_token_start_idx[request_idx + 1] : num_q_tokens_total;
+        num_q_tokens = q_token_end_idx - q_token_start_idx;
+        context_len = context_lens[q_token_end_idx - 1];
+    };
+
+    // KV/MMA cost scales with Q blocks; epilogue cost scales with valid tokens
+    const auto get_split_cost = [&](const uint32_t& num_q_tokens) {
+        return 2 * BLOCK_Q * math::ceil_div(num_q_tokens, BLOCK_Q) + num_q_tokens;
+    };
+
+    // Use the spare request-count bit to flag overflow and fall back to token cost
+    constexpr uint32_t kCostOverflowFlag = 0x80000000u;
+    bool cost_overflow = false;
+    for (uint32_t request_idx = thread_idx; request_idx < num_requests; request_idx += kNumThreads) {
+        uint32_t q_token_start_idx, num_q_tokens, context_len;
+        get_request_info(request_idx, q_token_start_idx, num_q_tokens, context_len);
+        const uint64_t cost = static_cast<uint64_t>(math::ceil_div(context_len, SPLIT_KV)) * get_split_cost(num_q_tokens);
+        request_work_prefix[request_idx] = static_cast<uint32_t>(cost);
+        cost_overflow |= cost > 0xffffffffu;
     }
     __syncthreads();
-
-    // Inclusive prefix sum by one warp
-    if (warp_idx == 0) {
-        uint32_t carry = 0;
-        for (uint32_t base = 0; base < num_logical_requests; base += 32) {
-            const uint32_t r = base + lane_idx;
-            const uint32_t v = (r < num_logical_requests) ? prefix_work[r] : 0u;
-            const uint32_t scanned = math::warp_inclusive_sum(v, lane_idx) + carry;
-            if (r < num_logical_requests)
-                prefix_work[r] = scanned;
-            carry = __shfl_sync(0xffffffff, scanned, 31);
-        }
-    }
+    if (num_requests > 0)
+        mqa_logits_metadata_prefix_scan<kNumThreads>(thread_idx, num_requests, request_work_prefix, warp_sums);
+    for (uint32_t request_idx = thread_idx + 1; request_idx < num_requests; request_idx += kNumThreads)
+        cost_overflow |= request_work_prefix[request_idx] < request_work_prefix[request_idx - 1];
+    if (cost_overflow)
+        atomicOr(num_requests_shared, kCostOverflowFlag);
     __syncthreads();
-
-    const uint32_t num_total_work = num_logical_requests > 0 ? prefix_work[num_logical_requests - 1] : 0u;
-
-    // Each thread emits one SM start; remainder is assigned to earlier SMs
-    const uint32_t q = num_total_work / kNumSMs, rem = num_total_work % kNumSMs;
-    for (uint32_t sm_idx = thread_idx; sm_idx <= kNumSMs; sm_idx += num_threads) {
-        const uint32_t w = sm_idx * q + (sm_idx < rem ? sm_idx : rem);
-        // First request whose prefix_work owns work unit `w`
-        uint32_t lo = 0, hi = num_logical_requests;
-        while (lo < hi) {
-            const uint32_t mid = (lo + hi) / 2;
-            if (prefix_work[mid] <= w) lo = mid + 1; else hi = mid;
+    const bool use_token_cost = (*num_requests_shared & kCostOverflowFlag) != 0;
+    if (use_token_cost) {
+        for (uint32_t request_idx = thread_idx; request_idx < num_requests; request_idx += kNumThreads) {
+            uint32_t q_token_start_idx, num_q_tokens, context_len;
+            get_request_info(request_idx, q_token_start_idx, num_q_tokens, context_len);
+            request_work_prefix[request_idx] = math::ceil_div(context_len, SPLIT_KV) * num_q_tokens;
         }
-        const uint32_t request_idx = lo;
-        uint32_t q_token_idx, kv_split_idx;
-        if (request_idx < num_logical_requests) {
-            const uint32_t work_before = (request_idx == 0) ? 0u : prefix_work[request_idx - 1];
-            const uint32_t w_in_request = w - work_before;
-            const auto info = Info::from_q_token(request_q_token_start[request_idx],
-                                                 num_q_tokens_total, context_lens, indices);
-            // Align SM starts to request/split boundaries
-            q_token_idx = info.q_token_start;
-            kv_split_idx = w_in_request / info.num_q_tokens;
-        } else {
-            // Tail sentinel: one-past-the-end
-            q_token_idx = num_q_tokens_total;
-            kv_split_idx = 0;
+        __syncthreads();
+        mqa_logits_metadata_prefix_scan<kNumThreads>(thread_idx, num_requests, request_work_prefix, warp_sums);
+    }
+    const uint32_t total_cost = num_requests > 0 ? request_work_prefix[num_requests - 1] : 0u;
+
+    // Balance cost across SMs at request split boundaries
+    const uint32_t cost_per_sm = total_cost / kNumSMs;
+    const uint32_t cost_remainder = total_cost % kNumSMs;
+    for (uint32_t sm_idx = thread_idx; sm_idx <= kNumSMs; sm_idx += kNumThreads) {
+        const uint32_t target = sm_idx * cost_per_sm + cute::min(sm_idx, cost_remainder);
+        const uint32_t request_idx = mqa_logits_metadata_upper_bound(request_work_prefix, num_requests, target);
+        uint32_t q_token_idx = num_q_tokens_total, kv_split_idx = 0;    // Tail sentinel: one-past-the-end
+        if (request_idx < num_requests) {
+            const uint32_t cost_before = request_idx == 0 ? 0u : request_work_prefix[request_idx - 1];
+            uint32_t num_q_tokens, context_len;
+            get_request_info(request_idx, q_token_idx, num_q_tokens, context_len);
+            kv_split_idx = (target - cost_before) / (use_token_cost ? num_q_tokens : get_split_cost(num_q_tokens));
         }
-        schedule_meta[sm_idx * 2] = q_token_idx;
-        schedule_meta[sm_idx * 2 + 1] = kv_split_idx;
+        reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = make_uint2(q_token_idx, kv_split_idx);
     }
 }
 
-// Device scheduler walks this SM's schedule range and implements SchedulerConcept
-// All specialized warps instantiate it and advance through the same task sequence
-template <bool kHasIndices> struct SM100IndicesStorage { const uint32_t* indices; };
-template <> struct SM100IndicesStorage<false> {};
-
-template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
-          uint32_t kNumHeads, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
-struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
-    // SchedulerConcept descriptors
+// Visit requests chunk by chunk, reusing each chunk's KV across its Q blocks
+template <uint32_t kNumHeads, uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
+struct SM100PagedMQALogitsScheduler {
     static constexpr bool kIsPaged = true;
-    static constexpr bool kHasPartialBlock = true;
     static constexpr uint32_t kPageKV = PAGE_KV;
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
-    static constexpr uint32_t BLOCK_Q = 128 / kNumHeads;
+    // Cache one page coordinate per lane
+    static constexpr uint32_t kNumCachedPages = 32;
+    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 128, "Invalid Q block shape");
+    DG_STATIC_ASSERT(SPLIT_KV % PAGE_KV == 0 and kNumPagesPerSplit <= kNumCachedPages, "Invalid split shape");
 
-    using Info = RequestInfo<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_Q, SPLIT_KV, PAGE_KV>;
+    using Info = RequestInfo<BLOCK_Q, SPLIT_KV, PAGE_KV>;
 
+    uint32_t num_q_tokens_total;
     const uint32_t* context_lens;
+    const uint32_t* indices;
     const uint32_t* block_table;
     uint32_t block_table_stride;
-    uint32_t num_q_tokens_total;
+    uint32_t end_q_token_idx, end_kv_split_idx;     // The next SM's start
 
-    // Walk state
-    Info cur;                           // current request geometry
-    uint32_t cur_kv_split_base;         // current chunk start (request-internal split)
-    uint32_t cur_q_block_in_request;    // current Q-block within the request
-    uint32_t end_q_token_idx, end_kv_split_idx;
-    bool done;
+    // Request/chunk/Q-block cursor; only current.q_token_start is valid after exhaustion
+    Info current;
+    uint32_t current_kv_split_base;
+    uint32_t current_q_block_in_request;
 
-    // Geometry stashed by `next_q_block` for the accessors below
-    uint32_t cur_block_table_row;       // request's block-table row
-    uint32_t cur_q_block_token_base;    // global first-token row of this Q-block
-    uint32_t cur_num_block_tokens;      // valid tokens in this Q-block
-    uint32_t cur_request_num_kv_pages;  // ceil(context_len / PAGE_KV); bound for last partial split
-
-    CUTLASS_DEVICE const uint32_t* get_indices() const {
-        if constexpr (kIsVarlen)
-            return this->indices;
-        return nullptr;
-    }
+    // Preserve the emitted task's page lookup state as the request cursor advances
+    const uint32_t* task_block_table_row;
+    uint32_t task_num_kv_pages;
+    uint32_t cached_page_base;
+    uint32_t cached_page_coord;
 
     CUTLASS_DEVICE SM100PagedMQALogitsScheduler(const uint32_t& sm_idx,
+                                                const uint32_t& num_q_tokens_total,
                                                 const uint32_t* context_lens,
-                                                const uint32_t* schedule_meta,
                                                 const uint32_t* indices,
                                                 const uint32_t* block_table,
                                                 const uint32_t& block_table_stride,
-                                                const uint32_t& num_q_tokens_total) {
-        this->context_lens = context_lens;
-        this->block_table = block_table;
-        this->block_table_stride = block_table_stride;
-        this->num_q_tokens_total = num_q_tokens_total;
-        if constexpr (kIsVarlen)
-            this->indices = indices;
-
+                                                const uint32_t* schedule_meta):
+            num_q_tokens_total(num_q_tokens_total),
+            context_lens(context_lens), indices(indices),
+            block_table(block_table), block_table_stride(block_table_stride) {
         const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
         const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
         end_q_token_idx = end.x;
         end_kv_split_idx = end.y;
 
-        cur_kv_split_base = start.y;
-        cur_q_block_in_request = 0;
-        done = (start.x >= num_q_tokens_total) or
-               (start.x == end_q_token_idx and start.y >= end_kv_split_idx);
-        if (not done)
-            cur = Info::from_q_token(start.x, num_q_tokens_total, context_lens, get_indices());
-
-        cur_block_table_row = 0;
-        cur_q_block_token_base = 0;
-        cur_num_block_tokens = 1;
-        cur_request_num_kv_pages = 0;
+        current.q_token_start = start.x;
+        current_kv_split_base = start.y;
+        current_q_block_in_request = 0;
+        if (has_work())
+            current = Info::from_q_token(start.x, num_q_tokens_total, context_lens, indices);
     }
 
-    // Exclusive split bound for the current request, clamped at the next SM start
-    CUTLASS_DEVICE uint32_t get_cur_kv_split_upper() const {
-        return (cur.q_token_start == end_q_token_idx) ? end_kv_split_idx : cur.num_kv_splits;
+    // Whether the current chunk is within this SM's assigned range
+    CUTLASS_DEVICE bool has_work() const {
+        return current.q_token_start < num_q_tokens_total and
+               (current.q_token_start != end_q_token_idx or current_kv_split_base < end_kv_split_idx);
     }
 
-    // Emit the next (Q-block, chunk) task and stash its addressing geometry
-    CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_split_base, uint32_t& num_kv_splits) {
-        q_block_idx = 0;  // addressing uses stashed state
-        if (done)
+    // Emit the next Q-block task
+    CUTLASS_DEVICE bool next_q_block(MQALogitsTask& task) {
+        if (not has_work())
             return false;
 
-        // Capture emitted task geometry before advancing state
-        const uint32_t upper = get_cur_kv_split_upper();
-        cur_block_table_row = cur.get_block_table_row();
-        uint32_t q_block_token_offset, q_block_num_tokens;
-        cur.get_q_block_span(cur_q_block_in_request, q_block_token_offset, q_block_num_tokens);
-        cur_q_block_token_base = cur.q_token_start + q_block_token_offset;
-        cur_num_block_tokens = q_block_num_tokens;
-        cur_request_num_kv_pages = cur.num_kv_pages;
-        kv_split_base = cur_kv_split_base;
-        const uint32_t remaining = upper - cur_kv_split_base;   // upper > cur_kv_split_base (guarded by `done`)
-        num_kv_splits = (cur.num_q_blocks == 1) ? remaining
-                                               : (remaining < kSplitsPerChunk ? remaining : kSplitsPerChunk);
+        // Exclusive split bound of the current request, clamped at the next SM's start
+        const uint32_t upper = (current.q_token_start == end_q_token_idx) ? end_kv_split_idx : current.num_kv_splits;
+        const uint32_t remaining = upper - current_kv_split_base;
+        uint32_t q_block_token_offset;
+        current.get_q_block_span(current_q_block_in_request, q_block_token_offset, task.num_q_tokens);
+        task.q_token_base = current.q_token_start + q_block_token_offset;
+        task.kv_token_base = current_kv_split_base * SPLIT_KV;
+        task.num_kv_splits = (current.num_q_blocks == 1) ? remaining : cute::min(remaining, kSplitsPerChunk);
+        task.kv_shared_with_prev = current_q_block_in_request > 0;
+        task_block_table_row = block_table + current.q_token_start * static_cast<uint64_t>(block_table_stride);
+        task_num_kv_pages = current.num_kv_pages;
+        cached_page_base = cute::numeric_limits<uint32_t>::max();
 
         // Advance in Q-block, chunk, request order
-        ++ cur_q_block_in_request;
-        if (cur_q_block_in_request == cur.num_q_blocks) {
-            cur_q_block_in_request = 0;
-            cur_kv_split_base += num_kv_splits;
-            if (cur_kv_split_base >= upper) {
-                if (cur.q_token_start == end_q_token_idx) {
-                    // Reached the next SM's start
-                    done = true;
-                } else {
-                    // Move to next request owned from split 0
-                    const uint32_t next_q_token = cur.q_token_start + cur.num_q_tokens;
-                    cur_kv_split_base = 0;
-                    if (next_q_token >= num_q_tokens_total)
-                        done = true;
-                    else {
-                        cur = Info::from_q_token(next_q_token, num_q_tokens_total, context_lens, get_indices());
-                        // The new request may already be this SM's end
-                        if (cur.q_token_start == end_q_token_idx and end_kv_split_idx == 0)
-                            done = true;
-                    }
-                }
+        if (++ current_q_block_in_request == current.num_q_blocks) {
+            current_q_block_in_request = 0;
+            current_kv_split_base += task.num_kv_splits;
+            if (current_kv_split_base >= upper and current.q_token_start != end_q_token_idx) {
+                // Start the next request at split 0; the final request stops at the SM boundary
+                current.q_token_start += current.num_q_tokens;
+                current_kv_split_base = 0;
+                if (has_work())
+                    current = Info::from_q_token(current.q_token_start, num_q_tokens_total, context_lens, indices);
             }
         }
         return true;
     }
 
-    CUTLASS_DEVICE uint32_t get_num_block_tokens(const uint32_t&) const {
-        return cur_num_block_tokens;
+    // Also return per-token KV bounds [0, context_len)
+    CUTLASS_DEVICE bool next_q_block(MQALogitsTask& task, uint32_t* seq_k_start, uint32_t* seq_k_end) {
+        if (not next_q_block(task))
+            return false;
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        const auto row_idx = cute::min(task.q_token_base + lane_idx, num_q_tokens_total - 1);
+        const uint32_t lane_k_end = lane_idx < BLOCK_Q ? context_lens[row_idx] : 0;
+        #pragma unroll
+        for (uint32_t token_idx = 0; token_idx < BLOCK_Q; ++ token_idx) {
+            seq_k_start[token_idx] = 0;
+            seq_k_end[token_idx] = ptx::exchange(lane_k_end, token_idx);
+        }
+        return true;
     }
 
-    CUTLASS_DEVICE uint32_t get_q_tma_token_base(const uint32_t&) const {
-        return cur_q_block_token_base;
-    }
-
-    CUTLASS_DEVICE static uint32_t get_kv_tma_offset(const uint32_t& kv_split_base, const uint32_t& kv_split_idx) {
-        return (kv_split_base + kv_split_idx) * SPLIT_KV;
-    }
-
-    CUTLASS_DEVICE uint32_t get_kv_page_coord_by_page_offset(const uint32_t& page_offset) const {
-        if (page_offset >= cur_request_num_kv_pages)
-            return 0;
-        const auto block_table_offset = cur_block_table_row * static_cast<uint64_t>(block_table_stride);
-        return block_table[block_table_offset + page_offset];
-    }
-
-    CUTLASS_DEVICE uint32_t get_logits_row(const uint32_t&, const uint32_t& token_idx) const {
-        return cur_q_block_token_base + token_idx;
-    }
-
-    CUTLASS_DEVICE uint32_t get_logits_col(const uint32_t& kv_split_base,
-                                           const uint32_t& kv_split_idx,
-                                           const uint32_t& math_thread_idx) const {
-        return (kv_split_base + kv_split_idx) * SPLIT_KV + math_thread_idx;
+    // Warp-wide page lookup with a sliding cache; out-of-range pages map to zero
+    CUTLASS_DEVICE void get_kv_page_coords(const MQALogitsTask& task, const uint32_t& kv_split_idx,
+                                           int (&page_coords)[kNumPagesPerSplit]) {
+        const uint32_t page_base = task.kv_token_base / PAGE_KV + kv_split_idx * kNumPagesPerSplit;
+        if (page_base < cached_page_base or page_base + kNumPagesPerSplit > cached_page_base + kNumCachedPages) {
+            const uint32_t page_offset = page_base + ptx::get_lane_idx();
+            cached_page_base = page_base;
+            cached_page_coord = page_offset < task_num_kv_pages ? task_block_table_row[page_offset] : 0;
+        }
+        #pragma unroll
+        for (uint32_t page_idx = 0; page_idx < kNumPagesPerSplit; ++ page_idx)
+            page_coords[page_idx] = ptx::exchange(cached_page_coord, page_base - cached_page_base + page_idx);
     }
 };
 
