@@ -1,12 +1,12 @@
 #pragma once
 
-#include "../../runtime/runtime.hpp"
+#include "../../../runtime/runtime.hpp"
 
-#include "../../utils/exception.hpp"
-#include "../../runtime/launch.hpp"
-#include "runtime_utils.hpp"
+#include "../../../utils/exception.hpp"
+#include "../../../runtime/launch.hpp"
+#include "../runtime_utils.hpp"
 
-namespace deep_gemm {
+namespace deep_gemm::legacy {
 
 class SMXXCleanLogitsRuntime final {
 public:
@@ -29,9 +29,9 @@ public:
 
     static std::string generate(const Args& args) {
         return std::format(R"(
-#include <deep_gemm/impls/smxx_clean_logits.cuh>
+#include <deep_gemm/legacy/impls/smxx_clean_logits.cuh>
 
-using namespace deep_gemm;
+using namespace deep_gemm::legacy;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_clean_logits<
@@ -75,8 +75,8 @@ static void smxx_clean_logits(const torch::Tensor& logits,
                                   num_warps * 32, smem_size)
     };
     const auto code = SMXXCleanLogitsRuntime::generate(args);
-    const auto kernel = jit->compile("smxx_clean_logits", code);
+    const auto kernel = jit->compile("legacy_smxx_clean_logits", code);
     SMXXCleanLogitsRuntime::launch(kernel, args);
 }
 
-} // namespace deep_gemm
+} // namespace deep_gemm::legacy

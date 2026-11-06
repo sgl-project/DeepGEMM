@@ -6,7 +6,7 @@
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 
-namespace deep_gemm {
+namespace deep_gemm::legacy {
 
 template <uint32_t kNextN, uint32_t BLOCK_KV, uint32_t kNumWarps, typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumWarps * 32, 1)

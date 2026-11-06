@@ -69,6 +69,7 @@ void sm120_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t n
         prefix_sum[k * 32 + lane_idx] = x;
         sum = __shfl_sync(0xffffffff, x, 31);
     }
+    __syncwarp();
 
     // SM work distribution
     if constexpr (kIsVarlen) {
@@ -96,10 +97,20 @@ void sm120_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t n
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
         }
     } else {
-        // num_next_n_atoms is host-passed (NV PR #314): SM90 multicast wants 1 while
-        // SM100 next_n=4 wants 2; computing it inline (`next_n / 2`) over-schedules by
-        // 2x on SM90 and triggers IMA when the SM90 scheduler steps past context_lens.
+        // The host passes the exact atom count used by the SM120 device kernel;
+        // keeping metadata and device atomization identical avoids stepping past
+        // context_lens when next_n changes.
         const uint32_t total = sum * num_next_n_atoms;
+        if (total == 0) {
+            // Emit only one-past-the-end sentinels. Besides avoiding the
+            // prefix_sum[batch_size] OOB, this prevents a final SM from
+            // executing a synthetic zero-KV task.
+            for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
+                schedule_metadata[sm_idx * 2] = batch_size * num_next_n_atoms;
+                schedule_metadata[sm_idx * 2 + 1] = 0;
+            }
+            return;
+        }
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
         const uint32_t pivot = kNumSMs - r;
         for (uint32_t sm_idx = lane_idx; sm_idx < kNumSMs; sm_idx += 32) {
@@ -111,6 +122,9 @@ void sm120_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t n
                 lo = pred ? mid + 1 : lo;
                 hi = pred ? hi : mid;
             }
+            // lo == batch_size when every context length is zero. Clamp before
+            // reading prefix_sum[q_idx]; the scheduler constructor separately
+            // guards empty ranges, so these entries produce no device work.
             const uint32_t q_idx = min(lo, batch_size - 1);
             const uint32_t offset_in_q = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1] * num_next_n_atoms);
             const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : prefix_sum[q_idx] - prefix_sum[q_idx - 1]);
@@ -195,8 +209,8 @@ struct SM120PagedMQALogitsScheduler : SM120IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE explicit SM120PagedMQALogitsScheduler(const uint32_t& sm_idx, const uint32_t& batch_size,
-                                                    const uint32_t* context_lens,
-                                                    const uint32_t* schedule_meta, const uint32_t* indices) {
+                                                        const uint32_t* context_lens,
+                                                        const uint32_t* schedule_meta, const uint32_t* indices) {
         this->context_lens = context_lens;
         this->batch_size = batch_size;
         if constexpr (kIsVarlen) {
@@ -208,8 +222,14 @@ struct SM120PagedMQALogitsScheduler : SM120IndicesStorage<kIsVarlen> {
         current_q_atom_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
-        // NOTES: unconditional call is safe — reversed metadata allocation ensures `current_q_atom_idx` is always in-bounds.
-        refresh_num_kv_and_advance(current_q_atom_idx);
+        // Empty metadata ranges may carry the one-past-the-end sentinel (notably
+        // all-zero varlen context lengths). Do not dereference context_lens or
+        // indices until this SM actually owns a task.
+        current_advance = 1;
+        current_num_kv = 0;
+        last_advance = 1;
+        if (exist_q_atom_idx(current_q_atom_idx))
+            refresh_num_kv_and_advance(current_q_atom_idx);
     }
 
     // Whether num_kv should be refreshed after advancing to q_atom_idx.
@@ -224,6 +244,17 @@ struct SM120PagedMQALogitsScheduler : SM120IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE bool fetch_next_task(uint32_t &q_atom_idx, uint32_t &kv_idx, uint32_t &num_kv) {
+        // A zero-context request has no KV task. Metadata naturally assigns it
+        // zero work, but traversal can still cross it between two non-empty
+        // requests; skip all of its atoms before exposing a task to the kernel.
+        while (current_num_kv == 0 and
+               not (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)) {
+            current_kv_idx = 0;
+            current_q_atom_idx += current_advance;
+            if (should_refresh_num_kv(current_q_atom_idx) and exist_q_atom_idx(current_q_atom_idx))
+                refresh_num_kv_and_advance(current_q_atom_idx);
+        }
+
         q_atom_idx = current_q_atom_idx;
         kv_idx = current_kv_idx;
         num_kv = current_num_kv;

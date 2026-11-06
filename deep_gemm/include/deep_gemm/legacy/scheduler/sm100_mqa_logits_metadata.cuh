@@ -5,13 +5,13 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/sm100_mqa_logits.cuh>
+#include <deep_gemm/legacy/scheduler/sm100_mqa_logits.cuh>
 
 // SM100 scheduler for contiguous-KV logits emits per-SM start point (q_block, split_offset) and work counts
 // Each Q block priced as kMQALogitsSplitCost * num_kv_splits + kMQALogitsSegmentCost
 // both constants are 1 for now
 
-namespace deep_gemm::sched {
+namespace deep_gemm::legacy::sched {
 
 inline constexpr uint32_t kNumLogitsMetadataThreads = 256;
 inline constexpr uint32_t kNumLogitsMetadataWarps = kNumLogitsMetadataThreads / 32;
@@ -118,4 +118,4 @@ void sm100_mqa_logits_metadata(const uint32_t num_q_tokens,
     schedule_meta[2 * kNumSMs + thread_idx] = end.coordinate - begin.coordinate;
 }
 
-} // namespace deep_gemm::sched
+} // namespace deep_gemm::legacy::sched

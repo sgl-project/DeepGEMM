@@ -92,18 +92,27 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
+            // SM90 traps after the wait loop: with a `trap;` inside the loop body ptxas allocates the registers of the region
+            // containing the loop against the kernel's launch bound and ignores that region's `setmaxnreg.inc`
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
+      !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT))
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
-        !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
-                    DG_TRAP_ONLY_DEVICE_ASSERT(false);
-#else
                     printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
-#endif
                 }
             }
+#else
+            bool timed_out = false;
+            while (ptx::ld_acq_sys(signal_ptr) != target) {
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    timed_out = true;
+                    break;
+                }
+            }
+            DG_TRAP_ONLY_DEVICE_ASSERT(not timed_out);
+#endif
         }
     }
 

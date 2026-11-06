@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdint>
 #include <format>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -13,6 +16,7 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/utils/env.hpp>
 
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
 #include "sm100.hpp"
@@ -23,7 +27,7 @@ struct MegaMoEConfig {
     // Block tiling
     int block_m, block_n, block_k;
     int load_block_m, load_block_n;
-    int store_block_m;
+    int store_block_m_l1, store_block_m_l2;
 
     // SF block sizes (UTCCP 128-aligned)
     int sf_block_m, sf_block_n;
@@ -46,11 +50,14 @@ struct MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
+    // SM107 K=64 `kind::mxf8f6f4` MMAs on packed FP4 weights, and the SIMT dispatch pull
+    bool use_sm107_k64, use_simt_pull;
+
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
            << ", load_block_m=" << config.load_block_m << ", load_block_n=" << config.load_block_n
-           << ", store_block_m=" << config.store_block_m
+           << ", store_block_m_l1=" << config.store_block_m_l1 << ", store_block_m_l2=" << config.store_block_m_l2
            << ", sf_block_m=" << config.sf_block_m << ", sf_block_n=" << config.sf_block_n
            << ", gran_k=" << config.gran_k
            << ", num_ring_tokens=" << config.num_ring_tokens
@@ -60,10 +67,36 @@ struct MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull
+           << ", use_sm107_k64=" << config.use_sm107_k64 << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
     }
 };
+
+// NOTES: oversized shared memory shrinks L1 to 8 KiB, which cannot hold the SIMT dispatch pull's in-flight remote
+// loads (5 KB per dispatch warp at hidden 5120): the SIMT pull keeps the normal budget
+static int get_smem_capacity_for_mega_moe(const int& block_m, const bool& use_simt_pull) {
+#if CUDA_VERSION >= 13040
+    if (SM107ArchSpec::is_current() and block_m != 240 and not use_simt_pull)
+        return SM107ArchSpec::oversized_smem_capacity;
+#endif
+    return SM100ArchSpec::smem_capacity;
+}
+
+static std::optional<int> get_smem_mode_for_mega_moe(const int& smem_size) {
+#if CUDA_VERSION >= 13040
+    if (smem_size > SM100ArchSpec::smem_capacity)
+        return CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+#endif
+    return std::nullopt;
+}
+
+// Locality domains are read per physical SM, so a grid smaller than the GPU stays correct
+static int get_num_sms_for_mega_moe() {
+    const auto num_sms = runtime->get_num_sms();
+    DG_HOST_ASSERT(num_sms > 0 and num_sms % 2 == 0 and num_sms <= jit->device.get_num_sms());
+    return num_sms;
+}
 
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
@@ -108,19 +141,30 @@ static bool is_nvfp4_mma_kind(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::NVFP4;
 }
 
-static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const std::optional<int64_t>& global_num_tokens) {
+    // Experts receive tokens from every rank, so an idle or lightly loaded rank still computes remote load.
+    // Without a caller hint, assume all ranks match the local count.
+    DG_HOST_ASSERT(not global_num_tokens.has_value() or
+                   (*global_num_tokens >= 0 and
+                    *global_num_tokens <= static_cast<int64_t>(num_max_tokens_per_rank) * num_ranks));
+    const float num_total_tokens = global_num_tokens.has_value() ?
+        static_cast<float>(*global_num_tokens) : static_cast<float>(num_tokens) * num_ranks;
+
     // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
-    const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+    const float num_expected_tokens = num_total_tokens * num_topk / num_experts;
     const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
-    int block_m = num_expected_tokens <= 10 ? 16 : 32;
+    // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
+    // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
+    int block_m = num_expected_tokens <= 2 ? 16 : 64;
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
@@ -131,8 +175,26 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
                 break;
         }
     }
-    const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
-    const int block_k = 128 * 8 / get_element_bits(mma_kind);
+
+    // Must divide `WG_BLOCK_M` (= block_m / 2), which pins each arm: 240 -> 120 and
+    // 128 -> 64 cannot take 48, 192 -> 96 can and halves its store iterations.
+    // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
+    int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 128 ? 32 : block_m <= 192 ? 48 :
+                           mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
+    int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
+    int block_k = 128 * 8 / get_element_bits(mma_kind);
+    int cluster_size = 2, num_epilogue_warpgroups = 2;
+
+    // Offline tuning hook: "cluster,block_m,store_block_m,block_k,epilogue_warpgroups",
+    // `block_k` in the pre-scaling 8-bit units above; `store_block_m` sets both L1 and L2.
+    if (const auto override_str = deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES"); not override_str.empty()) {
+        int v[5];
+        const int n = std::sscanf(override_str.c_str(), "%d,%d,%d,%d,%d",
+                                  v + 0, v + 1, v + 2, v + 3, v + 4);
+        DG_HOST_ASSERT(n == 5 and "DG_MEGA_MOE_TILES needs 5 comma-separated ints");
+        cluster_size = v[0], block_m = v[1], store_block_m_l1 = store_block_m_l2 = v[2];
+        block_k = v[3] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[4];
+    }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -140,18 +202,18 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         [=](const auto& candidate) { return candidate == block_m; })
     );
 
-    // Return configs: 2-CTA clusters and 2 epilogue warpgroups
-    return {2, block_m, store_block_m, block_k, 2 * 128};
+    return {cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_warpgroups * 128};
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
-    const int& num_bytes_per_pull, const int& store_block_m,
+    const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& use_sm107_k64 = false, const bool& use_simt_pull = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -163,15 +225,16 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Dispatch region
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = align(
+    // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
+    const int smem_send_buffers_size = align(use_simt_pull ? 16 * num_dispatch_warps :
         static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m * (block_n / 2) * kNumTMAStoreStages * elem_bits / 8;
-    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m_l1 * (block_n / 2) * kNumTMAStoreStages * elem_bits / 8;
+    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m_l2 * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
     // Schedule task payloads
@@ -184,10 +247,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
-        store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
+        store_block_m_l1 * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
 
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
+
+    const int smem_sf_inv_lut = mma_kind == MmaKind::NVFP4 ?
+        256 * static_cast<int>(sizeof(float)) : 0;
 
     // SF is aligned to UTCCP 128-element granularity
     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
@@ -195,9 +261,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
     // NOTES: for `MXFP8FP4` the FP4 weights are unpacked into 8-bit containers in smem,
-    // so A and B always share the same per-element footprint
+    // so A and B always share the same per-element footprint, except with SM107's K=64 MMA, which reads them packed
     const int smem_a_size_per_stage = load_block_m * block_k * elem_bits / 8;
-    const int smem_b_size_per_stage = block_n * block_k * elem_bits / 8;
+    const int smem_b_size_per_stage = block_n * block_k * (use_sm107_k64 ? 4 : elem_bits) / 8;
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
@@ -205,7 +271,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
-        smem_task_info + smem_tmem_ptr;
+        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
@@ -220,11 +286,14 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const std::optional<int64_t>& global_num_tokens,
+    const bool& fp4_weights = false) {
 
     // Block config
-    const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+    const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
+                                      mma_kind, global_num_tokens);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
@@ -243,37 +312,52 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Pull: divide token bytes by 2 until <= num_max_pull_bytes
     const int num_max_pull_bytes = is_mma_with_sf(mma_kind) ? 8192 : 4096;
-    int num_bytes_per_pull = hidden * get_element_bits(mma_kind) / 8;
+    const int num_token_bytes = hidden * get_element_bits(mma_kind) / 8;
+    int num_bytes_per_pull = num_token_bytes;
     while (num_bytes_per_pull > num_max_pull_bytes) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }
 
+    // SM107 (CC 10.7) has a K=64 `kind::mxf8f6f4` MMA, which reads FP4 operands packed: FP8 x FP4 then loads its
+    // routed weights packed and splits the FP8 shared expert's K blocks. `DG_MEGA_MOE_SM107_K64=0` disables it
+    const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
+        SM107ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
+    // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
+    // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on CC 10.7 only with packed FP4
+    // weight stages: FP4 activations, or FP8 x FP4 with the K=64 MMA. `DG_MEGA_MOE_SIMT_PULL=0/1` forces it
+    const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
+    const bool packed_weight_stages = use_sm107_k64 or mma_kind != MmaKind::MXFP8FP4;
+    const bool use_simt_pull = is_mma_with_sf(mma_kind) and num_token_bytes % 512 == 0 and
+        (simt_pull_env >= 0 ? simt_pull_env != 0 : SM107ArchSpec::is_current() and packed_weight_stages);
+
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
-        SM100ArchSpec::smem_capacity,
+        get_smem_capacity_for_mega_moe(block_m, use_simt_pull),
         num_experts, hidden,
-        block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
+        block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, use_sm107_k64, use_simt_pull);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
-        load_block_m, load_block_n, store_block_m,
+        load_block_m, load_block_n, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_ring_tokens, is_mma_with_sf(mma_kind) ? num_sf_ring_tokens : 0,
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull
+        num_bytes_per_pull,
+        use_sm107_k64, use_simt_pull
     };
 
     // Print configs for the first time
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = std::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, global_num_tokens={}, num_topk={}, mma_kind={}, use_simt_pull={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens,
+            global_num_tokens.value_or(-1), num_topk, static_cast<int>(mma_kind), config.use_simt_pull);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

@@ -20,7 +20,6 @@ public:
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
         deep_jit::cuda::LaunchOptions launch_args;
-        const std::optional<std::string> epilogue_type;
 
         void* gmem_d;
         void* gmem_c;
@@ -56,7 +55,6 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -73,7 +71,6 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
-        get_default_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
         k_n_warps);
     }
@@ -135,7 +132,6 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -206,7 +202,6 @@ static void sm120_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -268,7 +263,6 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -364,7 +358,6 @@ static void sm120_bf16_k_grouped_gemm(const torch::Tensor& a,
         .gemm_config = config,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size, 1),
-        .epilogue_type = std::nullopt,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a_km.data_ptr(),
@@ -417,7 +410,6 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -475,7 +467,6 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .launch_args = make_launch_options(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   1),
-        .epilogue_type = std::nullopt,
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,

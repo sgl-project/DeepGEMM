@@ -310,11 +310,11 @@ Sources: `csrc/apis/attention.hpp` (host checks), `tests/test_attention.py` (SF 
 
 ```python
 deep_gemm.fp8_fp4_mqa_logits(
-    q,                       # (q_fp, q_sf or None): q_fp [seq_len, num_heads, head_dim]
+    q,                       # (q_fp, q_sf): q_fp [seq_len, num_heads, head_dim]
     kv,                      # (kv_fp, kv_sf):       kv_fp [seq_len_kv, head_dim]
-    weights,                 # [seq_len, num_heads]; float32, or bf16 (SM100, forces bf16 logits)
+    weights,                 # [seq_len, num_heads]; bf16 on SM100, float32 on SM90 and SM120
     cu_seq_len_k_start, cu_seq_len_k_end,
-    clean_logits=True, max_seqlen_k=0, logits_dtype=torch.float32,
+    max_seqlen_k=max_seqlen_k,
 )
 ```
 
@@ -322,16 +322,18 @@ deep_gemm.fp8_fp4_mqa_logits(
 
 | Mode | `q_sf` | `kv_sf` | Q/KV data dtype | Arch |
 |---|---|---|---|---|
-| MX (`q_sf` provided) | `int32` packed UE8M0, contiguous | `int32` packed UE8M0, contiguous | FP8 (MXFP8) or packed FP4 (MXFP4) | SM100 only |
-| non-MX (`q_sf=None`) | — | `float32` (one plain scale per token), contiguous | FP8 only | SM90 / SM100 |
+| MX (`q_sf` provided) | `int32` packed UE8M0, contiguous | `int32` packed UE8M0, contiguous | FP8 (MXFP8) or packed FP4 (MXFP4) on SM100; packed FP4 (MXFP4) only on SM120 | SM100, SM120 |
+| non-MX (`q_sf=None`) | — | `float32` (one plain scale per token), contiguous | FP8 only | SM90, SM120 |
 
 Additional rules:
 
 - **FP4 Q/KV data requires MX mode** — `q_sf` must be provided (attention.hpp:92).
 - SF shapes: `q_sf` is `[seq_len, num_heads]` (non-paged) or `[batch_size, next_n, num_heads]` (paged); `kv_sf` is 1-D `[seq_len_kv]`. Both contiguous.
 - MX SF granularity is per-32-element blocks along `head_dim` — with `head_dim <= 128` all (up to 4) UE8M0 exponents of one token/head fit in exactly **one `int32`**, hence the shapes above have no trailing K dimension.
-- The legacy aliases `fp8_mqa_logits` / `fp8_paged_mqa_logits` hardwire `q_sf=None`, i.e., always the non-MX `float32` mode.
-- Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]` — per token, the value bytes (`head_dim` for FP8, `head_dim/2` for FP4) are followed by 4 SF bytes interpreted as `int32` (MX) or `float32` (non-MX) (attention.hpp:266-285).
+- The non-paged API returns compressed logits and requires a positive `max_seqlen_k`. Neither API cleans entries beyond each row's valid KV span; callers must mask them.
+- Weights and logits are BF16 on SM100 and FP32 on SM90 and SM120; the output dtype is fixed by the architecture.
+- SM120 takes 16, 32 or 64 heads (FP4 with `head_dim` 128), paged pages of 32, 64, 128 or 256 tokens, and paged requests either varlen or with a fixed `next_n`; consecutive varlen rows are paired and must share a block-table row, and varlen metadata fits about 8K query tokens. It has no dense `schedule_meta`.
+- Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]`, laid out per page: the value bytes of all `block_kv` tokens (`head_dim` each for FP8, `head_dim/2` for FP4) come first, followed by the page's `block_kv` 4-byte SFs, interpreted as `int32` (MX) or `float32` (non-MX). The page stride (`stride(0)`) may exceed the page size (attention.hpp:226-250).
 
 ```python
 from deep_gemm.utils import per_token_cast_to_fp8, per_custom_dims_cast_to_fp8
@@ -342,14 +344,16 @@ kv_fp8, kv_sf = per_token_cast_to_fp8(kv, use_ue8m0=True, gran_k=32, use_packed_
 logits = deep_gemm.fp8_fp4_mqa_logits(
     q=(q_fp8_2d.view(seq_len, num_heads, head_dim), q_sf.view(seq_len, num_heads)),  # int32
     kv=(kv_fp8, kv_sf.view(seq_len_kv)),                                             # int32
-    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke)
+    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+    max_seqlen_k=int((ke - ks).max().item()))
 
 # non-MX mode: q_sf=None forces kv_sf to be plain float32 per-token
 kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv, (0,), False)   # kv_sf: [seq_len_kv], float32
 logits = deep_gemm.fp8_fp4_mqa_logits(
     q=(q.to(torch.float8_e4m3fn), None),
     kv=(kv_fp8, kv_sf),
-    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke)
+    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+    max_seqlen_k=int((ke - ks).max().item()))
 ```
 
 ### 6.2 `fp8_einsum`: SFs Are Permuted Internally

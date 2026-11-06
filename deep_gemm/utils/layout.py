@@ -1,6 +1,6 @@
 """Layout utility wrappers.
 
-These functions call into the tvm-ffi _C module for CUDA kernel execution
+These functions call into the TORCH_LIBRARY _C ops for CUDA kernel execution
 and handle output tensor allocation on the Python side.
 """
 from __future__ import annotations
@@ -14,10 +14,6 @@ from .math import align, ceil_div
 def _get_C():
     from .. import _C
     return _C
-
-
-def _as_torch_tensor(value):
-    return value if isinstance(value, torch.Tensor) else torch.from_dlpack(value)
 
 
 def get_tma_aligned_size(mn: int, element_size: int) -> int:
@@ -62,11 +58,11 @@ try:
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
         """Transpose FP32 scaling factors into MN-major TMA-aligned layout."""
-        return _as_torch_tensor(_get_C().get_mn_major_tma_aligned_tensor(sf))
+        return _get_C().get_mn_major_tma_aligned_tensor(sf)
 
     def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf: torch.Tensor, psum_layout: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Pack FP32 scaling factors into UE8M0 int32 in MN-major TMA-aligned layout."""
-        return _as_torch_tensor(_get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf, psum_layout))
+        return _get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf, psum_layout)
 
     def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
             sf: torch.Tensor,
@@ -79,8 +75,8 @@ try:
         """Pack grouped SF, preserving compact group offsets unless padded layout is requested."""
         if k_alignment is None:
             k_alignment = get_mk_alignment_for_contiguous_layout()
-        return _as_torch_tensor(_get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf, grouped_layout, ks, gran_k, k_alignment, use_psum_layout, use_padded_sf_layout))
+        return _get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+            sf, grouped_layout, ks, gran_k, k_alignment, use_psum_layout, use_padded_sf_layout)
 
 except AttributeError:
     pass

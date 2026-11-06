@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <regex>
 #include <string>
 
 #include <cutlass/version.h>
@@ -10,6 +11,15 @@
 namespace deep_gemm {
 
 inline deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>> jit(nullptr);
+
+inline bool nvcc_at_least(const std::string& version, const int major, const int minor) {
+    std::smatch match;
+    if (not std::regex_search(version, match, std::regex(R"(release (\d+)\.(\d+))")))
+        return false;
+    const int found_major = std::stoi(match[1].str());
+    const int found_minor = std::stoi(match[2].str());
+    return found_major > major or (found_major == major and found_minor >= minor);
+}
 
 inline void init_jit(const std::string& library_root_path) {
     const auto library_root = std::filesystem::absolute(library_root_path);
@@ -31,7 +41,9 @@ inline void init_jit(const std::string& library_root_path) {
         // DeepJIT requires CUDA 12.9+, where the family suffix is available.
         const auto major = runtime->device.get_arch_major();
         const auto minor = runtime->device.get_arch_minor();
-        if (major == 10 and minor != 1)
+        if (major == 10 and minor == 7 and nvcc_at_least(runtime->backend.compiler_info.version, 13, 4))
+            runtime->default_compiler_options.arch = "107a";
+        else if (major == 10 and minor != 1)
             runtime->default_compiler_options.arch = "100f";
         if (major == 12) {
             runtime->default_compiler_options.arch = "120f";

@@ -18,9 +18,7 @@ classifiers = [
 ]
 dynamic = ["version"]
 
-dependencies = [
-    "apache-tvm-ffi==0.1.11",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [

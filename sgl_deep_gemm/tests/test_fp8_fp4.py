@@ -1,4 +1,9 @@
+import os
 import random
+import re
+import sys
+import tempfile
+
 import torch
 
 import deep_gemm
@@ -10,7 +15,8 @@ from deep_gemm.testing import (
     get_arch_major
 )
 from utils import (
-    assert_direct_output_matches_fp32_accumulation,
+    add_sf_k_padding, assert_direct_output_matches_fp32_accumulation,
+    assert_stochastic_bf16_matches_fp32_accumulation,
     assert_psum_zero_padding, convert_to_fp8, make_cublas_gemm,
 )
 
@@ -25,6 +31,7 @@ from generators import (
 def test_gemm() -> None:
     print('Testing GEMM:')
     use_alpha_options = (False, True) if get_arch_major() == 10 else (False,)
+    test_sf_k_padding = get_arch_major() == 10
     for kernel_type, quant_config, m, n, k, major_a, major_b, accumulate, out_dtype, scores in \
             enumerate_normal(torch.float8_e4m3fn, collect_cublas_scores=True):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -55,6 +62,17 @@ def test_gemm() -> None:
                                                         f'{diff:.5f}, alias={test_alias}')
 
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
+        if get_arch_major() == 10 and not accumulate and out_dtype == torch.bfloat16:
+            d_sr = torch.empty_like(d)
+            deep_gemm.fp8_fp4_gemm_nt(a, b, d_sr, disable_ue8m0_cast=disable_ue8m0_cast,
+                                      recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+                                      epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+            assert_stochastic_bf16_matches_fp32_accumulation(
+                d_sr,
+                lambda output, accumulator: deep_gemm.fp8_fp4_gemm_nt(
+                    a, b, output, c=accumulator, disable_ue8m0_cast=disable_ue8m0_cast,
+                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
+                f'FP8/FP4 GEMM stochastic rounding, {m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}')
         initial_d = d.clone()
         def test_func(a_=a, b_=b, d_=d):
             deep_gemm.fp8_fp4_gemm_nt(a_, b_, d_, c=d_ if accumulate else None,
@@ -67,6 +85,18 @@ def test_gemm() -> None:
             d.copy_(initial_d)
             test_func()
             assert torch.equal(d, equivalent_d), f'{m=}, {n=}, {k=}, {accumulate=}'
+        if test_sf_k_padding and use_ue8m0 and not accumulate:
+            packed_a = deep_gemm.transform_sf_into_required_layout(a[1], m, k, (1, quant_config.gran_k_a))
+            gran_mn_b = 1 if quant_config.is_fp4_b else quant_config.gran_k_b
+            packed_b = deep_gemm.transform_sf_into_required_layout(b[1], n, k, (gran_mn_b, quant_config.gran_k_b))
+            strided_a = a[0], add_sf_k_padding(packed_a, padding=4)
+            strided_b = b[0], add_sf_k_padding(packed_b, padding=4)
+            strided_d = initial_d.clone()
+            deep_gemm.fp8_fp4_gemm_nt(
+                strided_a, strided_b, strided_d,
+                recipe_a=(1, quant_config.gran_k_a), recipe_b=(1, quant_config.gran_k_b))
+            assert_bitwise_equal(strided_d, equivalent_d, 'packed SF K-stride')
+            test_sf_k_padding = False
         if quant_config.is_fp4_a or quant_config.is_fp4_b:
             equivalent_fp8_d = initial_d.clone()
             test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
@@ -222,6 +252,7 @@ def test_k_grouped_gemm_contiguous() -> None:
         return
 
     arch_major = get_arch_major()
+    test_sf_k_padding = arch_major == 10
     test_options = [(torch.float8_e4m3fn, QuantConfig(),
                      deep_gemm.k_grouped_fp8_gemm_nt_contiguous if arch_major == 9 else
                      deep_gemm.k_grouped_fp8_gemm_tn_contiguous)]
@@ -280,12 +311,15 @@ def test_k_grouped_gemm_contiguous() -> None:
                             case_label = (f'{dtype_opt} K-grouped direct output, {m=}, {n=}, {total_k=}, '
                                           f'{test_real_ks_cpu=}, {test_host_ks_cpu=}, {use_psum_layout=}, '
                                           f'{out_dtype=}')
-                            assert_direct_output_matches_fp32_accumulation(
-                                d,
-                                lambda output, accumulator: gemm(
-                                    a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
-                                    recipe=recipe, use_psum_layout=use_psum_layout),
-                                case_label)
+                            launch = lambda output, accumulator: gemm(
+                                a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
+                                recipe=recipe, use_psum_layout=use_psum_layout)
+                            assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
+                            if out_dtype == torch.bfloat16:
+                                gemm(a, b, d, test_host_ks_cpu, grouped_layout, None,
+                                     recipe=recipe, use_psum_layout=use_psum_layout,
+                                     epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                                assert_stochastic_bf16_matches_fp32_accumulation(d, launch, f'stochastic rounding, {case_label}')
 
                     if accumulate:
                         diff = calc_diff(d, ref_d)
@@ -332,6 +366,15 @@ def test_k_grouped_gemm_contiguous() -> None:
                             packed_d = initial_d.clone()
                             gemm(packed_a, packed_b, packed_d, packed_host_ks_cpu, grouped_layout, packed_d if accumulate else None,
                                  recipe=recipe, use_psum_layout=use_psum_layout, **packed_layout_kwargs)
+                            if test_sf_k_padding and packed_host_ks_cpu:
+                                strided_a = packed_a[0], add_sf_k_padding(packed_a[1], padding=4, k_grouped=True)
+                                strided_b = packed_b[0], add_sf_k_padding(packed_b[1], padding=4, k_grouped=True)
+                                strided_d = initial_d.clone()
+                                gemm(strided_a, strided_b, strided_d, packed_host_ks_cpu, grouped_layout,
+                                     strided_d if accumulate else None, recipe=recipe, use_psum_layout=use_psum_layout,
+                                     **packed_layout_kwargs)
+                                assert_bitwise_equal(strided_d, packed_d, 'K-grouped packed SF K-stride')
+                                test_sf_k_padding = False
                             if accumulate:
                                 packed_diff = calc_diff(packed_d, ref_d)
                                 assert packed_diff < quant_config.max_diff(), (
@@ -372,6 +415,133 @@ def test_k_grouped_gemm_contiguous() -> None:
     print()
 
 
+def _sm90_run(a, sa, b, sb, *, capture_config=False, **recipe):
+    out = torch.empty((a.shape[0], b.shape[0]), device="cuda", dtype=torch.bfloat16)
+    config_log = ""
+    if capture_config:
+        sys.stdout.flush()
+        with tempfile.TemporaryFile(mode="w+") as trace:
+            stdout_fd = os.dup(1)
+            try:
+                os.dup2(trace.fileno(), 1)
+                deep_gemm.fp8_gemm_nt((a, sa), (b, sb), out, **recipe)
+            finally:
+                os.dup2(stdout_fd, 1)
+                os.close(stdout_fd)
+            trace.seek(0)
+            config_log = trace.read()
+    else:
+        deep_gemm.fp8_gemm_nt((a, sa), (b, sb), out, **recipe)
+    torch.cuda.synchronize()
+    return out, config_log
+
+
+def _sm90_reference(a, sa, b, sb):
+    # Independent FP32 dequantized reference: each K32 product has its own scales.
+    n, k = b.shape
+    out = torch.zeros((a.shape[0], n), device="cuda", dtype=torch.float32)
+    for group in range(ceil_div(k, 32)):
+        start, end = group * 32, min((group + 1) * 32, k)
+        b_scale = sb[:, group].repeat_interleave(32)[:n]
+        product = a[:, start:end].float() @ b[:, start:end].float().T
+        out += product * sa[:, group, None] * b_scale[None, :]
+    return out.to(torch.bfloat16)
+
+
+def _sm90_selected_banks(config_log):
+    match = re.search(r"block_m=(\d+), block_n=(\d+)", config_log)
+    assert match is not None, f"SM90 did not report a selected tile: {config_log}"
+    block_m, block_n = map(int, match.groups())
+    # WGMMA M=64; the kernel uses a 128-row wave for larger M tiles.
+    wave_m = min(block_m, 128)
+    banks = 1 if block_m > wave_m else 4 if block_n <= 64 else 2
+    return banks, block_m, block_n
+
+
+def _check_sm90_invalid_activation_granularity():
+    m = n = 32
+    k = 128
+    a = torch.ones((m, k), device="cuda").to(torch.float8_e4m3fn)
+    b = torch.ones((n, k), device="cuda").to(torch.float8_e4m3fn)
+    invalid = (
+        (32, 32, 32, False),
+        (32, 32, 32, True),
+        (128, 128, 128, False),
+        (128, 128, 128, True),
+        (128, 1, 128, False),
+    )
+    for gran_m, gran_n, gran_k, separate in invalid:
+        # Allocate enough backing for every row if the guard regresses.
+        backing = torch.ones((m, ceil_div(k, gran_k)), device="cuda")
+        sa = backing[:ceil_div(m, gran_m)]
+        sb = torch.ones((ceil_div(n, gran_n), ceil_div(k, gran_k)), device="cuda")
+        recipe = (dict(recipe_a=(gran_m, gran_k), recipe_b=(gran_n, gran_k))
+                  if separate else dict(recipe=(gran_m, gran_n, gran_k)))
+        try:
+            _sm90_run(a, sa, b, sb, **recipe)
+        except RuntimeError as error:
+            assert "gran_m == 1" in str(error), (recipe, str(error))
+        else:
+            raise AssertionError(f"SM90 accepted unsupported A-scale granularity: {recipe}")
+
+
+def _check_sm90_block32_correctness():
+    # Cover K128-stage fragments, M/N tails, and both physical B-scale layouts.
+    # The remaining shapes select all three bank schedules on H200; fallbacks
+    # keep this check useful when another Hopper selects different tiles.
+    cases = (
+        (1, 8, 32, False, False, False),
+        (17, 40, 96, True, True, False),
+        (65, 72, 160, False, True, False),
+        (129, 96, 224, True, False, False),
+        (128, 32, 2048, False, False, True),
+        (2048, 1024, 512, True, True, True),
+        (2048, 2048, 512, False, False, True),
+        (2048, 1024, 2048, True, True, True),
+        (4096, 2048, 512, False, False, True),
+    )
+    observed_banks = set()
+    for m, n, k, transpose_sb, separate_recipe, check_banks in cases:
+        a = torch.randint(0, 4, (m, k), device="cuda").float().to(torch.float8_e4m3fn)
+        b = torch.randint(0, 4, (n, k), device="cuda").float().to(torch.float8_e4m3fn)
+        sa = torch.pow(2.0, torch.randint(-3, 1, (m, ceil_div(k, 32)), device="cuda").float())
+        sb = torch.pow(2.0, torch.randint(-3, 1, (ceil_div(n, 32), ceil_div(k, 32)), device="cuda").float())
+        if transpose_sb:
+            sb = sb.T.contiguous().T
+        recipe = (dict(recipe_a=(1, 32), recipe_b=(32, 32))
+                  if separate_recipe else dict(recipe=(1, 32, 32)))
+        actual, config_log = _sm90_run(a, sa, b, sb, capture_config=check_banks, **recipe)
+        expected = _sm90_reference(a, sa, b, sb)
+        assert torch.equal(actual, expected), (
+            f"block32 mismatch at {m=}, {n=}, {k=}, {transpose_sb=}, {separate_recipe=}; "
+            f"max error={(actual.float() - expected.float()).abs().max().item()}")
+        bank_note = ""
+        if check_banks:
+            banks, block_m, block_n = _sm90_selected_banks(config_log)
+            observed_banks.add(banks)
+            bank_note = f" banks={banks} tile=({block_m},{block_n})"
+        print(f"PASS block32 M={m} N={n} K={k} transposed_B_scales={transpose_sb}{bank_note}", flush=True)
+        if observed_banks == {1, 2, 4}:
+            break
+    assert observed_banks == {1, 2, 4}, observed_banks
+
+
+def test_sm90_block32() -> None:
+    if get_arch_major() != 9:
+        return
+    previous_print_configs = os.environ.get("DG_PRINT_CONFIGS")
+    os.environ["DG_PRINT_CONFIGS"] = "1"
+    try:
+        torch.manual_seed(32)
+        _check_sm90_invalid_activation_granularity()
+        _check_sm90_block32_correctness()
+    finally:
+        if previous_print_configs is None:
+            os.environ.pop("DG_PRINT_CONFIGS", None)
+        else:
+            os.environ["DG_PRINT_CONFIGS"] = previous_print_configs
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -383,3 +553,4 @@ if __name__ == '__main__':
     test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()
+    test_sm90_block32()

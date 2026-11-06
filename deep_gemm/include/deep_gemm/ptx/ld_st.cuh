@@ -8,6 +8,24 @@
 #if defined(DG_IN_CUDA_COMPILATION)
 namespace deep_gemm::ptx {
 
+CUTLASS_DEVICE uint32_t cvt_rs_bf16x2_f32(const float& lower, const float& upper,
+                                          const uint32_t& random_bits) {
+    uint32_t packed;
+    asm volatile("cvt.rs.bf16x2.f32 %0, %1, %2, %3;\n"
+                 : "=r"(packed) : "f"(upper), "f"(lower), "r"(random_bits));
+    return packed;
+}
+
+// Symmetric clamp for a nonnegative bound: retain the input sign and propagate NaNs.
+CUTLASS_DEVICE nv_bfloat162 clamp_bf16x2(const nv_bfloat162& value, const nv_bfloat162& bound) {
+    uint32_t packed;
+    asm("min.NaN.xorsign.abs.bf16x2 %0, %1, %2;"
+        : "=r"(packed)
+        : "r"(reinterpret_cast<const uint32_t&>(value)),
+          "r"(reinterpret_cast<const uint32_t&>(bound)));
+    return reinterpret_cast<const nv_bfloat162&>(packed);
+}
+
 // Compatibility: 256 bits LD/ST instructions
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
 using longlong4_t = longlong4_32a;
@@ -98,6 +116,11 @@ struct SM100_U8x8_STSM_T {
     }
 };
 
+/// Memory ordering
+CUTLASS_DEVICE void fence_acq_rel_cta() {
+    asm volatile("fence.acq_rel.cta;" ::: "memory");
+}
+
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
@@ -165,6 +188,25 @@ CUTLASS_DEVICE void cp_async_cg(const uint4* global_ptr, uint4* shared_ptr) {
     }
 }
 
+// Copies the first `num_src_bytes` (0 to 16) bytes and zero-fills the rest of the 16-byte destination
+template <uint32_t kNumL2PrefetchBytes>
+CUTLASS_DEVICE void cp_async_cg_zfill(const uint4* global_ptr, uint4* shared_ptr, const uint32_t num_src_bytes) {
+    DG_STATIC_ASSERT(kNumL2PrefetchBytes == 64 or kNumL2PrefetchBytes == 256, "Invalid L2 prefetch size");
+    if constexpr (kNumL2PrefetchBytes == 64) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::64B [%0], [%1], 16, %2;" ::
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+    } else {
+        asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;" ::
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+    }
+}
+
+// Copies the first `num_src_bytes` (0 or 4) bytes and zero-fills the rest of the 4-byte destination
+CUTLASS_DEVICE void cp_async_ca_zfill(const uint32_t* global_ptr, uint32_t* shared_ptr, const uint32_t num_src_bytes) {
+    asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;" ::
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+}
+
 CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta_idx) {
     uint32_t mapped;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(ptr), "r"(dst_cta_idx));
@@ -191,6 +233,71 @@ CUTLASS_DEVICE void st_async_cluster(T* dst, const T& src, const uint32_t& dst_c
     }
 }
 
+// early combine: CTA-scope message passing through shared memory and the wider-scope publish
+CUTLASS_DEVICE uint2 ld_shared(const uint2* ptr) {
+    uint2 ret;
+    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
+    return ret;
+}
+
+CUTLASS_DEVICE uint32_t ld_volatile_shared(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.shared.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint32_t ld_acquire_cta_shared(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.acquire.cta.shared::cta.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void st_release_cta_shared(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.release.cta.shared::cta.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void red_release_cta_shared_add(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("red.release.cta.shared::cta.add.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void fence_acq_rel_gpu() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+CUTLASS_DEVICE void fence_acq_rel_sys() {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
+
+CUTLASS_DEVICE uint32_t atom_add_relaxed_gpu(const uint32_t* ptr, const uint32_t& value) {
+    uint32_t ret;
+    asm volatile("atom.relaxed.gpu.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void red_add_relaxed_sys(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+}
+
+// count flag store of the low-latency head (release: orders the thread's earlier stores, and by cumulativity those of the
+// threads it synchronised with, before the flag at system scope)
+CUTLASS_DEVICE void st_release_sys_u32(uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE uint32_t ld_relaxed_sys(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void st_global_v2(void* ptr, const uint32_t& x, const uint32_t& y) {
+    asm volatile("st.global.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(x), "r"(y) : "memory");
+}
+
+CUTLASS_DEVICE void prefetch_bulk_l2(const void* ptr, const uint32_t& num_bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(ptr), "r"(num_bytes) : "memory");
+}
+
 CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
     // `size` must be 64-bit before PTX ISA 9.0
     DG_DEVICE_ASSERT(num_bytes % 8 == 0);
@@ -209,22 +316,15 @@ CUTLASS_DEVICE uint4 ld_evict_first(const uint4* ptr) {
     return value;
 }
 
-CUTLASS_DEVICE float ld_global(const float* ptr) {
-    float ret;
-    asm volatile("ld.weak.global.f32 %0, [%1];" : "=f"(ret) : "l"(ptr) : "memory");
-    return ret;
+// Store the low 16 bits of a packed pair: the `.b16` store truncates a 32-bit source register
+CUTLASS_DEVICE void st_global_low_bf16(nv_bfloat16* ptr, const nv_bfloat162& value) {
+    asm volatile("st.global.b16 [%0], %1;" :: "l"(ptr), "r"(*reinterpret_cast<const uint32_t*>(&value)));
 }
 
-CUTLASS_DEVICE float4 ld_global(const float4* ptr) {
-    float4 ret;
-    asm volatile("ld.weak.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w)
-                 : "l"(ptr) : "memory");
+CUTLASS_DEVICE uint32_t ld_global_cg(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
     return ret;
-}
-
-CUTLASS_DEVICE void st_global(float* ptr, const float& value) {
-    asm volatile("st.weak.global.f32 [%0], %1;" :: "l"(ptr), "f"(value) : "memory");
 }
 
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
@@ -292,6 +392,10 @@ CUTLASS_DEVICE void red_add(const uint32_t* ptr, const uint32_t& value) {
     asm volatile("red.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 
+CUTLASS_DEVICE void red_add_sys(const uint64_t* ptr, const uint64_t& value) {
+    asm volatile("red.sys.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
 CUTLASS_DEVICE void red_or_rel_sys(const uint64_t* ptr, const uint64_t& value) {
     asm volatile("red.release.sys.global.or.b64 [%0], %1;" :: "l"(ptr), "l"(value));
 }
@@ -309,7 +413,7 @@ CUTLASS_DEVICE void st_rel_sys(const uint64_t* ptr, const uint64_t& value) {
 }
 
 CUTLASS_DEVICE void red_add_rel(const uint32_t* ptr, const uint32_t& value) {
-    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value));
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
 }
 
 CUTLASS_DEVICE void red_add_rel(const uint64_t* ptr, const uint64_t& value) {
@@ -322,6 +426,10 @@ CUTLASS_DEVICE void red_async_inc_rel(const uint64_t* ptr) {
 
 CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
+}
+
+CUTLASS_DEVICE void red_add_sys(const float* ptr, const float& value) {
+    asm volatile("red.sys.global.add.f32 [%0], %1;" :: "l"(ptr), "f"(value));
 }
 
 CUTLASS_DEVICE int ld_acq_sys(const int* ptr) {
@@ -339,6 +447,12 @@ CUTLASS_DEVICE uint32_t ld_acq_sys(const uint32_t* ptr) {
 CUTLASS_DEVICE uint64_t ld_acq_gpu(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint64_t ld_relaxed_gpu(const uint64_t* ptr) {
+    uint64_t ret;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr) : "memory");
     return ret;
 }
 

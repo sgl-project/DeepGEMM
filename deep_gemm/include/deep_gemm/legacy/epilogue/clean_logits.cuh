@@ -4,7 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 
-namespace deep_gemm::epilogue {
+namespace deep_gemm::legacy::epilogue {
 
 // Warp-cooperative `-inf` filler for out-of-coverage logits columns.
 // The aligned interior of `[start_col, end_col)` is filled with 16-byte vectorized
@@ -46,4 +46,4 @@ struct LogitsCleaner {
     }
 };
 
-} // namespace deep_gemm::epilogue
+} // namespace deep_gemm::legacy::epilogue

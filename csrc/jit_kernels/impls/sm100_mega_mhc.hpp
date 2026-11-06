@@ -31,7 +31,7 @@ static void sm100_mega_mhc(
     const std::optional<torch::Tensor>& y_primary_sf,
     const std::optional<torch::Tensor>& y_shared_sf,
     const int& shared_sf_block_m, const float& rmsnorm_scale,
-    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms) {
+    const int& num_tokens, const int& hidden, const int& num_splits, const int& num_sms, const bool& in_cta_norm) {
     const bool is_shifted = shifted_prev_mix.has_value();
 
     const auto make_hidden_tma_desc = [&](const torch::Tensor& tensor) {
@@ -50,8 +50,11 @@ static void sm100_mega_mhc(
             static_cast<int>(tensor.stride(0)), swizzle_mode);
     };
 
-    const auto smem_size = static_cast<int>(sizeof(mhc_layout::SharedStorage));
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    const auto max_num_k_blocks_per_task = mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits);
+    const auto smem_size = in_cta_norm ? static_cast<int>(mhc_layout::get_x1_tiles_smem_offset() +
+                                                          mhc_layout::get_in_cta_norm_smem_size(max_num_k_blocks_per_task, hidden))
+                                       : static_cast<int>(sizeof(mhc_layout::SharedStorage));
+    DG_HOST_ASSERT(smem_size <= (in_cta_norm ? SM107ArchSpec::oversized_smem_capacity : SM100ArchSpec::smem_capacity));
 
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         printf("Mega %s mHC: T=%d, H=%d, splits=%d, IO/Fn/A stages=%u/%u/%u, "
@@ -100,8 +103,9 @@ static void sm100_mega_mhc(
         .y_bf16 = reinterpret_cast<nv_bfloat16*>(y_bf16.data_ptr()),
         .y_fp8 = y_fp8.has_value() ? reinterpret_cast<__nv_fp8_e4m3*>(y_fp8->data_ptr()) : nullptr,
         .y_primary_sf = y_primary_sf.has_value() ? reinterpret_cast<uint32_t*>(y_primary_sf->data_ptr<int32_t>()) : nullptr,
-        .y_primary_sf_stride_token = y_primary_sf.has_value() ? y_primary_sf->stride(0) : 0,
+        .y_primary_sf_stride_token = y_primary_sf.has_value() and y_primary_sf->dim() == 2 ? y_primary_sf->stride(0) : 0,
         .y_primary_sf_stride_word = y_primary_sf.has_value() ? y_primary_sf->stride(1) : 0,
+        .y_primary_sf_stride_mtile = y_primary_sf.has_value() and y_primary_sf->dim() == 4 ? y_primary_sf->stride(0) : 0,
         .y_shared_sf = y_shared_sf.has_value() ? reinterpret_cast<uint32_t*>(y_shared_sf->data_ptr<int32_t>()) : nullptr,
         .y_shared_sf_stride_word = y_shared_sf.has_value() ? y_shared_sf->stride(1) : 0,
     };
@@ -120,7 +124,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
         {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -128,11 +132,20 @@ static void __instantiate_kernel() {{
         mix_args.new_prev_mix != nullptr,
         store_bf16,
         norm_args.y_fp8 != nullptr,
-        shared_sf_block_m), compiler_options);
+        shared_sf_block_m,
+        norm_args.y_primary_sf_stride_mtile != 0,
+        // A dynamic task queue only pays off when the producer tasks span more than two grid waves
+        not in_cta_norm and mhc_layout::Workspace<>::get_num_m_blocks(num_tokens) * num_splits > 2u * num_sms,
+        in_cta_norm), compiler_options);
 
-    // Launch
-    jit->launch(
-        kernel, {
+    // Launch; shared memory above the portable capacity needs the oversized mode (SM107, CUDA 13.4+)
+    std::optional<int> smem_mode;
+#if CUDA_VERSION >= 13040
+    if (smem_size > SM100ArchSpec::smem_capacity)
+        smem_mode = CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+#endif
+    launch_with_shared_memory_mode(
+        smem_mode, kernel, {
             .num_smem_bytes = smem_size,
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(mhc_layout::kNumThreads, 1, 1),

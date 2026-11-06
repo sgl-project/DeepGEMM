@@ -65,13 +65,12 @@ class SymmBuffer:
         self.activation = activation
 
         # Allocate or reuse a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
-        )
+        layout_args = (group.size(), num_experts,
+                       num_max_tokens_per_rank, num_topk,
+                       hidden, intermediate_hidden,
+                       mma_type, activation,
+                       num_shared_experts)
+        num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -92,24 +91,14 @@ class SymmBuffer:
             self.buffer = base.buffer
             self.handle = base.handle
 
-        # Create input buffer views (as torch tensors, not tvm-ffi tensors).
+        # Create input buffer views; absent ones (BF16 SFs, no shared experts) are empty byte tensors
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf,
-         self.x_scales) = map(
-            torch.from_dlpack, slice_input_buffers(self.buffer))
-
-        # Restore activation types after the FFI transports unsupported DLPack dtypes as bytes.
-        activation_dtype = (torch.bfloat16 if mma_type == 'bf16xbf16' else
-                            torch.uint8 if mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4') else
-                            torch.float8_e4m3fn)
-        for name in ('x', 'shared_l1_acts', 'shared_l2_acts', 'l1_acts', 'l2_acts'):
-            value = getattr(self, name)
-            if value.numel():
-                setattr(self, name, value.view(activation_dtype))
+         self.x_scales) = _C.slice_symm_buffer_for_mega_moe(self.buffer, *layout_args)
 
     def destroy(self):
         self.handle = None
@@ -222,6 +211,33 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tensor):
+    """Convert canonical [gate; up], packed MN-major NVFP4 scales to MegaMoE layout.
+
+    TRT mode uses TRT-packed scales directly.
+    """
+    return (_transpose_sf_for_utccp(_interleave_weights_packed_fp4(l1_scales)),
+            _transpose_sf_for_utccp(l2_scales))
+
+
+def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):
+    if weight_layout not in ('megamoe', 'trtllm'):
+        raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
+    if weight_layout == 'trtllm' and (shared_l1_weights is not None or shared_l2_weights is not None):
+        raise ValueError('TRT-LLM weight layout does not support shared experts')
+
+
+def _validate_global_num_tokens(global_num_tokens: Optional[int], num_ranks: int,
+                                num_max_tokens_per_rank: int) -> None:
+    # Real tokens sent by all EP ranks this call; it only selects the tile, never the result.
+    if global_num_tokens is None:
+        return
+    if not 0 <= global_num_tokens <= num_ranks * num_max_tokens_per_rank:
+        raise ValueError(
+            f'`global_num_tokens` must be in [0, {num_ranks * num_max_tokens_per_rank}] '
+            f'(EP ranks x num_max_tokens_per_rank); got {global_num_tokens}'
+        )
+
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -237,7 +253,17 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      use_x_scales: bool = False,
                      l1_alphas: Optional[torch.Tensor] = None,
                      l2_alphas: Optional[torch.Tensor] = None,
-                     l2_act_scales: Optional[torch.Tensor] = None):
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     weight_layout: str = 'megamoe',
+                     global_num_tokens: Optional[int] = None,
+                     post_expert_norm: bool = False,
+                     post_expert_norm_weight: Optional[torch.Tensor] = None,
+                     post_expert_norm_eps: float = 1e-6,
+                     post_expert_norm_weight_first: bool = False):
+    _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+    _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+    if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
+        raise ValueError('TRT-LLM packed weights require NVFP4 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
             '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
@@ -261,7 +287,10 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales
+        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
+        post_expert_norm, post_expert_norm_weight,
+        post_expert_norm_eps, post_expert_norm_weight_first,
+        weight_layout == 'trtllm', global_num_tokens
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -277,7 +306,13 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    use_x_scales: bool = False,
                    l1_alphas: Optional[torch.Tensor] = None,
                    l2_alphas: Optional[torch.Tensor] = None,
-                   l2_act_scales: Optional[torch.Tensor] = None):
+                   l2_act_scales: Optional[torch.Tensor] = None,
+                   weight_layout: str = 'megamoe',
+                   global_num_tokens: Optional[int] = None,
+                   post_expert_norm: bool = False,
+                   post_expert_norm_weight: Optional[torch.Tensor] = None,
+                   post_expert_norm_eps: float = 1e-6,
+                   post_expert_norm_weight_first: bool = False):
     fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights,
@@ -285,7 +320,12 @@ def nvfp4_mega_moe(y: torch.Tensor,
         recipe=(1, 1, 16),
         activation=activation, activation_clamp=activation_clamp,
         fast_math=fast_math, use_x_scales=use_x_scales,
-        l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales
+        l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales,
+        post_expert_norm=post_expert_norm,
+        post_expert_norm_weight=post_expert_norm_weight,
+        post_expert_norm_eps=post_expert_norm_eps,
+        post_expert_norm_weight_first=post_expert_norm_weight_first,
+        weight_layout=weight_layout, global_num_tokens=global_num_tokens
     )
 
 
@@ -298,7 +338,15 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  weight_layout: str = 'megamoe',
+                  global_num_tokens: Optional[int] = None,
+                  post_expert_norm: bool = False,
+                  post_expert_norm_weight: Optional[torch.Tensor] = None,
+                  post_expert_norm_eps: float = 1e-6,
+                  post_expert_norm_weight_first: bool = False):
+    _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+    _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -313,16 +361,23 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math, post_expert_norm, post_expert_norm_weight,
+        post_expert_norm_eps, post_expert_norm_weight_first,
+        weight_layout == 'trtllm', global_num_tokens
     )
 
 
 def get_block_m_for_mega_moe(num_ranks: int, num_experts: int,
                              num_max_tokens_per_rank: int, num_tokens: int,
-                             num_topk: int, mma_type: str = 'fp8xfp4') -> int:
-    """`BLOCK_M` the kernel will pick — callers need it to lay out shared-expert SFs."""
+                             num_topk: int, mma_type: str = 'fp8xfp4',
+                             global_num_tokens: Optional[int] = None) -> int:
+    """`BLOCK_M` the kernel will pick — callers need it to lay out shared-expert SFs.
+
+    Pass the same `global_num_tokens` as the kernel call, or the two selections can differ.
+    """
+    _validate_global_num_tokens(global_num_tokens, num_ranks, num_max_tokens_per_rank)
     return int(_C.get_block_m_for_mega_moe(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type))
+        num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type, global_num_tokens))
 
 
 def mega_moe_pre_dispatch(x: torch.Tensor,

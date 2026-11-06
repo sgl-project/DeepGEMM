@@ -1,10 +1,19 @@
 #pragma once
 
+#include <cuda_fp8.h>
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm::layout::mega_mhc {
+
+#if defined(__CUDACC__)
+// Exact BF16x2 widening: one shift and one mask, no PRMT
+CUTLASS_DEVICE float2 bf16x2_to_float2(const nv_bfloat162& value) {
+    const uint32_t bits = *reinterpret_cast<const uint32_t*>(&value);
+    return {__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u)};
+}
+#endif
 
 // Model geometry
 static constexpr uint32_t kNumRoutes = 4;
@@ -21,7 +30,7 @@ static constexpr uint32_t BLOCK_K = 64;
 static constexpr uint32_t kSwizzleMode = 128;
 static constexpr uint32_t kFnAtomK = kSwizzleMode / sizeof(float);
 static constexpr uint32_t kSwizzleAlignment = 8 * kSwizzleMode;
-static constexpr uint32_t kNumIOStages = 4;
+static constexpr uint32_t kNumIOStages = 3;
 static constexpr uint32_t kNumFnStages = 2;
 static constexpr uint32_t kNumAStages = 4;
 static constexpr uint32_t kNumAccumStages = 2;
@@ -38,6 +47,14 @@ static constexpr uint32_t kNumSplitBarriers = 2;
 static constexpr uint64_t kSplitBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
 static constexpr uint32_t kNumMaxMBlocks = math::constexpr_ceil_div(kNumMaxTokens, BLOCK_M);
+// A barrier line holds one 8-byte state; the execution epoch, the exit count and the task queue counter
+// live in the unused tail of the buffer's first line, so the buffer is unchanged.
+// The task queue counter relies on the per-launch memset of the active barrier lines to start at zero.
+static constexpr uint64_t kSplitBarrierEpochOffset = kSplitBarrierLineBytes / 2;
+static constexpr uint64_t kSplitBarrierExitCountOffset = kSplitBarrierEpochOffset + sizeof(uint64_t);
+static constexpr uint64_t kSplitBarrierTaskCounterOffset = kSplitBarrierExitCountOffset + sizeof(uint64_t);
+DG_STATIC_ASSERT(kSplitBarrierTaskCounterOffset + sizeof(uint32_t) <= kSplitBarrierLineBytes,
+                 "Epoch, exit count and task counter must fit in the first barrier line");
 
 // Host/device ABI payloads for the two consumer domains. Tensor maps remain
 // standalone kernel parameters so TMA descriptors keep direct grid-constant access.
@@ -65,6 +82,8 @@ struct NormArgs {
     uint32_t* y_primary_sf;
     int64_t y_primary_sf_stride_token;
     int64_t y_primary_sf_stride_word;
+    // Non-zero selects FlashInfer's 128x4 swizzle: words between 128-token tiles
+    int64_t y_primary_sf_stride_mtile;
     uint32_t* y_shared_sf;
     int64_t y_shared_sf_stride_word;
 };
@@ -165,5 +184,33 @@ struct SharedStorage {
     // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
     alignas(uint32_t) uint32_t next_norm_task_ticket;
 };
+
+// BF16 pair offset in a `[BLOCK_M][BLOCK_K]` tile with the 128B swizzle, shared by the IO tiles and the X1 tiles
+CUTLASS_HOST_DEVICE constexpr uint32_t get_swizzled_bf16x2_offset(const uint32_t& row_idx, const uint32_t& col_idx) {
+    constexpr uint32_t kNumColsPerRow = kSwizzleMode / sizeof(nv_bfloat162);
+    constexpr uint32_t kNumColsPerBank = 16 / sizeof(nv_bfloat162);
+    const uint32_t bank_group_idx = (col_idx / kNumColsPerBank) ^ (row_idx & (kSwizzleMode / 16 - 1));
+    return row_idx * kNumColsPerRow + bank_group_idx * kNumColsPerBank + col_idx % kNumColsPerBank;
+}
+
+// In-CTA Norm keeps several tasks' X1 tiles behind SharedStorage (VR oversized shared memory)
+static constexpr uint32_t kNumX1Buffers = 3;
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_offset() {
+    return math::constexpr_align(static_cast<uint32_t>(sizeof(SharedStorage)), kSwizzleAlignment);
+}
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_max_num_k_blocks_per_task(const uint32_t& hidden, const uint32_t& num_splits) {
+    return math::constexpr_ceil_div(hidden / BLOCK_K, num_splits);
+}
+
+CUTLASS_HOST_DEVICE constexpr uint32_t get_x1_tiles_smem_size(const uint32_t& max_num_k_blocks_per_task) {
+    return kNumX1Buffers * max_num_k_blocks_per_task * BLOCK_M * BLOCK_K * static_cast<uint32_t>(sizeof(nv_bfloat16));
+}
+
+// The RMSNorm weight follows the X1 tiles, staged once per CTA
+CUTLASS_HOST_DEVICE constexpr uint32_t get_in_cta_norm_smem_size(const uint32_t& max_num_k_blocks_per_task, const uint32_t& hidden) {
+    return get_x1_tiles_smem_size(max_num_k_blocks_per_task) + hidden * static_cast<uint32_t>(sizeof(nv_bfloat16));
+}
 
 } // namespace deep_gemm::layout::mega_mhc

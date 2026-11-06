@@ -12,15 +12,33 @@ namespace deep_gemm::mega_mhc {
 
 namespace mhc_layout = layout::mega_mhc;
 
-static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms) {
+static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms,
+                               const uint32_t x1_k_block_budget = 0) {
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
-    // Fewest splits that still reach the shortest possible longest task
     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+    // Fewest splits that still reach the shortest possible longest task
     const uint32_t max_num_splits = cute::min(
         mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
-    return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
+    const uint32_t num_splits = math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
+
+    // Producer time is about (task waves) x (longest task); take a cheaper split count only if it saves > 5%
+    const auto get_cost = [&](const uint32_t& s) {
+        return math::ceil_div(num_m_blocks * s, num_sms) * math::ceil_div(num_k_blocks, s);
+    };
+    // Keep a split count whose tasks fit the in-CTA Norm buffers if the default one does
+    const bool keeps_x1_fit = x1_k_block_budget > 0 and
+                              mhc_layout::get_max_num_k_blocks_per_task(hidden, num_splits) <= x1_k_block_budget;
+    const auto fits = [&](const uint32_t& s) {
+        return not keeps_x1_fit or mhc_layout::get_max_num_k_blocks_per_task(hidden, s) <= x1_k_block_budget;
+    };
+    uint32_t best_num_splits = num_splits;
+    for (uint32_t s = 1; s <= max_num_splits; ++ s) {
+        if (fits(s) and get_cost(s) * 20 < get_cost(num_splits) * 19 and get_cost(s) <= get_cost(best_num_splits))
+            best_num_splits = s;
+    }
+    return best_num_splits;
 }
 
 static const torch::Tensor& get_split_barriers(const torch::TensorOptions& options) {
@@ -66,7 +84,7 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
  *     new_comb_res_mix               [T,hc_mult,hc_mult]               FP32
  *     y_bf16                         [T,H] BF16 | None
  *     y_fp8                          [T,H] E4M3 | None
- *     y_gemm_sf                      [T,H/128] int32 | None
+ *     y_gemm_sf                      [T,H/128] | [ceil(T/128),H/128,32,4] int32 | None
  *     y_routed_sf                    [T,H/128] int32 | None
  *     y_shared_sf                    [T,H/128] int32 | None
  *     shared_sf_block_m              int
@@ -82,7 +100,8 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
  *     UE8M0 scaling factors packed into each int32.
  *     y_bf16 and y_fp8 are independent optional outputs; at least one is required.
  *     With y_fp8, supply exactly either y_gemm_sf alone, or y_routed_sf and
- *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major,
+ *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major, or, when 4D,
+ *     FlashInfer's 128x4 swizzle (its flat uint8 view is FlashInfer's a_descale),
  *     y_routed_sf is contiguous row-major, and y_shared_sf is the Mega MoE
  *     shared-expert layout and requires shared_sf_block_m > 0.
  */
@@ -199,7 +218,14 @@ static void mega_mhc(const torch::Tensor& x,
         DG_HOST_ASSERT(tensor.device() == device);
     };
 
-    if (y_gemm_sf.has_value()) {
+    // A 4D `[ceil(T / 128), H / 128, 32, 4]` y_gemm_sf is FlashInfer's 128x4 swizzle
+    if (y_gemm_sf.has_value() and y_gemm_sf->dim() == 4) {
+        DG_HOST_ASSERT(y_gemm_sf->scalar_type() == torch::kInt and y_gemm_sf->device() == device);
+        DG_HOST_ASSERT(y_gemm_sf->is_contiguous());
+        DG_HOST_ASSERT(y_gemm_sf->size(0) == ceil_div(num_tokens, 128) and
+                       y_gemm_sf->size(1) == hidden / static_cast<int>(mhc_layout::kHiddenPerSFWord) and
+                       y_gemm_sf->size(2) == 32 and y_gemm_sf->size(3) == 4);
+    } else if (y_gemm_sf.has_value()) {
         check_sf(y_gemm_sf.value());
         DG_HOST_ASSERT(y_gemm_sf->stride(0) == 1);
         DG_HOST_ASSERT(y_gemm_sf->stride(1) >= num_tokens);
@@ -223,10 +249,27 @@ static void mega_mhc(const torch::Tensor& x,
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     const auto num_sms = runtime->get_num_sms();
     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
-    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms));
+    // Shifted on SM107 normalizes X1 inside the producing CTA when the X1 tile buffers fit the oversized shared memory
+    constexpr uint32_t kNumStaticSmemReserveBytes = 4096;
+    // It pays once Post spans several task waves; shorter grids finish Norm faster on the CTA-wide queue
+    constexpr uint32_t kMinNumTaskWavesForInCTANorm = 8;
+    const int in_cta_norm_env = deep_jit::get_env<int>("DG_MHC_IN_CTA_NORM", -1);
+    bool in_cta_norm = CUDA_VERSION >= 13040 and is_shifted and SM107ArchSpec::is_current() and
+                       (in_cta_norm_env >= 0 ? in_cta_norm_env != 0 :
+                        num_m_blocks * mhc_layout::kDefaultNumSplits >= kMinNumTaskWavesForInCTANorm * static_cast<uint32_t>(num_sms));
+    const uint32_t x1_k_block_budget = not in_cta_norm ? 0 :
+        (SM107ArchSpec::oversized_smem_capacity - mhc_layout::get_x1_tiles_smem_offset() - kNumStaticSmemReserveBytes -
+         mhc_layout::get_in_cta_norm_smem_size(0, static_cast<uint32_t>(hidden))) /
+        mhc_layout::get_x1_tiles_smem_size(1);
+    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
+                                           x1_k_block_budget);
+    // A CTA holding more than kNumX1Buffers splits of one m-block would wait on its own Post, so in-CTA Norm keeps
+    // grid-stride task ownership and needs a grid at least as wide as the split count
+    in_cta_norm = in_cta_norm and num_splits <= static_cast<uint32_t>(num_sms) and
+                  mhc_layout::get_max_num_k_blocks_per_task(static_cast<uint32_t>(hidden), num_splits) <= x1_k_block_budget;
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
-    const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
+    const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted and not in_cta_norm;
     const auto num_bf16_scratch_bytes = needs_bf16_scratch ? static_cast<int64_t>(num_tokens) * hidden * x.element_size() : 0;
     // Reject an unwarmed stream before allocating temporary capture storage.
     const auto& split_barriers = get_split_barriers(x.options());
@@ -239,7 +282,8 @@ static void mega_mhc(const torch::Tensor& x,
         0, num_m_blocks * mhc_layout::kSplitBarrierLineBytes, mhc_layout::kNumSplitBarriers,
         at::cuda::getCurrentCUDAStream()));
 
-    // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
+    // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary;
+    // in-CTA Norm keeps the rounded BF16 in shared memory instead.
     const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).
                                                      view(torch::kBFloat16).view({num_tokens, hidden})
                                                    : y_bf16.value_or(x);
@@ -255,10 +299,10 @@ static void mega_mhc(const torch::Tensor& x,
         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
         y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
         y_fp8, y_primary_sf, y_shared_sf,
-        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
+        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, in_cta_norm);
 }
 
-#ifndef DG_USE_TVM_FFI
+#ifndef DG_USE_TORCH_LIBRARY
 static void register_apis(pybind11::module_& m) {
     m.def(
         "mega_mhc",

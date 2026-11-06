@@ -1,10 +1,10 @@
 #pragma once
 
-#include "../heuristics/sm120.hpp"
-#include "runtime_utils.hpp"
-#include "../../runtime/launch.hpp"
+#include "../../heuristics/sm120.hpp"
+#include "../runtime_utils.hpp"
+#include "../../../runtime/launch.hpp"
 
-namespace deep_gemm {
+namespace deep_gemm::legacy {
 
 // SM120 paged MQA logits. Follows dev's per-arch style; uses the atom scheduler
 // (scheduler/sm120_paged_mqa_logits.cuh). split_kv is fixed at 128 (2 groups × 64).
@@ -31,9 +31,9 @@ public:
 
     static std::string generate(const Args& args) {
         return std::format(R"(
-#include <deep_gemm/scheduler/sm120_paged_mqa_logits.cuh>
+#include <deep_gemm/legacy/scheduler/sm120_paged_mqa_logits.cuh>
 
-using namespace deep_gemm;
+using namespace deep_gemm::legacy;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sched::sm120_paged_mqa_logits_metadata<
@@ -82,7 +82,7 @@ static void sm120_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .launch_args = make_launch_options(1, num_threads, smem_size)
     };
     const auto code = SM120PagedMQALogitsMetadataRuntime::generate(args);
-    const auto kernel = jit->compile("sm120_paged_mqa_logits_metadata", code);
+    const auto kernel = jit->compile("legacy_sm120_paged_mqa_logits_metadata", code);
     SM120PagedMQALogitsMetadataRuntime::launch(kernel, args);
 }
 
@@ -105,9 +105,9 @@ public:
     static std::string generate(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
         return std::format(R"(
-#include <deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh>
+#include <deep_gemm/legacy/impls/sm120_fp8_paged_mqa_logits.cuh>
 
-using namespace deep_gemm;
+using namespace deep_gemm::legacy;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp8_paged_mqa_logits<
@@ -209,7 +209,7 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
         .launch_args = make_launch_options(num_sms, num_specialized_threads + num_math_threads, smem_size)
     };
     const auto code = SM120FP8PagedMQALogitsRuntime::generate(args);
-    const auto kernel = jit->compile("sm120_fp8_paged_mqa_logits", code);
+    const auto kernel = jit->compile("legacy_sm120_fp8_paged_mqa_logits", code);
     SM120FP8PagedMQALogitsRuntime::launch(kernel, args);
 }
 
@@ -231,9 +231,9 @@ public:
 
     static std::string generate(const Args& args) {
         return std::format(R"(
-#include <deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh>
+#include <deep_gemm/legacy/impls/sm120_fp4_paged_mqa_logits.cuh>
 
-using namespace deep_gemm;
+using namespace deep_gemm::legacy;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm120_fp4_paged_mqa_logits<
@@ -346,7 +346,7 @@ static void sm120_fp4_paged_mqa_logits(const torch::Tensor& q,
         .launch_args = make_launch_options(num_sms, num_tma_threads + num_math_threads, smem_size)
     };
     const auto code = SM120FP4PagedMQALogitsRuntime::generate(args);
-    const auto kernel = jit->compile("sm120_fp4_paged_mqa_logits", code);
+    const auto kernel = jit->compile("legacy_sm120_fp4_paged_mqa_logits", code);
     SM120FP4PagedMQALogitsRuntime::launch(kernel, args);
 }
 
@@ -386,4 +386,4 @@ static void sm120_paged_mqa_logits(const bool& is_fp4,
     }
 }
 
-} // namespace deep_gemm
+} // namespace deep_gemm::legacy
