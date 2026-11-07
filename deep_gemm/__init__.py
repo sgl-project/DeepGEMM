@@ -192,6 +192,9 @@ try:
     def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
         _C.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits)
 
+    def tf32_hc_prenorm_gemm_dual(a, b, b2, d, d2, sqr_sum, num_splits=None):
+        _C.tf32_hc_prenorm_gemm_dual(a, b, b2, d, d2, sqr_sum, num_splits)
+
     def transform_sf_into_required_layout(sf, mn, k, recipe, num_groups=None, is_sfa=None, disable_ue8m0_cast=False, psum_layout=None):
         (recipe_a, recipe_b, recipe_c) = recipe if len(recipe) == 3 else (recipe[0], recipe[1], None)
         return _C.transform_sf_into_required_layout(sf, mn, k, recipe_a, recipe_b, recipe_c, num_groups, is_sfa, disable_ue8m0_cast, psum_layout)
