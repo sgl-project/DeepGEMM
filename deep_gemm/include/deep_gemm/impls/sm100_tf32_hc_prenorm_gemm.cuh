@@ -39,7 +39,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kSwizzleCDMode,
           uint32_t kNumStages,
           uint32_t kNumMMAThreads, uint32_t kNumCastAndReduceThreads,
-          uint32_t kNumB = 1>
+          uint32_t kNumB>
 CUTLASS_GLOBAL void __launch_bounds__(kNumMMAThreads + kNumCastAndReduceThreads, 1)
 sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_a,
@@ -165,9 +165,10 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
                 // Issue TMAs
                 tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx);
-                tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, 0);
-                if constexpr (kNumB == 2)
-                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b2, full_barriers[stage_idx], smem_b[stage_idx] + BLOCK_N * BLOCK_K, k_idx, 0);
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumB; ++ j)
+                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(j == 0 ? &tensor_map_b : &tensor_map_b2, full_barriers[stage_idx],
+                                                               smem_b[stage_idx] + j * BLOCK_N * BLOCK_K, k_idx, 0);
 
                 // Arrive at full barriers
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_STAGE_STRIDE;
@@ -305,10 +306,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         DG_STATIC_ASSERT(BLOCK_K * sizeof(nv_bfloat16) == kSwizzleAMode, "Invalid block K");
 
         // Launch reductions
-        float2 sum[kNumRowGroups][2];
-        #pragma unroll
-        for (uint32_t g = 0; g < kNumRowGroups; ++ g)
-            sum[g][0] = sum[g][1] = float2{0, 0};
+        float2 sum[kNumRowGroups][2] = {};
         #pragma unroll kNumStages
         for (uint32_t s = 0; s < num_total_stages; ++ s) {
             // Wait TMA arrival
