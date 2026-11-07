@@ -347,7 +347,8 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 for (uint32_t i = 0; i < kNumLoads; ++ i) {
                     #pragma unroll
                     for (uint32_t u = 0; u < 2; ++ u) {
-                        fp32x2_values[u][i] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&uint32_values[u][i]));
+                        fp32x2_values[u][i] = make_float2(__uint_as_float(uint32_values[u][i] << 16),
+                                                          __uint_as_float(uint32_values[u][i] & 0xffff0000u));
                         sum[g][u] = __ffma2_rn(fp32x2_values[u][i], fp32x2_values[u][i], sum[g][u]);
                     }
 
