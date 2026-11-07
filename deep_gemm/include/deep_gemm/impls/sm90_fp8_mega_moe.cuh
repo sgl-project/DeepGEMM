@@ -42,26 +42,31 @@ __forceinline__ __device__ float sm90_fp8_mega_moe_clamp_up(float x) {
     return x;
 }
 
-template <bool kFastMath>
+template <bool kFastMath, float kActivationAlpha = 1.0f>
 __forceinline__ __device__ float sm90_fp8_mega_moe_silu(float x) {
-    const float e = kFastMath ? __expf(-x) : expf(-x);
+    const float e = kFastMath ? __expf(-kActivationAlpha * x) : expf(-kActivationAlpha * x);
     const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
     return x * sig;
 }
 
 // kFastMath SiLU with `ex2.approx.ftz.f32` instead of `__expf`'s non-ftz form: the two only differ when exp(-x) < 2^-126,
 // where `1.0f + e` is 1.0f either way, so the result is bit-identical. Same operation order: e = ex2(x * -log2e), rcp.approx.ftz(1 + e), x * sig.
+template <float kActivationAlpha = 1.0f>
 __forceinline__ __device__ float sm90_fp8_mega_moe_silu_ftz_exp(float x) {
     float e;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(__fmul_rn(-x, 1.4426950408889634f)));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(__fmul_rn(-kActivationAlpha * x, 1.4426950408889634f)));
     return x * math::fast_rcp(1.0f + e);
 }
 
-template <bool kFastMath, float kActivationClamp>
+template <
+    bool kFastMath,
+    float kActivationClamp,
+    float kActivationAlpha = 1.0f,
+    float kActivationUpBias = 0.0f>
 __forceinline__ __device__ float sm90_fp8_mega_moe_swiglu(float g, float u) {
     g = sm90_fp8_mega_moe_clamp_gate<kActivationClamp>(g);
     u = sm90_fp8_mega_moe_clamp_up<kActivationClamp>(u);
-    return sm90_fp8_mega_moe_silu<kFastMath>(g) * u;
+    return sm90_fp8_mega_moe_silu<kFastMath, kActivationAlpha>(g) * (u + kActivationUpBias);
 }
 
 // Continuous FP32 activation scale. SM90 WGMMA has no hardware block-scale operand (the SF
@@ -99,6 +104,8 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
+    float kActivationAlpha,
+    float kActivationUpBias,
     bool kFastMath,
     uint32_t kEpilogueRegisterBudget,
     bool kReuseAccumAsFinal,
@@ -2167,8 +2174,8 @@ sm90_fp8_mega_moe_impl(void* y,
                 };
                 auto silu = [](float x) -> float {
                     if constexpr (kFastMath)
-                        return sm90_fp8_mega_moe_silu_ftz_exp(x);
-                    return x * (1.0f / (1.0f + expf(-x)));
+                        return sm90_fp8_mega_moe_silu_ftz_exp<kActivationAlpha>(x);
+                    return x * (1.0f / (1.0f + expf(-kActivationAlpha * x)));
                 };
 
                 // Rows at or beyond `valid_m` are computed like the others; nothing of theirs is observable (the staging and SF stores
@@ -2196,11 +2203,11 @@ sm90_fp8_mega_moe_impl(void* y,
                     clamp_up(u_r1_c1);
 
                     const uint32_t g = p / kPairsPerSFGroup;
-                    swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                    swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
+                    swiglu_r0[p][0] = silu(g_r0_c0) * (u_r0_c0 + kActivationUpBias);
+                    swiglu_r0[p][1] = silu(g_r0_c1) * (u_r0_c1 + kActivationUpBias);
                     amax_r0[g] = fmaxf(amax_r0[g], fmaxf(fabsf(swiglu_r0[p][0]), fabsf(swiglu_r0[p][1])));
-                    swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                    swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                    swiglu_r1[p][0] = silu(g_r1_c0) * (u_r1_c0 + kActivationUpBias);
+                    swiglu_r1[p][1] = silu(g_r1_c1) * (u_r1_c1 + kActivationUpBias);
                     amax_r1[g] = fmaxf(amax_r1[g], fmaxf(fabsf(swiglu_r1[p][0]), fabsf(swiglu_r1[p][1])));
                 }
 

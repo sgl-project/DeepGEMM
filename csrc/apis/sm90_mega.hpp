@@ -38,7 +38,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const bool& use_fp8_dispatch, const std::string& activation) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai");
     // also asserted at launch; here so a shape this kernel cannot serve is reported before a buffer is allocated for it
     DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
     // the per-128 L2 activation SF takes the 256-wide tiles, whose L1 and L2 N block counts must be even
@@ -155,6 +155,8 @@ static void fp8_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
+    const float& activation_alpha,
+    const float& activation_up_bias,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     // the caller's bound on this call's per-rank token count on every rank (0 = capacity)
@@ -169,7 +171,7 @@ static void fp8_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai");
 
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
@@ -235,7 +237,8 @@ static void fp8_mega_moe(
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
                      num_ring_tokens,
-                     activation_clamp, fast_math,
+                     activation_clamp, activation_alpha, activation_up_bias,
+                     fast_math,
                      num_tokens_bound, l2_lag_encoded);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))

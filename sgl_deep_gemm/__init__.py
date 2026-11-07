@@ -462,6 +462,8 @@ def fp8_mega_moe(y: torch.Tensor,
                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
+                 activation_alpha: float = 1.0,
+                 activation_up_bias: float = 0.0,
                  activation_clamp: Optional[float] = None,
                  fast_math: bool = True,
                  num_tokens_bound: Optional[int] = None):
@@ -480,7 +482,7 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
-        activation, activation_clamp,
+        activation, activation_alpha, activation_up_bias, activation_clamp,
         fast_math,
         int(num_tokens_bound) if num_tokens_bound is not None else 0
     )

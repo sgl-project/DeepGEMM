@@ -646,6 +646,7 @@ void dg_fp8_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l1
                      at::IntArrayRef sym_buffer_ptrs, int64_t rank_idx,
                      int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                      at::IntArrayRef recipe, const std::string& activation,
+                     double activation_alpha, double activation_up_bias,
                      std::optional<double> activation_clamp, bool fast_math, int64_t num_tokens_bound) {
     DG_HOST_ASSERT(0 <= num_tokens_bound and num_tokens_bound <= std::numeric_limits<int>::max());
     mega::fp8_mega_moe(
@@ -653,7 +654,8 @@ void dg_fp8_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l1
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs.vec(),
         static_cast<int>(rank_idx), static_cast<int>(num_max_tokens_per_rank),
         static_cast<int>(num_experts), static_cast<int>(num_topk), to_tuple3(recipe),
-        activation, to_optional_float(activation_clamp), fast_math, static_cast<int>(num_tokens_bound));
+        activation, static_cast<float>(activation_alpha), static_cast<float>(activation_up_bias),
+        to_optional_float(activation_clamp), fast_math, static_cast<int>(num_tokens_bound));
 }
 
 void dg_mega_moe_pre_dispatch(const Tensor& x, const Tensor& topk_idx, const Tensor& topk_weights,
@@ -873,7 +875,8 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("fp8_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l1_weights_sf, Tensor l2_weights, "
           "Tensor l2_weights_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "
-          "int[] recipe, str activation, float? activation_clamp, bool fast_math, int num_tokens_bound=0) -> ()");
+          "int[] recipe, str activation, float activation_alpha, float activation_up_bias, "
+          "float? activation_clamp, bool fast_math, int num_tokens_bound=0) -> ()");
     m.def("mega_moe_pre_dispatch(Tensor x, Tensor topk_idx, Tensor topk_weights, Tensor(a!) buf_x, "
           "Tensor(b!) buf_x_sf, Tensor(c!) buf_topk_idx, Tensor(d!) buf_topk_weights, int num_tokens, int group_size, "
           "str mma_type, Tensor(e!)? buf_x_scales, Tensor? expert_scales) -> ()");
