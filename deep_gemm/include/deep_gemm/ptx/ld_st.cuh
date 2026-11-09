@@ -117,8 +117,11 @@ struct SM100_U8x8_STSM_T {
 };
 
 /// Memory ordering
-CUTLASS_DEVICE void fence_acq_rel_cta() {
-    asm volatile("fence.acq_rel.cta;" ::: "memory");
+CUTLASS_DEVICE uint4 ld_acquire_shared(const uint4* ptr) {
+    uint4 ret;
+    asm volatile("ld.acquire.cta.shared::cta.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
 }
 
 /// Shared memory

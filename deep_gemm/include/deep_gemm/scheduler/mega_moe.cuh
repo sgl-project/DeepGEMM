@@ -279,14 +279,17 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {
         task_info_full_barriers[sched_stage_idx].wait(sched_phase);
-        task_info = task_infos[sched_stage_idx];
+        // Acquire loads, so the slot release cannot be performed before the reads complete
+        DG_STATIC_ASSERT(sizeof(task_info_t) == 2 * sizeof(uint4), "Invalid task info size");
+        const auto slot = reinterpret_cast<const uint4*>(task_infos + sched_stage_idx);
+        auto dst = reinterpret_cast<uint4*>(&task_info);
+        dst[0] = ptx::ld_acquire_shared(slot);
+        dst[1] = ptx::ld_acquire_shared(slot + 1);
         advance_sched_pipeline();
         return task_info.is_valid();
     }
 
     CUTLASS_DEVICE void release_task_info() const {
-        // Complete metadata reads before the scheduler can overwrite this slot.
-        ptx::fence_acq_rel_cta();
         task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);
     }
 
