@@ -283,8 +283,8 @@ struct MegaMoEScheduler {
         DG_STATIC_ASSERT(sizeof(task_info_t) == 2 * sizeof(uint4), "Invalid task info size");
         const auto slot = reinterpret_cast<const uint4*>(task_infos + sched_stage_idx);
         auto dst = reinterpret_cast<uint4*>(&task_info);
-        dst[0] = ptx::ld_acquire_shared(slot);
-        dst[1] = ptx::ld_acquire_shared(slot + 1);
+        dst[0] = ptx::ld_acquire_cta_shared(slot);
+        dst[1] = ptx::ld_acquire_cta_shared(slot + 1);
         advance_sched_pipeline();
         return task_info.is_valid();
     }

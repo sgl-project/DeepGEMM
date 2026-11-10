@@ -116,14 +116,6 @@ struct SM100_U8x8_STSM_T {
     }
 };
 
-/// Memory ordering
-CUTLASS_DEVICE uint4 ld_acquire_shared(const uint4* ptr) {
-    uint4 ret;
-    asm volatile("ld.acquire.cta.shared::cta.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
-    return ret;
-}
-
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
@@ -252,6 +244,13 @@ CUTLASS_DEVICE uint32_t ld_volatile_shared(const uint32_t* ptr) {
 CUTLASS_DEVICE uint32_t ld_acquire_cta_shared(const uint32_t* ptr) {
     uint32_t ret;
     asm volatile("ld.acquire.cta.shared::cta.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint4 ld_acquire_cta_shared(const uint4* ptr) {
+    uint4 ret;
+    asm volatile("ld.acquire.cta.shared::cta.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
     return ret;
 }
 
