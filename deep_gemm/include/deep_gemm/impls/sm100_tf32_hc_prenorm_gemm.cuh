@@ -288,6 +288,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 }
             }
             cute::tma_store_arrive();
+            cute::tma_store_wait<0>();
         }
 
         // Deallocate tensor memory by warp 1
