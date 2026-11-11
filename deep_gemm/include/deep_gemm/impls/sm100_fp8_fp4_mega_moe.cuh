@@ -621,7 +621,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                // The upper half tells the receiver that every SM of this rank has counted
+                // The receiver waits for `kNumSMs` per rank in the upper half. It is a constant here: the grid sync
+                // above, not this value, is what orders every SM's count before the read of the send count
                 const uint64_t expert_status = (static_cast<uint64_t>(kNumSMs) << 32) | expert_send_status[j];
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
@@ -1021,7 +1022,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
+            /* Before the NVLink barrier, there is a grid sync; the pull barrier's waiters rely on it */ true,
             /* At the end of kernel does not need to sync */ false
         );
     } else if (warp_idx == kNumDispatchWarps) {
@@ -2123,9 +2124,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            // Without the post-expert norm, each slot waits for its own rank right before its load, so the slots of
-            // ranks that are already done load while the others are awaited
+            // Without the post-expert norm, each slot waits for its own rank right before its load
             constexpr bool kWaitPerSlot = not kWithPostExpertNorm;
+            const auto print_peers_timeout = [&]() {
+                printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx);
+            };
             bool is_lane_ready = not is_routed;
             const auto wait_slot_ready = [&](const uint32_t& slot_idx) {
                 comm::wait_until([&]() {
@@ -2134,11 +2137,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (not is_lane_ready)
                         is_lane_ready = ptx::ld_acq_sys(peer_ready_ptr) == grid_idx;
                     return (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1) != 0;
-                }, [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+                }, print_peers_timeout);
             };
             if constexpr (not kWaitPerSlot) {
                 comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                                 [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+                                 print_peers_timeout);
             }
 
             // The RMS spans the full hidden dim, of which the L2 epilogue holds only

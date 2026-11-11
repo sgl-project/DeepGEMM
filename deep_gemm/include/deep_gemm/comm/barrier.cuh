@@ -76,8 +76,10 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
     if (sync_prologue)
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 
-    // `known_counter` is thread 0's copy of the barrier counter as of this barrier. With it, every SM waits on the
-    // signal word itself and the trailing grid sync is skipped
+    // `known_counter` is thread 0's copy of the barrier counter as of this barrier, read before SM 0 can advance it.
+    // With it, every SM waits on the signal word itself and the trailing grid sync is skipped.
+    // NOTES: the signal word must keep its target until every SM has read it, so the next NVLink barrier of the
+    // kernel must begin with a grid sync (`sync_prologue`)
     const bool wait_on_all_sms = known_counter != nullptr and sync_epilogue;
 
     // NVLink cross-rank barrier, only SM 0 signals
@@ -96,8 +98,10 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
 
         // Update status and wait arrival
         if (thread_idx == 0) {
-            if (sm_idx == 0)
+            if (sm_idx == 0) {
+                DG_DEVICE_ASSERT(known_counter == nullptr or ((*known_counter ^ status) & 3) == 0);
                 ptx::red_add(counter_ptr, 1);
+            }
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
             // SM90 traps after the wait loop: with a `trap;` inside the loop body ptxas allocates the registers of the region
@@ -106,8 +110,8 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
       !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT))
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                    printf("DeepGEMM NVLink barrier timeout: rank=%d, sm=%u, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, sm_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
                 }
             }
