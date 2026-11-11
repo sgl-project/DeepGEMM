@@ -31,8 +31,8 @@ struct MegaGateConfig {
 
     int num_token_cols;
     int num_gate_threads;
-    // Ranking teams: one gate warp per expert wave of a token, 0 if every gate warp ranks its own tokens
-    int num_teams;
+    // Tokens a CTA ranks wave-parallel (one gate warp per expert wave of a token), 0 if every gate warp ranks its own tokens
+    int num_wave_parallel_tokens;
 
     int num_stages, smem_size;
 
@@ -45,7 +45,7 @@ struct MegaGateConfig {
            << ", num_worker_groups=" << config.num_worker_groups << ", num_launch_sms=" << config.num_launch_sms
            << ", num_waves=" << config.num_waves
            << ", num_token_cols=" << config.num_token_cols << ", num_gate_threads=" << config.num_gate_threads
-           << ", num_teams=" << config.num_teams
+           << ", num_wave_parallel_tokens=" << config.num_wave_parallel_tokens
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size << ")";
         return os;
     }
@@ -179,16 +179,16 @@ static MegaGateConfig get_mega_gate_config(const int& num_tokens, const int& hid
                              static_cast<int>(mega_gate_layout::kSharedMemoryAlignment));
     DG_HOST_ASSERT(config.num_stages >= 2);
 
-    // Teams need the activation to rank (a scoring bias with split K), a single ranking round for the only token
+    // Wave-parallel ranking needs the activation to rank (a scoring bias with split K), a single ranking round for the only token
     // block of a CTA, and room for their waves in the weight stages
     const auto num_expert_waves = num_aligned_experts / kExpertAlignment;
-    const auto num_teams = num_gate_warpgroups * 4 / num_expert_waves;
-    const auto num_team_bytes = 2 * num_aligned_experts * static_cast<int>(sizeof(float));
+    const auto num_wave_parallel_tokens = num_gate_warpgroups * 4 / num_expert_waves;
+    const auto num_wave_exchange_bytes = 2 * num_aligned_experts * static_cast<int>(sizeof(float));
     const auto num_weight_stage_bytes = config.load_block_n * BLOCK_K * static_cast<int>(sizeof(cutlass::bfloat16_t));
-    const auto has_teams = has_scoring_bias and config.num_split_k > 1 and num_expert_waves > 1 and
-                           config.num_waves == 1 and config.block_tokens <= num_teams * config.num_logical_ctas and
-                           num_teams * num_team_bytes <= config.num_stages * num_weight_stage_bytes;
-    config.num_teams = has_teams ? num_teams : 0;
+    const auto is_wave_parallel = has_scoring_bias and config.num_split_k > 1 and num_expert_waves > 1 and
+                           config.num_waves == 1 and config.block_tokens <= num_wave_parallel_tokens * config.num_logical_ctas and
+                           num_wave_parallel_tokens * num_wave_exchange_bytes <= config.num_stages * num_weight_stage_bytes;
+    config.num_wave_parallel_tokens = is_wave_parallel ? num_wave_parallel_tokens : 0;
 
     // Print configs for the first time
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
