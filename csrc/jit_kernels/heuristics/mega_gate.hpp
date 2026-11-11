@@ -181,9 +181,9 @@ static MegaGateConfig get_mega_gate_config(const int& num_tokens, const int& hid
 
     // Wave-parallel ranking needs the activation to rank (a scoring bias with split K), a single ranking round for the only token
     // block of a CTA, and room for their waves in the weight stages
-    const auto num_expert_waves = num_aligned_experts / kExpertAlignment;
-    const auto num_wave_parallel_tokens = num_gate_warpgroups * 4 / num_expert_waves;
-    const auto num_wave_exchange_bytes = 2 * num_aligned_experts * static_cast<int>(sizeof(float));
+    const auto num_expert_waves = num_aligned_experts / static_cast<int>(mega_gate_layout::kNumExpertsPerWave);
+    const auto num_wave_parallel_tokens = config.num_gate_threads / 32 / num_expert_waves;
+    const auto num_wave_exchange_bytes = static_cast<int>(mega_gate_layout::get_num_wave_exchange_bytes(num_aligned_experts));
     const auto num_weight_stage_bytes = config.load_block_n * BLOCK_K * static_cast<int>(sizeof(cutlass::bfloat16_t));
     const auto is_wave_parallel = has_scoring_bias and config.num_split_k > 1 and num_expert_waves > 1 and
                            config.num_waves == 1 and config.block_tokens <= num_wave_parallel_tokens * config.num_logical_ctas and

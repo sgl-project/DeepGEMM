@@ -62,6 +62,11 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
     using SharedStorage = mega_gate_layout::SharedStorage;
     constexpr bool kCacheLogicalCount = mega_gate_layout::caches_logical_count(kNumRoutedExperts, kHasBias, kHasImageTokenMask, kHasPhysicalMap);
     constexpr bool kHasMetadataCache = kHasBias or kHasImageTokenMask or kCacheLogicalCount;
+    constexpr bool kHasScoringBias = kHasBias or kHasImageTokenMask;
+
+    // Row flags of a token; a token with one of `kFirstWaveOnlyFlags` is never ranked wave-parallel
+    constexpr uint32_t kFlagMasked = 1, kFlagForceRandom = 2, kFlagFixedRouting = 4, kFlagImageToken = 8;
+    constexpr uint32_t kFirstWaveOnlyFlags = kFlagMasked | kFlagForceRandom | kFlagFixedRouting;
 
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumEpilogueStages * UMMA_N>();
 
@@ -122,6 +127,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
 
     using Workspace = mega_gate_layout::Workspace<kNumSplitK, kNumRoutedExperts>;
     const Workspace workspace(gmem_scratch, gmem_score_barriers);
+    const auto num_x_stage_bytes = (block_tokens / kNumMmaCtas) * BLOCK_K * static_cast<uint32_t>(sizeof(cutlass::bfloat16_t));
     const auto get_effective_umma_n = [&](const uint32_t& token_block_idx) {
         return math::align(cute::min(block_tokens, num_tokens - token_block_idx * block_tokens), 16u);
     };
@@ -133,7 +139,6 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
     // Dispatch warps into different roles
     if (warp_idx == 0 and cute::elect_one_sync()) {
         // TMA load warp
-        const auto num_x_stage_bytes = (block_tokens / kNumMmaCtas) * BLOCK_K * static_cast<uint32_t>(sizeof(cutlass::bfloat16_t));
         // A CTA pair splits both the experts (UMMA M) and the tokens (UMMA N) between its two CTAs
         const auto expert_base_idx = expert_group_idx * kNumExpertsPerGroup + mma_cta_rank * LOAD_BLOCK_N;
         uint32_t stage_idx = 0, phase = 0;
@@ -169,7 +174,6 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
         // MMA issue warp
         auto instr_desc = cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
                                                       UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
-        const auto num_x_stage_bytes = (block_tokens / kNumMmaCtas) * BLOCK_K * static_cast<uint32_t>(sizeof(cutlass::bfloat16_t));
         auto x_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleMode>(
             mega_gate_layout::get_x_stage_ptr(smem_buffer, 0, num_x_stage_bytes), 0, 0);
         auto weight_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K, kSwizzleMode>(
@@ -275,8 +279,8 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             // Wave-parallel ranking: one warp per expert wave of a token activates its wave, the warp of the first
             // wave selects. The waves are exchanged through the weight stages, which are free once the only token block of
             // the CTA is computed
-            constexpr uint32_t kNumWaveExchangeBytes = 2 * kNumRoutedExperts * static_cast<uint32_t>(sizeof(float));
-            DG_STATIC_ASSERT(kNumWaveParallelTokens == 0 or ((kHasBias or kHasImageTokenMask) and kNumSplitK > 1 and kNumExpertWaves > 1),
+            constexpr uint32_t kNumWaveExchangeBytes = mega_gate_layout::get_num_wave_exchange_bytes(kNumRoutedExperts);
+            DG_STATIC_ASSERT(kNumWaveParallelTokens == 0 or (kHasScoringBias and kNumSplitK > 1 and kNumExpertWaves > 1),
                              "Wave-parallel ranking splits the activation of the expert waves");
             DG_STATIC_ASSERT(kNumWaveParallelTokens * kNumExpertWaves <= kNumGateWarps, "Too many wave-parallel tokens");
             const auto token_slot_idx = gate_warp_idx / kNumExpertWaves, warp_wave_idx = gate_warp_idx % kNumExpertWaves;
@@ -291,13 +295,13 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                 uint32_t flags = 0;
                 if (token_idx < token_end_idx) {
                     if constexpr (kHasMask)
-                        flags |= ptx::ld_volatile(mask + token_idx) ? 0u : 1u;
+                        flags |= ptx::ld_volatile(mask + token_idx) ? 0u : kFlagMasked;
                     if constexpr (kHasForceRandom)
-                        flags |= ptx::ld_volatile(force_random + token_idx) ? 2u : 0u;
+                        flags |= ptx::ld_volatile(force_random + token_idx) ? kFlagForceRandom : 0u;
                     if constexpr (kHasFixRoutingMask)
-                        flags |= ptx::ld_volatile(fix_routing_mask + token_idx) ? 4u : 0u;
+                        flags |= ptx::ld_volatile(fix_routing_mask + token_idx) ? kFlagFixedRouting : 0u;
                     if constexpr (kHasImageTokenMask)
-                        flags |= ptx::ld_volatile(image_token_mask + token_idx) ? 8u : 0u;
+                        flags |= ptx::ld_volatile(image_token_mask + token_idx) ? kFlagImageToken : 0u;
                 }
                 return flags;
             };
@@ -316,7 +320,6 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             ptx::tcgen05_after_thread_sync();
 
             const auto expert_group_base_idx = expert_group_idx * kNumExpertsPerGroup;
-            constexpr bool kHasScoringBias = kHasBias or kHasImageTokenMask;
             // sqrt-softplus is not linear: with split-K it is applied after summing the partials in the top-k loop,
             // with a single split it is applied on store and the selected score is re-read
             constexpr bool kScoreOnStore = kHasScoringBias and kNumSplitK == 1;
@@ -393,25 +396,23 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                         unbiased_score + bias_local[value_idx] : -cute::numeric_limits<float>::infinity();
                 }
             };
-            auto wave_parallel = false;
             if constexpr (kNumWaveParallelTokens > 0) {
-                const auto wave_exchange = reinterpret_cast<float*>(
-                    mega_gate_layout::get_weight_stage_ptr(smem_buffer, 0, num_stages,
-                        (block_tokens / kNumMmaCtas) * BLOCK_K * static_cast<uint32_t>(sizeof(cutlass::bfloat16_t)), kNumWeightStageBytes)) +
-                    token_slot_idx * (kNumWaveExchangeBytes / sizeof(float));
+                DG_STATIC_ASSERT(kNumExpertsPerLaneVector == 4, "A lane exchanges its vector of a wave with one 128-bit access");
+                const auto wave_exchange = mega_gate_layout::get_wave_exchange_ptr(
+                    smem_buffer, num_stages, num_x_stage_bytes, token_slot_idx, kNumRoutedExperts);
                 const auto get_wave_ptr = [&](const uint32_t& expert_wave_idx, const bool& is_unbiased) {
                     return wave_exchange + (is_unbiased ? kNumRoutedExperts : 0) + expert_wave_idx * kNumExpertsPerWave +
                            lane_idx * kNumExpertsPerLaneVector;
                 };
                 // Masked, random and fixed tokens are left to the warp of the first wave
-                wave_parallel = global_token_idx < token_end_idx and (next_token_flags & 7u) == 0;
-                DG_TRAP_ONLY_DEVICE_ASSERT(wave_parallel or global_token_idx >= token_end_idx or (next_token_flags & 7u) != 0);
+                const auto wave_parallel = global_token_idx < token_end_idx and (next_token_flags & kFirstWaveOnlyFlags) == 0;
                 if (wave_parallel) {
                     load_wave(global_token_idx, warp_wave_idx, 0);
-                    activate_wave(warp_wave_idx, 0, (next_token_flags & 8u) != 0);
-                    ptx::st_shared(get_wave_ptr(warp_wave_idx, false),
-                                   __float_as_uint(scores_local[0]), __float_as_uint(scores_local[1]),
-                                   __float_as_uint(scores_local[2]), __float_as_uint(scores_local[3]));
+                    activate_wave(warp_wave_idx, 0, (next_token_flags & kFlagImageToken) != 0);
+                    if (warp_wave_idx != 0)
+                        ptx::st_shared(get_wave_ptr(warp_wave_idx, false),
+                                       __float_as_uint(scores_local[0]), __float_as_uint(scores_local[1]),
+                                       __float_as_uint(scores_local[2]), __float_as_uint(scores_local[3]));
                     ptx::st_shared(get_wave_ptr(warp_wave_idx, true),
                                    __float_as_uint(unbiased_scores_local[0]), __float_as_uint(unbiased_scores_local[1]),
                                    __float_as_uint(unbiased_scores_local[2]), __float_as_uint(unbiased_scores_local[3]));
@@ -421,22 +422,20 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                     global_token_idx = token_end_idx;
                 } else if (wave_parallel) {
                     #pragma unroll
-                    for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx) {
+                    for (uint32_t expert_wave_idx = 1; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx)
                         *reinterpret_cast<float4*>(scores_local + expert_wave_idx * kNumExpertsPerLaneVector) =
                             ptx::ld_shared(reinterpret_cast<const float4*>(get_wave_ptr(expert_wave_idx, false)));
-                        *reinterpret_cast<float4*>(unbiased_scores_local + expert_wave_idx * kNumExpertsPerLaneVector) =
-                            ptx::ld_shared(reinterpret_cast<const float4*>(get_wave_ptr(expert_wave_idx, true)));
-                    }
                 }
             }
             // Every logical CTA of the block ranks a share of its tokens once all the splits are visible
             for (; global_token_idx < token_end_idx; global_token_idx += kNumRoundTokens) {
                 const auto token_flags = next_token_flags;
-                next_token_flags = load_token_flags(global_token_idx + kNumRoundTokens);
-                const auto is_masked = kHasMask and (token_flags & 1u) != 0;
-                const auto is_force_random = kHasForceRandom and (token_flags & 2u) != 0;
-                const auto has_fixed_routing = kHasFixRoutingMask and (token_flags & 4u) != 0;
-                const auto is_image_token = kHasImageTokenMask and (token_flags & 8u) != 0;
+                if constexpr (kNumWaveParallelTokens == 0)
+                    next_token_flags = load_token_flags(global_token_idx + kNumRoundTokens);
+                const auto is_masked = kHasMask and (token_flags & kFlagMasked) != 0;
+                const auto is_force_random = kHasForceRandom and (token_flags & kFlagForceRandom) != 0;
+                const auto has_fixed_routing = kHasFixRoutingMask and (token_flags & kFlagFixedRouting) != 0;
+                const auto is_image_token = kHasImageTokenMask and (token_flags & kFlagImageToken) != 0;
 
                 if (is_masked) {
                     epilogue::mega_gate::store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(
@@ -490,6 +489,12 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                 if constexpr (kNumSplitK == 1) {
                     if (lane_idx < kNumTopk)
                         selected_unbiased_score = load_reduced_score(global_token_idx, static_cast<uint32_t>(selected_expert_idx));
+                    __syncwarp();
+                } else if constexpr (kNumWaveParallelTokens > 0) {
+                    if (lane_idx < kNumTopk)
+                        selected_unbiased_score = ptx::ld_shared(
+                            mega_gate_layout::get_wave_exchange_ptr(smem_buffer, num_stages, num_x_stage_bytes, token_slot_idx, kNumRoutedExperts) +
+                            kNumRoutedExperts + selected_expert_idx);
                     __syncwarp();
                 } else {
                     selected_unbiased_score = epilogue::mega_gate::select_warp_expert_value<kNumExpertWaves>(
