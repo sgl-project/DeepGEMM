@@ -2132,8 +2132,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            // Without the post-expert norm, each slot waits for its own rank right before its load, so the slots of
+            // ranks that are already done load while the others are awaited
+            constexpr bool kWaitPerSlot = not kWithPostExpertNorm;
+            bool is_lane_ready = not is_routed;
+            const auto wait_slot_ready = [&](const uint32_t& slot_idx) {
+                comm::wait_until([&]() {
+                    if (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1)
+                        return true;
+                    if (not is_lane_ready)
+                        is_lane_ready = ptx::ld_acq_sys(peer_ready_ptr) == grid_idx;
+                    return (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1) != 0;
+                }, [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            };
+            if constexpr (not kWaitPerSlot) {
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                                 [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            }
 
             // The RMS spans the full hidden dim, of which the L2 epilogue holds only
             // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
@@ -2241,6 +2256,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Shared slot goes first, then routed slots in top-k order
                         const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        if constexpr (kWaitPerSlot)
+                            wait_slot_ready(slot_idx);
 
                         // Load FP8 / BF16 chunk
                         if (cute::elect_one_sync()) {
