@@ -558,18 +558,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 sum_sq_ptr[i] = 0.0f;
         }
 
+        uint32_t nvl_barrier_counter = 0;
+        if (thread_idx == 0)
+            nvl_barrier_counter = *workspace.get_nvl_barrier_counter_ptr();
+
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Get SM offset (~6.5 us)
+        // Get SM offset. An SM without tokens for an expert leaves its counter alone
+        constexpr uint32_t kNumExpertsPerDispatchThread = math::constexpr_ceil_div(kNumExperts, kNumDispatchThreads);
+        uint64_t expert_send_status[kNumExpertsPerDispatchThread];
         #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+        for (uint32_t j = 0; j < kNumExpertsPerDispatchThread; ++ j) {
+            const uint32_t i = j * kNumDispatchThreads + thread_idx;
+            expert_send_status[j] = 0;
+            if (i < kNumExperts) {
+                const uint64_t num_tokens_to_expert = shared_storage.expert_token_count[i];
+                if (num_tokens_to_expert != 0)
+                    expert_send_status[j] = ptx::atomic_add(workspace.get_expert_send_count_ptr(i), num_tokens_to_expert);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < kNumExpertsPerDispatchThread; ++ j) {
+            const uint32_t i = j * kNumDispatchThreads + thread_idx;
+            if (i < kNumExperts)
+                shared_storage.expert_token_count[i] = static_cast<uint32_t>(expert_send_status[j]);
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -601,10 +617,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+            for (uint32_t j = 0; j < kNumExpertsPerDispatchThread; ++ j) {
+                const uint32_t i = j * kNumDispatchThreads + thread_idx;
+                if (i < kNumExperts)
+                    expert_send_status[j] = *workspace.get_expert_send_count_ptr(i);
+            }
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumExpertsPerDispatchThread; ++ j) {
+                const uint32_t i = j * kNumDispatchThreads + thread_idx;
+                if (i >= kNumExperts)
+                    continue;
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                // The upper half tells the receiver that every SM of this rank has counted
+                const uint64_t expert_status = (static_cast<uint64_t>(kNumSMs) << 32) | (expert_send_status[j] & 0xffffffffull);
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
@@ -629,7 +655,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
+            /* After the NVLink barrier, every SM has seen it */ true,
+            &nvl_barrier_counter
         );
 
         // Ensure the epilogue barrier cannot run with the pull barrier
@@ -1003,7 +1030,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
+            /* At the end of kernel does not need to sync */ false,
+            &nvl_barrier_counter
         );
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
