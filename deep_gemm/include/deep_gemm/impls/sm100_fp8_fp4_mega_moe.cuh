@@ -558,19 +558,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 sum_sq_ptr[i] = 0.0f;
         }
 
+        uint32_t nvl_barrier_counter = 0;
+        if (thread_idx == 0)
+            nvl_barrier_counter = *workspace.get_nvl_barrier_counter_ptr();
+
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Get SM offset (~6.5 us)
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
-        }
+        // Get SM offset. An SM without tokens for an expert leaves its counter alone
+        constexpr uint32_t kNumExpertsPerDispatchThread = math::constexpr_ceil_div(kNumExperts, kNumDispatchThreads);
+        uint32_t expert_send_status[kNumExpertsPerDispatchThread] = {};
+        const auto for_each_thread_expert = [&](const auto& process) {
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumExpertsPerDispatchThread; ++ j) {
+                if (const uint32_t i = j * kNumDispatchThreads + thread_idx; i < kNumExperts)
+                    process(j, i);
+            }
+        };
+        for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
+            if (const uint64_t num_tokens_to_expert = shared_storage.expert_token_count[i]; num_tokens_to_expert != 0)
+                expert_send_status[j] = static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), num_tokens_to_expert));
+        });
+        for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
+            shared_storage.expert_token_count[i] = expert_send_status[j];
+        });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
@@ -600,14 +615,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+            for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
+                expert_send_status[j] = static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i));
+            });
+            for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                // The receiver waits for `kNumSMs` per rank in the upper half. It is a constant here: the grid sync
+                // above, not this value, is what orders every SM's count before the read of the send count
+                const uint64_t expert_status = (static_cast<uint64_t>(kNumSMs) << 32) | expert_send_status[j];
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
+                    dst_rank_idx) = expert_send_status[j];
                 if constexpr (kUseSimtPull) {
                     // NOTES: no return value, so the pushes of all experts are in flight together; the release of the
                     // NVLink barrier below orders them before the peers pull
@@ -619,7 +638,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                         expert_status);
                 }
-            }
+            });
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -629,7 +648,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
+            /* After the NVLink barrier, every SM has seen it */ true,
+            &nvl_barrier_counter
         );
 
         // Ensure the epilogue barrier cannot run with the pull barrier
@@ -1002,7 +1022,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
+            /* Before the NVLink barrier, there is a grid sync; the pull barrier's waiters rely on it */ true,
             /* At the end of kernel does not need to sync */ false
         );
     } else if (warp_idx == kNumDispatchWarps) {
@@ -2104,8 +2124,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
-                             [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            // Without the post-expert norm, each slot waits for its own rank right before its load
+            constexpr bool kWaitPerSlot = not kWithPostExpertNorm;
+            const auto print_peers_timeout = [&]() {
+                printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx);
+            };
+            bool is_lane_ready = not is_routed;
+            const auto wait_slot_ready = [&](const uint32_t& slot_idx) {
+                comm::wait_until([&]() {
+                    if (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1)
+                        return true;
+                    if (not is_lane_ready)
+                        is_lane_ready = ptx::ld_acq_sys(peer_ready_ptr) == grid_idx;
+                    return (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1) != 0;
+                }, print_peers_timeout);
+            };
+            if constexpr (not kWaitPerSlot) {
+                comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                                 print_peers_timeout);
+            }
 
             // The RMS spans the full hidden dim, of which the L2 epilogue holds only
             // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
@@ -2213,6 +2250,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Shared slot goes first, then routed slots in top-k order
                         const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        if constexpr (kWaitPerSlot)
+                            wait_slot_ready(slot_idx);
 
                         // Load FP8 / BF16 chunk
                         if (cute::elect_one_sync()) {
