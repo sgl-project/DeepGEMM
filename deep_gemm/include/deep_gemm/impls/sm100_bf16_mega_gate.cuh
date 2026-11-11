@@ -271,7 +271,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             const auto score_barrier_ptr = workspace.get_score_barrier_ptr(token_block_idx);
 
-            // The row flags of a token are fetched one ranking round ahead, so they are never queued behind the score waits
+            // The row flags of a token are fetched one ranking round ahead
             constexpr uint32_t kNumRoundTokens = kNumGateWarps * kNumLogicalCtas;
             constexpr uint32_t kNumExpertsPerLaneVector = mega_gate_layout::kNumExpertsPerLaneVector;
             constexpr uint32_t kNumExpertsPerWave = mega_gate_layout::kNumExpertsPerWave;
@@ -396,10 +396,10 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                         unbiased_score + bias_local[value_idx] : -cute::numeric_limits<float>::infinity();
                 }
             };
+            const auto wave_exchange = kNumWaveParallelTokens > 0 ?
+                mega_gate_layout::get_wave_exchange_ptr(smem_buffer, num_stages, num_x_stage_bytes, token_slot_idx, kNumRoutedExperts) : nullptr;
             if constexpr (kNumWaveParallelTokens > 0) {
                 DG_STATIC_ASSERT(kNumExpertsPerLaneVector == 4, "A lane exchanges its vector of a wave with one 128-bit access");
-                const auto wave_exchange = mega_gate_layout::get_wave_exchange_ptr(
-                    smem_buffer, num_stages, num_x_stage_bytes, token_slot_idx, kNumRoutedExperts);
                 const auto get_wave_ptr = [&](const uint32_t& expert_wave_idx, const bool& is_unbiased) {
                     return wave_exchange + (is_unbiased ? kNumRoutedExperts : 0) + expert_wave_idx * kNumExpertsPerWave +
                            lane_idx * kNumExpertsPerLaneVector;
@@ -492,9 +492,7 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                     __syncwarp();
                 } else if constexpr (kNumWaveParallelTokens > 0) {
                     if (lane_idx < kNumTopk)
-                        selected_unbiased_score = ptx::ld_shared(
-                            mega_gate_layout::get_wave_exchange_ptr(smem_buffer, num_stages, num_x_stage_bytes, token_slot_idx, kNumRoutedExperts) +
-                            kNumRoutedExperts + selected_expert_idx);
+                        selected_unbiased_score = ptx::ld_shared(wave_exchange + kNumRoutedExperts + selected_expert_idx);
                     __syncwarp();
                 } else {
                     selected_unbiased_score = epilogue::mega_gate::select_warp_expert_value<kNumExpertWaves>(
