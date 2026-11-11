@@ -25,7 +25,8 @@ static void sm100_bf16_mega_gate(const torch::Tensor& x, const torch::Tensor& we
                                  const int& num_routed_experts, const int& num_topk) {
     const auto num_aligned_experts = align(num_routed_experts, static_cast<int>(mega_gate_layout::kExpertAlignment));
 
-    const auto config = get_mega_gate_config(num_tokens, hidden, num_routed_experts, runtime->get_num_sms());
+    const auto config = get_mega_gate_config(num_tokens, hidden, num_routed_experts, runtime->get_num_sms(),
+                                             bias.has_value() or image_token_mask.has_value());
 
     // Score scratch: every split writes its slice of `[num_token_blocks * block_tokens, num_aligned_experts]`
     const auto num_token_blocks = ceil_div(num_tokens, config.block_tokens);
@@ -51,7 +52,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {}, {},
-        {},
+        {}, {},
         {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
@@ -59,7 +60,7 @@ static void __instantiate_kernel() {{
         hidden, num_aligned_experts,
         config.num_gate_threads,
         config.num_mma_ctas, config.num_split_k, config.num_expert_groups,
-        num_topk,
+        num_topk, config.num_wave_parallel_tokens,
         num_routed_experts != num_aligned_experts, bias.has_value(), image_token_mask.has_value(),
         mask.has_value(), fix_routing_mask.has_value(), force_random.has_value(),
         routing_args.to_physical_map != nullptr, routing_args.unmapped_topk_idx != nullptr));

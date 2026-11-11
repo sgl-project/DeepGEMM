@@ -50,9 +50,15 @@ CUTLASS_HOST_DEVICE constexpr bool caches_logical_count(const uint32_t num_route
     return has_physical_map and num_bias_cache_bytes + num_routed_experts * static_cast<uint32_t>(sizeof(int)) <= kNumMaxMetadataCacheBytes;
 }
 
+// Wave-parallel ranking exchanges the biased and the unbiased scores of a token between its warps
+CUTLASS_HOST_DEVICE constexpr uint32_t get_num_wave_exchange_bytes(const uint32_t num_routed_experts) {
+    return 2 * num_routed_experts * static_cast<uint32_t>(sizeof(float));
+}
+
 static constexpr uint32_t kNumMaxStages = 32;
 
-// Fixed SMEM header, followed by `num_stages` x stages then `num_stages` weight stages (runtime strides)
+// Fixed SMEM header, followed by `num_stages` x stages then `num_stages` weight stages (runtime strides).
+// The weight stages hold the wave exchange once the token block of the CTA is computed
 struct SharedStorage {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -73,6 +79,12 @@ CUTLASS_DEVICE cutlass::bfloat16_t* get_x_stage_ptr(uint8_t* smem_buffer, const 
 CUTLASS_DEVICE cutlass::bfloat16_t* get_weight_stage_ptr(uint8_t* smem_buffer, const uint32_t& stage_idx, const uint32_t& num_stages,
                                                          const uint32_t& x_stage_bytes, const uint32_t& w_stage_bytes) {
     return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + kStageDataOffset + num_stages * x_stage_bytes + stage_idx * w_stage_bytes);
+}
+
+CUTLASS_DEVICE float* get_wave_exchange_ptr(uint8_t* smem_buffer, const uint32_t& num_stages, const uint32_t& x_stage_bytes,
+                                            const uint32_t& token_slot_idx, const uint32_t& num_routed_experts) {
+    return reinterpret_cast<float*>(smem_buffer + kStageDataOffset + num_stages * x_stage_bytes +
+                                    token_slot_idx * get_num_wave_exchange_bytes(num_routed_experts));
 }
 
 // View over global score scratch: [num_token_blocks * block_tokens, kNumSplits, kNumExperts]
