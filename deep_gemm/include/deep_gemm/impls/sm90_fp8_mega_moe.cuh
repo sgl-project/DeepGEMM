@@ -660,14 +660,14 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t kBeforeCombineReduceBarrierTag   = 2;
 
     // Register reconfiguration counts (64512 budget). 256-epilogue-thread split-N decode: 64*48 + 64*40 + 256*168 = 48640;
-    // 2 math warpgroups on the 128x256 split-M tile: 64*104 + 64*104 + 256*200 = 64512 (setmaxnreg is warpgroup-collective,
-    // so the dispatch warps and the TMA loader warps share one count).
+    // 2 math warpgroups on the 128x256 split-M tile: 256*216 + 128*72 = 64512.
+    // setmaxnreg is warpgroup-collective, so dispatch and TMA loader warps share one count.
     constexpr bool kSplitMWide = BLOCK_M == 128 and BLOCK_N == 256 and
                                  kNumDispatchThreads == 64 and kNumNonEpilogueThreads == 64;
     constexpr uint32_t kNumEpilogueRegisters    =
-        kEpilogueRegisterBudget == 0 ? (kSplitMWide ? 200 : 168) : kEpilogueRegisterBudget;
-    constexpr uint32_t kNumDispatchRegisters = kSplitMWide ? 104 : 48;
-    constexpr uint32_t kNumNonEpilogueRegisters = kSplitMWide ? 104 : 40;
+        kEpilogueRegisterBudget == 0 ? (kSplitMWide ? 216 : 168) : kEpilogueRegisterBudget;
+    constexpr uint32_t kNumDispatchRegisters = kSplitMWide ? 72 : 48;
+    constexpr uint32_t kNumNonEpilogueRegisters = kSplitMWide ? 72 : 40;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -1657,6 +1657,14 @@ sm90_fp8_mega_moe_impl(void* y,
                 return mma::sm90::advance_smem_desc(desc_b_stage0, stage * SMEM_B_SIZE_PER_STAGE + byte_offset);
             };
 
+            // Offsets are in 16-byte units, matching the descriptor address field.
+            const auto stage_desc = [](const uint64_t& base, const uint32_t& lo_advance) {
+                cute::GmmaDescriptor d;
+                d.desc_ = base;
+                d.reg32_[0] += lo_advance;
+                return d.desc_;
+            };
+
             float final_accum[kAccumPerThread] = {};
 
             if constexpr (kReuseAccumAsFinal) {
@@ -1807,12 +1815,6 @@ sm90_fp8_mega_moe_impl(void* y,
                     uint64_t desc_b_wg = mma::sm90::make_smem_desc(smem_b[0] + smem_b_wg_offset, 1).desc_;
                     asm volatile("" : "+l"(desc_a_wg));
                     asm volatile("" : "+l"(desc_b_wg));
-                    const auto stage_desc = [](const uint64_t& base, const uint32_t& lo_advance) {
-                        cute::GmmaDescriptor d;
-                        d.desc_ = base;
-                        d.reg32_[0] += lo_advance;
-                        return d.desc_;
-                    };
                     // the four ratios prev -> cur of the rescale chain, exactly rescale_l1_final / rescale_l2_final's expressions
                     const auto ratio = [](const float& prev_a, const float& prev_w, const float& cur_a, const float& cur_w) {
                         return (prev_a * prev_w) * (kFastMath ? math::fast_rcp(cur_a * cur_w) : 1.0f / (cur_a * cur_w));
@@ -2012,9 +2014,20 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
             } else {
-                DG_STATIC_ASSERT(kNumSFGroupsPerWG == 1, "The promotion path assumes one weight-SF block per warpgroup tile");
                 float accum[kAccumPerThread];
 
+                // Keep base descriptors opaque so their bitfields are not rebuilt in the K loop.
+                uint64_t partial_desc_a_wg = 0, partial_desc_b_wg = 0;
+                if constexpr (WG_BLOCK_N == 256) {
+                    partial_desc_a_wg = mma::sm90::make_smem_desc(smem_a[0] + smem_a_wg_offset, 1).desc_;
+                    partial_desc_b_wg = mma::sm90::make_smem_desc(smem_b[0] + smem_b_wg_offset, 1).desc_;
+                    asm volatile("" : "+l"(partial_desc_a_wg));
+                    asm volatile("" : "+l"(partial_desc_b_wg));
+                }
+
+                // This branch uses per-128 activation scales in both linear layers.
+                constexpr uint32_t kMainloopUnroll = WG_BLOCK_N == 256 and kNumStages == 4 ? 4 : 1;
+                #pragma unroll kMainloopUnroll
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     full_barriers[stage_idx]->wait(phase);
                     if constexpr (kTrace) {
@@ -2036,15 +2049,57 @@ sm90_fp8_mega_moe_impl(void* y,
                     // L1 weight SF: (E, 2*IH/128, H/128) MN-major, N axis = [gate(IH/128), up(IH/128)]; with the gate/up gran-8 interleave a
                     // logical 128-wide N tile covers 64 gate + 64 up rows of the same original 128-row block, so gate_sf_n = sf_n_block_idx / 2,
                     // up_sf_n = IH/128 + sf_n_block_idx / 2. L2 weight SF: (E, H/128, IH/128) MN-major, one scalar per logical 128x128 tile.
-                    float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
+                    float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f, l2_sf_hi = 0.0f;
                     if (block_phase == sched::BlockPhase::Linear1) {
                         gate_sf = ptx::ld_shared(smem_weight_sf_wg + k_block_idx);
                         up_sf   = ptx::ld_shared(smem_weight_sf_wg + kL1SFKBlocks + k_block_idx);
                     } else {
                         l2_sf = ptx::ld_shared(smem_weight_sf_wg + k_block_idx);
+                        if constexpr (kNumSFGroupsPerWG > 1)
+                            l2_sf_hi = ptx::ld_shared(smem_weight_sf_wg + kL2SFKBlocks + k_block_idx);
                     }
 
-                    if (block_phase == sched::BlockPhase::Linear1) {
+                    if constexpr (WG_BLOCK_N == 256) {
+                        // Bound the temporary accumulator while preserving FP32 promotion per scale group.
+                        auto accumulate_n_chunks = [&]<bool IsL1>() {
+                            constexpr uint32_t kPartialN = 128;
+                            using PartialWGMMA = typename mma::sm90::FP8MMASelector<kPartialN>::type;
+                            constexpr uint32_t kPartialAccum = PartialWGMMA::kNumAccum;
+                            #pragma unroll
+                            for (uint32_t n = 0; n < WG_BLOCK_N / kPartialN; ++ n) {
+                                float partial[kPartialAccum];
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kPartialAccum; ++ i) ptx::warpgroup_fence_operand(partial[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0; k < BLOCK_K / PartialWGMMA::K; ++ k) {
+                                    const uint32_t k_off = k * PartialWGMMA::K;
+                                    auto desc_a = stage_desc(partial_desc_a_wg, stage_idx * (SMEM_A_SIZE_PER_STAGE >> 4) + (k_off >> 4));
+                                    auto desc_b = stage_desc(partial_desc_b_wg, stage_idx * (SMEM_B_SIZE_PER_STAGE >> 4) + ((n * kPartialN * BLOCK_K + k_off) >> 4));
+                                    PartialWGMMA::wgmma(desc_a, desc_b, partial, k);
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kPartialAccum; ++ i) ptx::warpgroup_fence_operand(partial[i]);
+                                ptx::warpgroup_wait<0>();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kPartialAccum / 4; ++ i) {
+                                    const float weight_sf = IsL1 ? ((i & 1u) ? up_sf : gate_sf)
+                                        : (n == 0 ? l2_sf : l2_sf_hi);
+                                    const uint32_t offset = n * kPartialAccum + i * 4;
+                                    final_accum[offset+0] += scale_a_0_lo * weight_sf * partial[i*4+0];
+                                    final_accum[offset+1] += scale_a_0_lo * weight_sf * partial[i*4+1];
+                                    final_accum[offset+2] += scale_a_1_lo * weight_sf * partial[i*4+2];
+                                    final_accum[offset+3] += scale_a_1_lo * weight_sf * partial[i*4+3];
+                                }
+                            }
+                        };
+                        if (block_phase == sched::BlockPhase::Linear1)
+                            accumulate_n_chunks.template operator()<true>();
+                        else
+                            accumulate_n_chunks.template operator()<false>();
+                        release_empty_stage(stage_idx);
+                    } else if (block_phase == sched::BlockPhase::Linear1) {
                         // Single per-128 K-block WGMMA group
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);

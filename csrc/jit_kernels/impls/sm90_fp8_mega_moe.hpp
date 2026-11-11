@@ -208,7 +208,8 @@ static void sm90_fp8_mega_moe(
     // a BLOCK_M outside the SM90 candidate set would index SF rows past the pool sized above
     DG_HOST_ASSERT(is_sm90_candidate_block_m(config.block_m) and
                    config.num_padded_sf_pool_tokens >= (num_data_pool_tokens / config.block_m) * align(config.block_m, 128));
-    const bool reuse_accum_as_final = config.block_m == 128;
+    // Keep cross-scale-group accumulation in CUDA FP32, outside FP8 WGMMA.
+    const bool reuse_accum_as_final = false;
     const bool default_split_mn_barrier_opt = config.block_m == 128 and config.block_n == 256;
     const bool decode_split_n_path = config.block_m == 64;
     const bool decode_split_n_bn256 =
