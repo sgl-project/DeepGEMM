@@ -25,7 +25,7 @@ namespace mega_gate_layout = layout::mega_gate;
 template <uint32_t SHAPE_K, uint32_t kNumRoutedExperts,
           uint32_t kNumGateThreads,
           uint32_t kNumMmaCtas, uint32_t kNumSplitK, uint32_t kNumExpertGroups,
-          uint32_t kNumTopk,
+          uint32_t kNumTopk, uint32_t kNumTeams,
           bool kHasPaddedExperts, bool kHasBias, bool kHasImageTokenMask,
           bool kHasMask, bool kHasFixRoutingMask, bool kHasForceRandom,
           bool kHasPhysicalMap, bool kHasUnmappedTopkIdx>
@@ -267,6 +267,43 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             const auto score_barrier_ptr = workspace.get_score_barrier_ptr(token_block_idx);
 
+            // The row flags of a token are fetched one ranking round ahead, so they are never queued behind the score waits
+            constexpr uint32_t kNumRoundTokens = kNumGateWarps * kNumLogicalCtas;
+            constexpr uint32_t kNumExpertsPerLaneVector = mega_gate_layout::kNumExpertsPerLaneVector;
+            constexpr uint32_t kNumExpertsPerWave = mega_gate_layout::kNumExpertsPerWave;
+            constexpr uint32_t kNumExpertWaves = kNumRoutedExperts / kNumExpertsPerWave;
+            // A team of warps ranks one token: every member activates one expert wave, the first one selects.
+            // Teams exchange their waves through the weight stages, which are free once the only token block of
+            // the CTA is computed
+            constexpr uint32_t kTeamSize = kNumExpertWaves;
+            constexpr uint32_t kNumTeamBytes = 2 * kNumRoutedExperts * static_cast<uint32_t>(sizeof(float));
+            DG_STATIC_ASSERT(kNumTeams == 0 or ((kHasBias or kHasImageTokenMask) and kNumSplitK > 1 and kTeamSize > 1),
+                             "Teams split the activation of the expert waves");
+            DG_STATIC_ASSERT(kNumTeams * kTeamSize <= kNumGateWarps, "Too many teams");
+            const auto team_idx = gate_warp_idx / kTeamSize, member_idx = gate_warp_idx % kTeamSize;
+            if constexpr (kNumTeams > 0) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(num_token_blocks <= num_worker_groups and
+                                           block_tokens <= kNumTeams * kNumLogicalCtas and
+                                           num_stages * kNumWeightStageBytes >= kNumTeams * kNumTeamBytes);
+            }
+            auto global_token_idx = kNumTeams == 0 ? token_base_idx + gate_warp_idx * kNumLogicalCtas + logical_cta_rank :
+                                    team_idx < kNumTeams ? token_base_idx + team_idx * kNumLogicalCtas + logical_cta_rank : token_end_idx;
+            const auto load_token_flags = [&](const uint32_t& token_idx) {
+                uint32_t flags = 0;
+                if (token_idx < token_end_idx) {
+                    if constexpr (kHasMask)
+                        flags |= ptx::ld_volatile(mask + token_idx) ? 0u : 1u;
+                    if constexpr (kHasForceRandom)
+                        flags |= ptx::ld_volatile(force_random + token_idx) ? 2u : 0u;
+                    if constexpr (kHasFixRoutingMask)
+                        flags |= ptx::ld_volatile(fix_routing_mask + token_idx) ? 4u : 0u;
+                    if constexpr (kHasImageTokenMask)
+                        flags |= ptx::ld_volatile(image_token_mask + token_idx) ? 8u : 0u;
+                }
+                return flags;
+            };
+            auto next_token_flags = load_token_flags(global_token_idx);
+
             // The first logical CTA re-arms the score barrier of this block for the current grid
             if (gate_warp_idx == kNumGateWarps - 1 and kNumLogicalCtas > 1 and cute::elect_one_sync()) {
                 if (logical_cta_rank == 0)
@@ -321,14 +358,86 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
             };
             // Masked rows are never checked, so padded rows may hold non-finite scores
             auto gate_is_valid = true;
+            float unbiased_scores_local[kNumExpertWaves * kNumExpertsPerLaneVector];
+            float scores_local[kNumExpertWaves * kNumExpertsPerLaneVector];
+            const auto load_wave = [&](const uint32_t& token_idx, const uint32_t& expert_wave_idx, const uint32_t& local_wave_idx) {
+                const auto global_expert_base_idx = expert_wave_idx * kNumExpertsPerWave + lane_idx * kNumExpertsPerLaneVector;
+                auto& score_values = *reinterpret_cast<float4*>(scores_local + local_wave_idx * kNumExpertsPerLaneVector);
+                load_scores(token_idx, global_expert_base_idx, score_values);
+            };
+            const auto activate_wave = [&](const uint32_t& expert_wave_idx, const uint32_t& local_wave_idx, const bool& is_image_token) {
+                const auto global_expert_base_idx = expert_wave_idx * kNumExpertsPerWave + lane_idx * kNumExpertsPerLaneVector;
+                const auto local_expert_base_idx = local_wave_idx * kNumExpertsPerLaneVector;
+                auto& score_values = *reinterpret_cast<float (*)[kNumExpertsPerLaneVector]>(scores_local + local_expert_base_idx);
+                if constexpr (kHasScoringBias and kNumSplitK > 1)
+                    epilogue::mega_gate::sqrt_softplus(score_values);
+                const float* bias_ptr = nullptr;
+                if constexpr (kHasBias)
+                    bias_ptr = smem_bias;
+                if constexpr (kHasImageTokenMask)
+                    bias_ptr = is_image_token ? smem_image_bias : bias_ptr;
+                const auto bias_values = bias_ptr ?
+                    ptx::ld_shared(reinterpret_cast<const float4*>(bias_ptr + global_expert_base_idx)) :
+                    make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                const auto bias_local = reinterpret_cast<const float*>(&bias_values);
+                // Only the last wave can hold padded experts
+                const auto is_valid_expert = not kHasPaddedExperts or
+                                             expert_wave_idx + 1 < kNumExpertWaves or
+                                             global_expert_base_idx < routing_args.num_routed_experts;
+                #pragma unroll
+                for (uint32_t value_idx = 0; value_idx < kNumExpertsPerLaneVector; ++ value_idx) {
+                    const auto unbiased_score = score_values[value_idx];
+                    gate_is_valid = gate_is_valid and (not is_valid_expert or isfinite(unbiased_score));
+                    if constexpr (kNumSplitK > 1)
+                        unbiased_scores_local[local_expert_base_idx + value_idx] = unbiased_score;
+                    scores_local[local_expert_base_idx + value_idx] = is_valid_expert ?
+                        unbiased_score + bias_local[value_idx] : -cute::numeric_limits<float>::infinity();
+                }
+            };
+            auto team_ranked = false;
+            if constexpr (kNumTeams > 0) {
+                const auto team_scores = reinterpret_cast<float*>(
+                    mega_gate_layout::get_weight_stage_ptr(smem_buffer, 0, num_stages,
+                        (block_tokens / kNumMmaCtas) * BLOCK_K * static_cast<uint32_t>(sizeof(cutlass::bfloat16_t)), kNumWeightStageBytes)) +
+                    team_idx * (kNumTeamBytes / sizeof(float));
+                const auto get_wave_ptr = [&](const uint32_t& expert_wave_idx, const bool& is_unbiased) {
+                    return team_scores + (is_unbiased ? kNumRoutedExperts : 0) + expert_wave_idx * kNumExpertsPerWave +
+                           lane_idx * kNumExpertsPerLaneVector;
+                };
+                // Masked, random and fixed tokens are left to the first member
+                team_ranked = global_token_idx < token_end_idx and (next_token_flags & 7u) == 0;
+                DG_TRAP_ONLY_DEVICE_ASSERT(team_ranked or global_token_idx >= token_end_idx or (next_token_flags & 7u) != 0);
+                if (team_ranked) {
+                    load_wave(global_token_idx, member_idx, 0);
+                    activate_wave(member_idx, 0, (next_token_flags & 8u) != 0);
+                    ptx::st_shared(get_wave_ptr(member_idx, false),
+                                   __float_as_uint(scores_local[0]), __float_as_uint(scores_local[1]),
+                                   __float_as_uint(scores_local[2]), __float_as_uint(scores_local[3]));
+                    ptx::st_shared(get_wave_ptr(member_idx, true),
+                                   __float_as_uint(unbiased_scores_local[0]), __float_as_uint(unbiased_scores_local[1]),
+                                   __float_as_uint(unbiased_scores_local[2]), __float_as_uint(unbiased_scores_local[3]));
+                }
+                cutlass::arch::NamedBarrier::sync(kNumGateThreads, 0);
+                if (member_idx != 0) {
+                    global_token_idx = token_end_idx;
+                } else if (team_ranked) {
+                    #pragma unroll
+                    for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx) {
+                        *reinterpret_cast<float4*>(scores_local + expert_wave_idx * kNumExpertsPerLaneVector) =
+                            ptx::ld_shared(reinterpret_cast<const float4*>(get_wave_ptr(expert_wave_idx, false)));
+                        *reinterpret_cast<float4*>(unbiased_scores_local + expert_wave_idx * kNumExpertsPerLaneVector) =
+                            ptx::ld_shared(reinterpret_cast<const float4*>(get_wave_ptr(expert_wave_idx, true)));
+                    }
+                }
+            }
             // Every logical CTA of the block ranks a share of its tokens once all the splits are visible
-            for (uint32_t global_token_idx = token_base_idx + gate_warp_idx * kNumLogicalCtas + logical_cta_rank;
-                 global_token_idx < token_end_idx;
-                 global_token_idx += kNumGateWarps * kNumLogicalCtas) {
-                const auto is_masked = kHasMask and not mask[global_token_idx];
-                const auto is_force_random = kHasForceRandom and force_random[global_token_idx];
-                const auto has_fixed_routing = kHasFixRoutingMask and fix_routing_mask[global_token_idx];
-                const auto is_image_token = kHasImageTokenMask and image_token_mask[global_token_idx];
+            for (; global_token_idx < token_end_idx; global_token_idx += kNumRoundTokens) {
+                const auto token_flags = next_token_flags;
+                next_token_flags = load_token_flags(global_token_idx + kNumRoundTokens);
+                const auto is_masked = kHasMask and (token_flags & 1u) != 0;
+                const auto is_force_random = kHasForceRandom and (token_flags & 2u) != 0;
+                const auto has_fixed_routing = kHasFixRoutingMask and (token_flags & 4u) != 0;
+                const auto is_image_token = kHasImageTokenMask and (token_flags & 8u) != 0;
 
                 if (is_masked) {
                     epilogue::mega_gate::store_token_outputs<kNumTopk, kHasUnmappedTopkIdx>(
@@ -359,48 +468,14 @@ sm100_bf16_mega_gate_impl(const __grid_constant__ cute::TmaDescriptor tensor_map
                         continue;
                     }
                 }
-                constexpr uint32_t kNumExpertsPerLaneVector = mega_gate_layout::kNumExpertsPerLaneVector;
-                constexpr uint32_t kNumExpertsPerWave = mega_gate_layout::kNumExpertsPerWave;
-                constexpr uint32_t kNumExpertWaves = kNumRoutedExperts / kNumExpertsPerWave;
-                float unbiased_scores_local[kNumExpertWaves * kNumExpertsPerLaneVector];
-                float scores_local[kNumExpertWaves * kNumExpertsPerLaneVector];
-                #pragma unroll
-                for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx) {
-                    const auto global_expert_base_idx = expert_wave_idx * kNumExpertsPerWave +
-                                                        lane_idx * kNumExpertsPerLaneVector;
-                    const auto local_expert_base_idx = expert_wave_idx * kNumExpertsPerLaneVector;
-                    auto& score_values = *reinterpret_cast<float4*>(scores_local + local_expert_base_idx);
-                    load_scores(global_token_idx, global_expert_base_idx, score_values);
-                }
-                #pragma unroll
-                for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx) {
-                    const auto global_expert_base_idx = expert_wave_idx * kNumExpertsPerWave + lane_idx * kNumExpertsPerLaneVector;
-                    const auto local_expert_base_idx = expert_wave_idx * kNumExpertsPerLaneVector;
-                    auto& score_values = *reinterpret_cast<float (*)[kNumExpertsPerLaneVector]>(scores_local + local_expert_base_idx);
-                    if constexpr (kHasScoringBias and kNumSplitK > 1)
-                        epilogue::mega_gate::sqrt_softplus(score_values);
-                    const float* bias_ptr = nullptr;
-                    if constexpr (kHasBias)
-                        bias_ptr = smem_bias;
-                    if constexpr (kHasImageTokenMask)
-                        bias_ptr = is_image_token ? smem_image_bias : bias_ptr;
-                    const auto bias_values = bias_ptr ?
-                        ptx::ld_shared(reinterpret_cast<const float4*>(bias_ptr + global_expert_base_idx)) :
-                        make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                    const auto bias_local = reinterpret_cast<const float*>(&bias_values);
-                    // Only the last wave can hold padded experts
-                    const auto is_valid_expert = not kHasPaddedExperts or
-                                                 expert_wave_idx + 1 < kNumExpertWaves or
-                                                 global_expert_base_idx < routing_args.num_routed_experts;
+                // A team block has one ranking round, and the tokens a team skips never get here
+                if constexpr (kNumTeams == 0) {
                     #pragma unroll
-                    for (uint32_t value_idx = 0; value_idx < kNumExpertsPerLaneVector; ++ value_idx) {
-                        const auto unbiased_score = score_values[value_idx];
-                        gate_is_valid = gate_is_valid and (not is_valid_expert or isfinite(unbiased_score));
-                        if constexpr (kNumSplitK > 1)
-                            unbiased_scores_local[local_expert_base_idx + value_idx] = unbiased_score;
-                        scores_local[local_expert_base_idx + value_idx] = is_valid_expert ?
-                            unbiased_score + bias_local[value_idx] : -cute::numeric_limits<float>::infinity();
-                    }
+                    for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx)
+                        load_wave(global_token_idx, expert_wave_idx, expert_wave_idx);
+                    #pragma unroll
+                    for (uint32_t expert_wave_idx = 0; expert_wave_idx < kNumExpertWaves; ++ expert_wave_idx)
+                        activate_wave(expert_wave_idx, expert_wave_idx, is_image_token);
                 }
 
                 int selected_expert_idx = -1;

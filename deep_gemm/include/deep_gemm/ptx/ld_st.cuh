@@ -335,6 +335,12 @@ CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE bool ld_volatile(const bool* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.global.u8 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret != 0;
+}
+
 CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
     uint32_t ret;
     asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
