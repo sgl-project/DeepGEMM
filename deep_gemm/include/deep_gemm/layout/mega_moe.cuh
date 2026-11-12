@@ -73,6 +73,9 @@ struct alignas(128) MegaMoESignals {
     // rank are done. Dispatch clears readiness before its NVLink barrier because graph replays reuse grid IDs.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
+    // Broadcast output readiness: `output_ready_grid_idx[peer] == own grid index` means the peer's combined rows
+    // are written into this rank's gathered `y`. Cleared with `combine_ready_grid_idx`.
+    alignas(128) uint64_t output_ready_grid_idx[kNumMaxRanks];
 
     // Expert token counts
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
@@ -175,6 +178,11 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_combine_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
         return signals->combine_ready_grid_idx + peer_rank_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_output_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
+        return signals->output_ready_grid_idx + peer_rank_idx;
     }
 
     CUTLASS_DEVICE
