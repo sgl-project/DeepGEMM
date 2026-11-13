@@ -113,6 +113,7 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.gathered_y = None
 
 
 # TODO: remove this function
@@ -274,7 +275,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     if broadcast_y:
-        assert sym_buffer.gathered_y is not None and y.data_ptr() == sym_buffer.gathered_y.data_ptr(), \
+        # NOTES: an empty `y` has a null `data_ptr()`, so compare storage and offset
+        gathered_y = sym_buffer.gathered_y
+        assert gathered_y is not None and y.dtype == gathered_y.dtype and \
+            y.untyped_storage().data_ptr() == gathered_y.untyped_storage().data_ptr() and \
+            y.storage_offset() == gathered_y.storage_offset(), \
             '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':

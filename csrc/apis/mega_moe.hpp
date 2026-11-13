@@ -219,9 +219,11 @@ static void fp8_fp4_mega_moe(
     // Config checks; a broadcast `y` holds every rank's rows (rank-major) inside the symmetric buffer
     const auto num_ranks_y = broadcast_y ? static_cast<int>(sym_buffer_ptrs.size()) : 1;
     DG_HOST_ASSERT(y.size(0) % num_ranks_y == 0);
-    DG_HOST_ASSERT(not broadcast_y or (
-        static_cast<const uint8_t*>(y.data_ptr()) >= static_cast<const uint8_t*>(sym_buffer.data_ptr()) and
-        static_cast<const uint8_t*>(y.data_ptr()) + y.nbytes() <= static_cast<const uint8_t*>(sym_buffer.data_ptr()) + sym_buffer.nbytes()));
+    // NOTES: an empty `y` has a null `data_ptr()`, so locate it through its storage
+    const int64_t y_offset = broadcast_y ?
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(y.storage().data()) - reinterpret_cast<uintptr_t>(sym_buffer.data_ptr())) +
+        y.storage_offset() * y.element_size() : 0;
+    DG_HOST_ASSERT(not broadcast_y or (y_offset >= 0 and y_offset + static_cast<int64_t>(y.nbytes()) <= static_cast<int64_t>(sym_buffer.nbytes())));
     const auto num_tokens = static_cast<int>(y.size(0)) / num_ranks_y;
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and (rk == 32 or rk == 16));
@@ -420,10 +422,16 @@ static void fp8_fp4_mega_moe(
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
-    // Zero the entire symmetric buffer for debug mode
+    // Zero the symmetric buffer for debug mode, except a broadcast `y`
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
-        sym_buffer.zero_();
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG")) {
+        if (broadcast_y) {
+            sym_buffer.slice(0, 0, y_offset).zero_();
+            sym_buffer.slice(0, y_offset + static_cast<int64_t>(y.nbytes())).zero_();
+        } else {
+            sym_buffer.zero_();
+        }
+    }
 }
 
 static void bf16_mega_moe(
