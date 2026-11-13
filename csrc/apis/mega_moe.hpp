@@ -47,8 +47,8 @@ get_symm_buffer_size_for_mega_moe(
 
     // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
+    DG_HOST_ASSERT(parse_activation(activation) != MegaMoEActivation::SiTU or
+                   mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -240,11 +240,10 @@ static void fp8_fp4_mega_moe(
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
-    DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
-    const bool use_situ = activation == "situ";
-    const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
+    const auto activation_kind = parse_activation(activation);
+    DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or
+                   mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
+    DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or not activation_clamp_opt.has_value());
     // K3 SiTU config (activation_situ_{beta,linear_beta}). Passed to the kernel as template
     // parameters: it only takes its equal-transform shortcut for this pair, and computes the
     // literal SiTU for any other.
@@ -403,7 +402,7 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, swiglu_alpha, use_situ, fast_math,
+                               activation_clamp, activation_kind, fast_math,
                                use_x_scales,
                                l1_alphas.has_value()
                                    ? l1_alphas->const_data_ptr<float>() : nullptr,
@@ -461,7 +460,7 @@ static void bf16_mega_moe(
     const auto weight_layout = parse_weight_layout(weight_layout_str);
     DG_HOST_ASSERT(weight_layout != MegaMoEWeightLayout::GateUpInterleaved);
     const bool use_trtllm_weights = weight_layout == MegaMoEWeightLayout::TrtLLM;
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(parse_activation(activation) == MegaMoEActivation::SwiGLU);
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
 
     // Activation checks

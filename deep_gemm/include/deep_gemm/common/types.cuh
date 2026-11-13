@@ -12,6 +12,15 @@ enum class MmaKind {
     NVFP4       = 3,
 };
 
+// MegaMoE L1 epilogue activation
+enum class MegaMoEActivation {
+    SwiGLU      = 0,
+    // SwiGLU with `sigmoid(1.702 * gate)`
+    SwiGLUOAI   = 1,
+    // Tanh-bounded gate and soft-clipped up
+    SiTU        = 2,
+};
+
 // How MegaMoE expert weights and their SFs are stored
 enum class MegaMoEWeightLayout {
     // `transform_weights_for_mega_moe` output

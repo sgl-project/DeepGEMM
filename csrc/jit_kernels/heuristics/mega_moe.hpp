@@ -129,6 +129,24 @@ static std::string to_mma_kind_name(const MmaKind& mma_kind) {
     DG_HOST_UNREACHABLE("Unknown MMA kind");
 }
 
+static MegaMoEActivation parse_activation(const std::string& activation_str) {
+    if (activation_str == "swiglu")
+        return MegaMoEActivation::SwiGLU;
+    if (activation_str == "swigluoai")
+        return MegaMoEActivation::SwiGLUOAI;
+    DG_HOST_ASSERT(activation_str == "situ");
+    return MegaMoEActivation::SiTU;
+}
+
+static std::string to_activation_name(const MegaMoEActivation& activation) {
+    switch (activation) {
+        case MegaMoEActivation::SwiGLU:     return "MegaMoEActivation::SwiGLU";
+        case MegaMoEActivation::SwiGLUOAI:  return "MegaMoEActivation::SwiGLUOAI";
+        case MegaMoEActivation::SiTU:       return "MegaMoEActivation::SiTU";
+    }
+    DG_HOST_UNREACHABLE("Unknown activation");
+}
+
 static MegaMoEWeightLayout parse_weight_layout(const std::string& weight_layout_str) {
     if (weight_layout_str == "megamoe")
         return MegaMoEWeightLayout::MegaMoE;

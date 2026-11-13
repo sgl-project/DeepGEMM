@@ -104,8 +104,7 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
-    float kSwiGLUAlpha,
-    bool kUseSitu,
+    MegaMoEActivation kActivation,
     bool kFastMath,
     bool kUseXScales,
     bool kWithL1Alphas,
@@ -177,6 +176,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseTrtllmWeights = kWeightLayout == MegaMoEWeightLayout::TrtLLM;
     constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved;
+    constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
+    constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = ptx::Allocator2Sm;
 
