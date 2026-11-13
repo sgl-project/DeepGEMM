@@ -603,7 +603,7 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
                          const OptTensor& l1_alphas, const OptTensor& l2_alphas, const OptTensor& l2_act_scales,
                          bool post_expert_norm, const OptTensor& post_expert_norm_weight,
                          double post_expert_norm_eps, bool post_expert_norm_weight_first,
-                         bool use_trtllm_weights, bool use_inkling2_weights,
+                         const std::string& weight_layout,
                          std::optional<int64_t> global_num_tokens, bool broadcast_y) {
     DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l1_weights_sf.has_value());
     DG_HOST_ASSERT(shared_l2_weights.has_value() == shared_l2_weights_sf.has_value());
@@ -619,7 +619,7 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
         mma_type, activation, to_optional_float(activation_clamp), fast_math, use_x_scales,
         l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight, static_cast<float>(post_expert_norm_eps),
-        post_expert_norm_weight_first, use_trtllm_weights, global_num_tokens, use_inkling2_weights, broadcast_y);
+        post_expert_norm_weight_first, weight_layout, global_num_tokens, broadcast_y);
 }
 
 void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l2_weights,
@@ -630,7 +630,7 @@ void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l
                       const std::string& activation, std::optional<double> activation_clamp, bool fast_math,
                       bool post_expert_norm, const OptTensor& post_expert_norm_weight,
                       double post_expert_norm_eps, bool post_expert_norm_weight_first,
-                      bool use_trtllm_weights, std::optional<int64_t> global_num_tokens) {
+                      const std::string& weight_layout, std::optional<int64_t> global_num_tokens) {
     mega::bf16_mega_moe(
         y, l1_weights, l2_weights, shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs.vec(),
@@ -638,7 +638,7 @@ void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l
         static_cast<int>(num_experts), static_cast<int>(num_topk),
         activation, to_optional_float(activation_clamp), fast_math,
         post_expert_norm, post_expert_norm_weight, static_cast<float>(post_expert_norm_eps),
-        post_expert_norm_weight_first, use_trtllm_weights, global_num_tokens);
+        post_expert_norm_weight_first, weight_layout, global_num_tokens);
 }
 
 void dg_fp8_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l1_weights_sf,
@@ -862,14 +862,14 @@ TORCH_LIBRARY(deep_gemm, m) {
           "int[] recipe, str mma_type, str activation, float? activation_clamp, bool fast_math, bool use_x_scales, "
           "Tensor? l1_alphas, Tensor? l2_alphas, Tensor? l2_act_scales, "
           "bool post_expert_norm, Tensor? post_expert_norm_weight, float post_expert_norm_eps, "
-          "bool post_expert_norm_weight_first, bool use_trtllm_weights, bool use_inkling2_weights, "
+          "bool post_expert_norm_weight_first, str weight_layout, "
           "int? global_num_tokens, bool broadcast_y) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights, "
           "Tensor? shared_l2_weights, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "
           "str activation, float? activation_clamp, bool fast_math, "
           "bool post_expert_norm, Tensor? post_expert_norm_weight, float post_expert_norm_eps, "
-          "bool post_expert_norm_weight_first, bool use_trtllm_weights, "
+          "bool post_expert_norm_weight_first, str weight_layout, "
           "int? global_num_tokens) -> ()");
     m.def("fp8_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l1_weights_sf, Tensor l2_weights, "
           "Tensor l2_weights_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "

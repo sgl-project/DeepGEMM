@@ -54,9 +54,10 @@ static void sm100_bf16_mega_moe(
     const bool& post_expert_norm,
     const bool& post_expert_norm_weight_first,
     const float& post_expert_norm_eps,
-    const bool& use_trtllm_weights = false,
+    const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::MegaMoE,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
+    const bool use_trtllm_weights = weight_layout == MegaMoEWeightLayout::TrtLLM;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -171,7 +172,7 @@ static void __instantiate_kernel() {{
         post_expert_norm_weight_first ? "true" : "false",
         post_expert_norm_weight != nullptr ? "true" : "false",
         to_string(post_expert_norm_eps),
-        use_trtllm_weights ? "true" : "false"));
+        to_weight_layout_name(weight_layout)));
 
     // Launch
     launch_with_shared_memory_mode(

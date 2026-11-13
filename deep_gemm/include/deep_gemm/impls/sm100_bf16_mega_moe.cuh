@@ -37,7 +37,7 @@ template <
     bool kPostNormWeightFirst = false,
     bool kPostNormHasWeight = false,
     float kPostNormEps = 1e-6f,
-    bool kUseTrtllmWeights = false,
+    MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::MegaMoE,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -72,6 +72,7 @@ sm100_bf16_mega_moe_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                          const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    constexpr bool kUseTrtllmWeights = kWeightLayout == MegaMoEWeightLayout::TrtLLM;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = ptx::Allocator2Sm;
 

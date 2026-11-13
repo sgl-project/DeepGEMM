@@ -129,6 +129,24 @@ static std::string to_mma_kind_name(const MmaKind& mma_kind) {
     DG_HOST_UNREACHABLE("Unknown MMA kind");
 }
 
+static MegaMoEWeightLayout parse_weight_layout(const std::string& weight_layout_str) {
+    if (weight_layout_str == "megamoe")
+        return MegaMoEWeightLayout::MegaMoE;
+    if (weight_layout_str == "trtllm")
+        return MegaMoEWeightLayout::TrtLLM;
+    DG_HOST_ASSERT(weight_layout_str == "gate_up_interleaved");
+    return MegaMoEWeightLayout::GateUpInterleaved;
+}
+
+static std::string to_weight_layout_name(const MegaMoEWeightLayout& weight_layout) {
+    switch (weight_layout) {
+        case MegaMoEWeightLayout::MegaMoE:              return "MegaMoEWeightLayout::MegaMoE";
+        case MegaMoEWeightLayout::TrtLLM:               return "MegaMoEWeightLayout::TrtLLM";
+        case MegaMoEWeightLayout::GateUpInterleaved:    return "MegaMoEWeightLayout::GateUpInterleaved";
+    }
+    DG_HOST_UNREACHABLE("Unknown weight layout");
+}
+
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4 or mma_kind == MmaKind::NVFP4;
 }
