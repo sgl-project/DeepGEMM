@@ -7,7 +7,7 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import align, per_block_cast_to_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
@@ -54,8 +54,8 @@ def _to_shared_mega_moe_sf_layout(sf: torch.Tensor, block_m: int, num_max_sf_tok
     return result
 
 
-def _cast_fp8_for_mega_moe(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+def _cast_fp8_for_mega_moe(x: torch.Tensor, gran_k: int = 32) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=gran_k, use_packed_ue8m0=True)
     mn, packed_sf_k = x_sf.shape
     x_sf_tma = torch.empty_strided(
         (mn, packed_sf_k), (1, align(mn, 4)), dtype=x_sf.dtype, device=x_sf.device)
@@ -84,9 +84,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
-    # `run_fused` passes this as the recipe's K granularity; it was never bound, so
-    # every non-BF16 run died with a `NameError`.
-    gran_k = 32
+    gran_k = args.gran_k
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -96,6 +94,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     shared_intermediate_hidden = intermediate_hidden * num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
+    assert gran_k == 32 or (args.mma_type == 'fp8xfp8' and num_shared_experts == 0 and
+                            hidden % 512 == 0 and intermediate_hidden % 512 == 0), \
+        'blockwise-128 (`--gran-k 128`) is an FP8 `fp8xfp8` routed-experts-only layout, ' \
+        'and needs hidden/intermediate divisible by 512'
 
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -103,7 +105,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        recipe=(1, 1, gran_k)
     )
 
     # Cast routed weights into FP4 or FP8
@@ -123,6 +126,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         for i in range(num_groups):
             w[i], w_sf[i] = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=32)
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
+    def _cast_weights_to_fp8_blockwise(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
+        w_sf_block = torch.empty((num_groups, n // 128, k // 128), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf_block[i] = per_block_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=128)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf_block, n, k, (128, 128), num_groups)
         return w, w_sf
 
     # Create inputs
@@ -163,14 +175,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
+            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x, gran_k)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
-            l1_weights = cast_weights(l1_weights)
-            l2_weights = cast_weights(l2_weights)
+            if gran_k == 128:
+                l1_weights = _cast_weights_to_fp8_blockwise(l1_weights)
+                l2_weights = _cast_weights_to_fp8_blockwise(l2_weights)
+            else:
+                cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
+                l1_weights = cast_weights(l1_weights)
+                l2_weights = cast_weights(l2_weights)
             if num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
@@ -286,6 +302,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > Recipe K granularity: {gran_k}', once_in_node=True)
     dist_print(f' > Localized weights: {args.use_localization}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
@@ -349,7 +366,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False,
                                'do_expand': True, 'use_tma_aligned_col_major_sf': True}
             gemm_fn = deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous
-            gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, 32)}
+            gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, gran_k)}
             swiglu_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
             get_num_tokens = lambda recv_x: recv_x[0].size(0)
 
@@ -398,7 +415,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             swiglu_result = tilelang_ops.swiglu_apply_weight_to_fp8(
                 x=l1_y, topk_weights=recv_topk_weights,
                 avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
-                num_per_channels=32, use_col_major_scales=True,
+                num_per_channels=gran_k, use_col_major_scales=True,
                 clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
                 **swiglu_kwargs)
             l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
@@ -563,6 +580,8 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
+    parser.add_argument('--gran-k', type=int, default=32, choices=(32, 128),
+                        help='Recipe K granularity; 128 = blockwise `(128, 128)` packed SFs (fp8xfp8, no shared experts)')
     parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires CUDA 13.4 locality domains, or MLOPart)')
 
     # Test settings

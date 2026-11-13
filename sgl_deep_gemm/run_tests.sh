@@ -207,6 +207,11 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
           --num-tokens 2048 --num-max-tokens-per-rank 2048 --hidden 1024 \
           --intermediate-hidden 512 --num-experts 8 --num-topk 2 --num-shared-experts 0 \
           --num-correctness-tests 1 --num-graph-correctness-tests 24
+        # Blockwise-128: packed per-128 weight SFs with the L2 activations quantized per 128
+        run_test test_mega_moe.py --num-processes 2 --mma-type fp8xfp8 --gran-k 128 \
+          --num-tokens 1024 --num-max-tokens-per-rank 1024 --hidden 1024 \
+          --intermediate-hidden 512 --num-experts 8 --num-topk 2 --num-shared-experts 0 \
+          --num-correctness-tests 1
       fi
     else
       skip_test test_mega_moe.py "deep_ep with ElasticBuffer not installed"
