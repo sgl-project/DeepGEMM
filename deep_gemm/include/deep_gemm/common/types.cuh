@@ -12,6 +12,25 @@ enum class MmaKind {
     NVFP4       = 3,
 };
 
+// MegaMoE L1 epilogue activation
+enum class MegaMoEActivation {
+    SwiGLU      = 0,
+    // SwiGLU with `sigmoid(1.702 * gate)`
+    SwiGLUOAI   = 1,
+    // Tanh-bounded gate and soft-clipped up
+    SiTU        = 2,
+};
+
+// How MegaMoE expert weights and their SFs are stored
+enum class MegaMoEWeightLayout {
+    // `transform_weights_for_mega_moe` output
+    MegaMoE             = 0,
+    // TRT-LLM (FlashInfer) shuffled rows, SFs in CUTLASS 128x4 atoms
+    TrtLLM              = 1,
+    // L1 rows alternate gate/up (gate 2i, up 2i + 1), SFs in CUTLASS 128x4 atoms
+    GateUpInterleaved   = 2,
+};
+
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
     switch (mma_kind) {
         case MmaKind::BF16:     return 2;

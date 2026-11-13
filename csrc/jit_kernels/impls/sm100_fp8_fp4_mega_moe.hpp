@@ -13,11 +13,11 @@
 
 namespace deep_gemm {
 
-// Inkling2 L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
+// `GateUpInterleaved` L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
 // the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 .. u14 g1 .. g15 u1 .. u15]
 // (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
 // (SMEM row 8p + i <- GMEM row 2i + p).
-static CUtensorMap make_inkling2_l1_tma_desc(
+static CUtensorMap make_interleaved_l1_tma_desc(
     const torch::Tensor& weights, const int inner_bytes, const int rows,
     const int load_block_n, const bool packed_fp4) {
     DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0);
@@ -48,10 +48,10 @@ static CUtensorMap make_inkling2_l1_tma_desc(
     return result;
 }
 
-// Inkling2 L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
-// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_inkling2_l1_tma_desc`.
+// `GateUpInterleaved` L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
+// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_interleaved_l1_tma_desc`.
 // The row block and k chunk dims are flattened, so one load covers one row block.
-static CUtensorMap make_inkling2_l1_sf_tma_desc(
+static CUtensorMap make_interleaved_l1_sf_tma_desc(
     const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks,
     const int& box_k_chunks, const bool packed_fp4) {
     DG_HOST_ASSERT(sf.is_contiguous() and box_k_chunks <= num_k_chunks);
@@ -146,8 +146,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const float& swiglu_alpha,
-    const bool& use_situ,
+    const MegaMoEActivation& activation,
     const bool& fast_math,
     const bool& use_x_scales,
     const float* l1_alphas,
@@ -159,13 +158,14 @@ static void sm100_fp8_fp4_mega_moe(
     const float& post_norm_eps,
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
-    const bool& use_trtllm_weights = false,
+    const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::MegaMoE,
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
     const float& situ_beta = 4.0f,
     const float& situ_linear_beta = 25.0f,
-    const bool& use_inkling2_weights = false,
     const bool& broadcast_y = false
 ) {
+    const bool use_trtllm_weights = weight_layout == MegaMoEWeightLayout::TrtLLM;
+    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -180,7 +180,7 @@ static void sm100_fp8_fp4_mega_moe(
         mma_kind, global_num_tokens,
         l1_weights.scalar_type() == kPackedFP4);
 
-    if (use_trtllm_weights or use_inkling2_weights) {
+    if (use_trtllm_weights or use_interleaved_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
     }
@@ -216,10 +216,10 @@ static void sm100_fp8_fp4_mega_moe(
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
     // TRT L1 rows are addressed as one 2D `[E * N, K]` matrix; the rest use the localizable 4D layout
-    const auto tensor_map_l1_weights = use_inkling2_weights ?
-        make_inkling2_l1_tma_desc(l1_weights, weight_inner(hidden),
-                                 num_experts_per_rank * intermediate_hidden * 2,
-                                 config.load_block_n, is_packed_fp4) :
+    const auto tensor_map_l1_weights = use_interleaved_weights ?
+        make_interleaved_l1_tma_desc(l1_weights, weight_inner(hidden),
+                                     num_experts_per_rank * intermediate_hidden * 2,
+                                     config.load_block_n, is_packed_fp4) :
         use_trtllm_weights ?
         make_tma_2d_desc(weight_tensor(l1_weights),
                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
@@ -227,7 +227,7 @@ static void sm100_fp8_fp4_mega_moe(
                          static_cast<int>(l1_weights.stride(-2)),
                          config.swizzle_weights_mode, 0, false, not is_packed_fp4) :
         make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l1_weights_sf = use_inkling2_weights ? make_inkling2_l1_sf_tma_desc(
+    const auto tensor_map_l1_weights_sf = use_interleaved_weights ? make_interleaved_l1_sf_tma_desc(
         l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4) :
         use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
@@ -260,7 +260,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
         make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l2_weights_sf = use_inkling2_weights ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l2_weights_sf = use_interleaved_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, true, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
         use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
@@ -351,10 +351,10 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -371,8 +371,7 @@ static void __instantiate_kernel() {{
     config.num_bytes_per_pull,
     config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
     num_sms, num_ranks,
-    to_string(activation_clamp), to_string(swiglu_alpha),
-    use_situ ? "true" : "false",
+    to_string(activation_clamp), to_activation_name(activation),
     fast_math ? "true" : "false",
     use_x_scales ? "true" : "false",
     (l1_alphas != nullptr) ? "true" : "false",
@@ -385,10 +384,9 @@ static void __instantiate_kernel() {{
     post_norm_weight_first ? "true" : "false",
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
-    use_trtllm_weights ? "true" : "false",
+    to_weight_layout_name(weight_layout),
     config.use_sm107_k64 ? "true" : "false",
     config.use_simt_pull ? "true" : "false",
-    use_inkling2_weights ? "true" : "false",
     broadcast_y ? "true" : "false"));
     // Launch
     launch_with_shared_memory_mode(
