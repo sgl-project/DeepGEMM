@@ -128,6 +128,8 @@ template <
     bool kUseSM107K64 = false,
     // SIMT dispatch pull (no SMEM send buffer)
     bool kUseSimtPull = false,
+    bool kUseInkling2Weights = false,
+    bool kBroadcastY = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -194,6 +196,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kUseTrtllmWeights or
                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
                      "TRT weight layout requires routed NVFP4 experts");
+    DG_STATIC_ASSERT(not kUseInkling2Weights or
+                     (not kUseTrtllmWeights and kNumSharedExperts == 0 and
+                      (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
+                                                      cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
+                     "Inkling2 weight layout requires routed NVFP4 or FP8xFP8 experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -611,6 +618,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Graph replays reuse grid IDs. Clear local readiness before the
                 // dispatch NVLink barrier permits this launch's peer notifications.
                 *workspace.get_combine_ready_grid_idx_ptr(thread_idx) = 0;
+                if constexpr (kBroadcastY)
+                    *workspace.get_output_ready_grid_idx_ptr(thread_idx) = 0;
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
             }
             __syncwarp();
@@ -1182,6 +1191,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         else
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
+                } else if constexpr (kUseInkling2Weights) {
+                    // Inkling2 weights: L1 rows reordered into the `megamoe` SMEM order by the
+                    // descriptor; L2 rows are plain. SFs are CUTLASS 128x4 atoms (TRT SMEM order).
+                    const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
+                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                    const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                    auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                    if (is_l1) {
+                        #pragma unroll
+                        for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
+                            auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
+                            if (cute::elect_one_sync()) {
+                                if constexpr (kIsWeightFP8) {
+                                    cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                        tensor_map_b_ptr, full, cache_hint, tile,
+                                        k_idx + atom * 128, 0, 0, expert_n_idx / 16);
+                                } else {
+                                    cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                        tensor_map_b_ptr, full, cache_hint, tile,
+                                        k_idx + atom * 128, 0, 0, 0, expert_n_idx / 32);
+                                }
+                            }
+                        }
+                    } else if (cute::elect_one_sync()) {
+                        tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    }
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        const uint32_t sf_row_block = expert_n_idx / 128;
+                        const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
+                        if (is_l1) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < BLOCK_N / 128; ++ i)
+                                cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                    tensor_map_sfb_ptr, full, cache_hint,
+                                    shared_storage.smem_sfb[stage_idx] + i * kNumSFChunksPerBlock * kNumUTCCPAlignedElems,
+                                    0, 0, 0, 0, (sf_row_block + i) * shape_sfb_k + sf_k_chunk);
+                        } else {
+                            cute::SM100_TMA_2SM_LOAD_3D::copy(
+                                tensor_map_sfb_ptr, full, cache_hint, shared_storage.smem_sfb[stage_idx],
+                                0, sf_k_chunk, sf_row_block);
+                        }
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
                 } else if (cute::elect_one_sync()) {
                     if (is_split_k) {
                         tma::copy_nd<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, shared_b_dtype_t, 4>(
@@ -1322,7 +1380,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                    (kUseTrtllmWeights
+                                    ((kUseTrtllmWeights or kUseInkling2Weights)
                                         ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                         : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -2406,9 +2464,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
-                // TMA store the BF16 chunk to gmem y. Output byte offset still
-                // tracks BF16 chunks (= kNumChunkBytes).
-                if (cute::elect_one_sync()) {
+                // Broadcast: every rank's gathered `y` (in the symmetric buffer) gets this row at
+                // `rank_idx * num_tokens + token_idx`, written over NVLink
+                if constexpr (kBroadcastY) {
+                    const auto dst_ptr = math::advance_ptr<uint4>(
+                        y, (static_cast<uint64_t>(sym_buffer.rank_idx) * num_tokens + token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes);
+                    #pragma unroll
+                    for (uint32_t j = lane_idx; j < kNumChunkUint4; j += 32) {
+                        const auto value = ptx::ld_shared(combine_store_buffer + j);
+                        #pragma unroll
+                        for (uint32_t r = 0; r < kNumRanks; ++ r)
+                            *sym_buffer.map(dst_ptr + j, (sym_buffer.rank_idx + r) % kNumRanks) = value;
+                    }
+                    __syncwarp();
+                } else if (cute::elect_one_sync()) {
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
                         math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes),
@@ -2416,6 +2485,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+            }
+        }
+
+        if constexpr (kBroadcastY) {
+            // All this rank's broadcast rows are written after the fence and grid sync; then tag every peer
+            // and wait until every peer has tagged this rank, so `y` is complete when the kernel finishes
+            __threadfence_system();
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+            if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+                ptx::st_rel_sys(sym_buffer.map(workspace.get_output_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+                const auto ready_ptr = workspace.get_output_ready_grid_idx_ptr(epilogue_thread_idx);
+                comm::wait_until([&]() { return ptx::ld_acq_sys(ready_ptr) == grid_idx; },
+                                 [&]() { printf("DeepGEMM broadcast output timeout: rank=%u, peer=%u\n", sym_buffer.rank_idx, epilogue_thread_idx); });
             }
         }
     }

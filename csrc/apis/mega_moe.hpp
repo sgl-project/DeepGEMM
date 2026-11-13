@@ -45,10 +45,10 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
-    // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
+    // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
+                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -209,13 +209,22 @@ static void fp8_fp4_mega_moe(
     const float& post_expert_norm_eps = 1e-6f,
     const bool& post_expert_norm_weight_first = false,
     const bool& use_trtllm_weights = false,
-    const std::optional<int64_t>& global_num_tokens = std::nullopt
+    const std::optional<int64_t>& global_num_tokens = std::nullopt,
+    const bool& use_inkling2_weights = false,
+    const bool& broadcast_y = false
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
-    // Config checks
-    const auto num_tokens = static_cast<int>(y.size(0));
+    // Config checks; a broadcast `y` holds every rank's rows (rank-major) inside the symmetric buffer
+    const auto num_ranks_y = broadcast_y ? static_cast<int>(sym_buffer_ptrs.size()) : 1;
+    DG_HOST_ASSERT(y.size(0) % num_ranks_y == 0);
+    // NOTES: an empty `y` has a null `data_ptr()`, so locate it through its storage
+    const int64_t y_offset = broadcast_y ?
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(y.storage().data()) - reinterpret_cast<uintptr_t>(sym_buffer.data_ptr())) +
+        y.storage_offset() * y.element_size() : 0;
+    DG_HOST_ASSERT(not broadcast_y or (y_offset >= 0 and y_offset + static_cast<int64_t>(y.nbytes()) <= static_cast<int64_t>(sym_buffer.nbytes())));
+    const auto num_tokens = static_cast<int>(y.size(0)) / num_ranks_y;
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and (rk == 32 or rk == 16));
     const auto mma_kind = parse_mma_kind(mma_type);
@@ -229,8 +238,9 @@ static void fp8_fp4_mega_moe(
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
+    DG_HOST_ASSERT(not (use_trtllm_weights and use_inkling2_weights));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
+                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
     const bool use_situ = activation == "situ";
     const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
@@ -252,8 +262,11 @@ static void fp8_fp4_mega_moe(
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
     DG_HOST_ASSERT(not use_trtllm_weights or not is_localized(l1_weights));
+    DG_HOST_ASSERT(not use_inkling2_weights or not is_localized(l1_weights));
     const auto weight_dtype = l1_weights.scalar_type();
     DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
+    DG_HOST_ASSERT(not use_inkling2_weights or mma_kind == MmaKind::NVFP4 or
+                   (mma_kind == MmaKind::MXFP8FP4 and weight_dtype == torch::kFloat8_e4m3fn));
     DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
@@ -264,12 +277,19 @@ static void fp8_fp4_mega_moe(
     constexpr int kGranMN = 1;
     const int kGranK = rk;
     // TRT weights require matching dense TRT scales; descriptors encode their layout.
-    if (use_trtllm_weights)
+    if (use_trtllm_weights or use_inkling2_weights)
         DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+    if (use_inkling2_weights) {
+        // CUTLASS 128x4 atoms: one byte per (row, K group) over 128-row-padded rows
+        DG_HOST_ASSERT(intermediate_hidden * 2 % 128 == 0 and hidden % 128 == 0);
+        DG_HOST_ASSERT(l1_weights_sf.nbytes() == int64_t(num_experts_per_rank) * intermediate_hidden * 2 * (hidden / kGranK));
+        DG_HOST_ASSERT(l2_weights_sf.nbytes() == int64_t(num_experts_per_rank) * hidden * (intermediate_hidden / kGranK));
+    } else {
+        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+    }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
@@ -397,15 +417,21 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_eps,
                                mma_kind,
                                use_fp8_combine, use_trtllm_weights, global_num_tokens,
-                               situ_beta, situ_linear_beta);
+                               situ_beta, situ_linear_beta, use_inkling2_weights, broadcast_y);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
-    // Zero the entire symmetric buffer for debug mode
+    // Zero the symmetric buffer for debug mode, except a broadcast `y`
     // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
-        sym_buffer.zero_();
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG")) {
+        if (broadcast_y) {
+            sym_buffer.slice(0, 0, y_offset).zero_();
+            sym_buffer.slice(0, y_offset + static_cast<int64_t>(y.nbytes())).zero_();
+        } else {
+            sym_buffer.zero_();
+        }
+    }
 }
 
 static void bf16_mega_moe(

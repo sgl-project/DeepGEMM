@@ -48,11 +48,12 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: Optional['SymmBuffer'] = None):
+                 base: Optional['SymmBuffer'] = None,
+                 gather_output: bool = False):
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
-        assert activation != 'situ' or mma_type == 'fp8xfp4', \
-            '`situ` activation is supported only for `fp8xfp4` MegaMoE'
+        assert activation != 'situ' or mma_type in ('fp8xfp4', 'fp8xfp8', 'nvfp4xnvfp4'), \
+            '`situ` activation is supported only for `fp8xfp4`, `fp8xfp8` and `nvfp4xnvfp4` MegaMoE'
         _check_legacy_fp4_acts_env()
         self.group = group
         self.num_experts = num_experts
@@ -71,6 +72,9 @@ class SymmBuffer:
                        mma_type, activation,
                        num_shared_experts)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
+        # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
+        num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
+        num_bytes = align(num_bytes, 128) + num_gathered_bytes
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -88,8 +92,11 @@ class SymmBuffer:
             assert num_bytes <= base.buffer.nbytes, \
                 (f'The reused Mega MoE config requires {num_bytes} bytes, '
                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
+            assert num_gathered_bytes == 0 or base.gathered_y is not None, 'The reused buffer has no gathered output'
             self.buffer = base.buffer
             self.handle = base.handle
+        self.gathered_y = (self.buffer[self.buffer.nbytes - num_gathered_bytes:].view(torch.bfloat16).view(-1, hidden)
+                           if gather_output else None)
 
         # Create input buffer views; absent ones (BF16 SFs, no shared experts) are empty byte tensors
         (self.x, self.x_sf,
@@ -106,6 +113,7 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.gathered_y = None
 
 
 # TODO: remove this function
@@ -194,7 +202,7 @@ def transform_weights_for_mega_moe(
     assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
     assert activation != 'situ' or (
         isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)
-    ), '`situ` activation is supported only for FP8xFP4 MegaMoE weights'
+    ), '`situ` activation needs quantized (weight, sf) MegaMoE weights'
     if isinstance(l1_weights, tuple):
         # FP8/MXFP4/NVFP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP.
         interleave = _interleave_weights_packed_fp4 if mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4') \
@@ -221,10 +229,13 @@ def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tens
 
 
 def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):
-    if weight_layout not in ('megamoe', 'trtllm'):
+    # `inkling2`: checkpoint gate/up rows interleaved per row (gate 2i, up 2i+1), unpacked
+    # `[E, N, K]` weights, and weight SFs in the CUTLASS 128x4-atom layout
+    # (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8 (`fp8xfp8`) weights.
+    if weight_layout not in ('megamoe', 'trtllm', 'inkling2'):
         raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
-    if weight_layout == 'trtllm' and (shared_l1_weights is not None or shared_l2_weights is not None):
-        raise ValueError('TRT-LLM weight layout does not support shared experts')
+    if weight_layout != 'megamoe' and (shared_l1_weights is not None or shared_l2_weights is not None):
+        raise ValueError(f'{weight_layout} weight layout does not support shared experts')
 
 
 def _validate_global_num_tokens(global_num_tokens: Optional[int], num_ranks: int,
@@ -259,11 +270,22 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      post_expert_norm: bool = False,
                      post_expert_norm_weight: Optional[torch.Tensor] = None,
                      post_expert_norm_eps: float = 1e-6,
-                     post_expert_norm_weight_first: bool = False):
+                     post_expert_norm_weight_first: bool = False,
+                     broadcast_y: bool = False):
+    # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+    if broadcast_y:
+        # NOTES: an empty `y` has a null `data_ptr()`, so compare storage and offset
+        gathered_y = sym_buffer.gathered_y
+        assert gathered_y is not None and y.dtype == gathered_y.dtype and \
+            y.untyped_storage().data_ptr() == gathered_y.untyped_storage().data_ptr() and \
+            y.storage_offset() == gathered_y.storage_offset(), \
+            '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError('TRT-LLM packed weights require NVFP4 MMA')
+    if weight_layout == 'inkling2' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
+        raise ValueError('Inkling2 weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
             '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
@@ -290,7 +312,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
-        weight_layout == 'trtllm', global_num_tokens
+        weight_layout == 'trtllm', weight_layout == 'inkling2', global_num_tokens, broadcast_y
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -346,6 +368,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   post_expert_norm_eps: float = 1e-6,
                   post_expert_norm_weight_first: bool = False):
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+    if weight_layout == 'inkling2':
+        raise ValueError('Inkling2 weights require NVFP4 or FP8xFP8 MMA')
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     _C.bf16_mega_moe(
         y,
