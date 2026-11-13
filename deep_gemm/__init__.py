@@ -404,7 +404,8 @@ def get_symm_buffer_for_mega_moe(group,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu'):
+                                 activation: str = 'swiglu',
+                                 recipe=None, recipe_a=None, recipe_b=None):
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
@@ -423,7 +424,8 @@ def get_symm_buffer_for_mega_moe(group,
         num_shared_experts=num_shared_experts,
         use_fp8_dispatch=use_fp8_dispatch,
         mma_type=mma_type,
-        activation=activation
+        activation=activation,
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b
     )
 
 

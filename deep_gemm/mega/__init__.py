@@ -48,6 +48,9 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
+                 recipe: Optional[Tuple[int, int, int]] = None,
+                 recipe_a: Optional[Tuple[int, int]] = None,
+                 recipe_b: Optional[Tuple[int, int]] = None,
                  base: Optional['SymmBuffer'] = None):
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
@@ -64,12 +67,12 @@ class SymmBuffer:
         self.mma_type = mma_type
         self.activation = activation
 
-        # Allocate or reuse a symmetric buffer
+        # Allocate or reuse a symmetric buffer; the recipe's K granularity sizes every SF view
         layout_args = (group.size(), num_experts,
                        num_max_tokens_per_rank, num_topk,
                        hidden, intermediate_hidden,
                        mma_type, activation,
-                       num_shared_experts)
+                       num_shared_experts, recipe, recipe_a, recipe_b)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
@@ -99,6 +102,8 @@ class SymmBuffer:
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf,
          self.x_scales) = _C.slice_symm_buffer_for_mega_moe(self.buffer, *layout_args)
+        # SF K granularity of this buffer's SF views, as the native side resolved it
+        self.gran_k = 0 if mma_type == 'bf16xbf16' else hidden // (4 * self.x_sf.shape[1])
 
     def destroy(self):
         self.handle = None
@@ -116,7 +121,10 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 recipe: Optional[Tuple[int, int, int]] = None,
+                                 recipe_a: Optional[Tuple[int, int]] = None,
+                                 recipe_b: Optional[Tuple[int, int]] = None) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -130,7 +138,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b
     )
 
 
@@ -246,7 +255,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                     recipe: Tuple[int, int, int] = (1, 1, 32),
+                     recipe: Optional[Tuple[int, int, int]] = None,
+                     recipe_a: Optional[Tuple[int, int]] = None,
+                     recipe_b: Optional[Tuple[int, int]] = None,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
@@ -285,7 +296,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe, sym_buffer.mma_type,
+        recipe, recipe_a, recipe_b, sym_buffer.mma_type,
         activation, activation_clamp,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
