@@ -405,7 +405,8 @@ struct MegaMoEBuffer {
                   const uint32_t& num_sf_ring_tokens,
                   const MmaKind& mma_kind,
                   const uint32_t& num_shared_experts = 0,
-                  const bool& use_fp8_combine = false) {
+                  const bool& use_fp8_combine = false,
+                  const uint32_t& gran_k_recipe = 0) {
         const bool with_sf = get_sf_gran_k(mma_kind) != 0;
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
@@ -420,7 +421,7 @@ struct MegaMoEBuffer {
         // NOTE: multiply before dividing — `elem_bits / 8` truncates to 0 for the
         // 4-bit kinds (NVFP4/MXFP4), which would zero-size every activation slot.
         const auto num_token_bytes = [=](const uint32_t& num_elems) { return num_elems * elem_bits / 8; };
-        const uint32_t gran_k = with_sf ? get_sf_gran_k(mma_kind) : 1;
+        const uint32_t gran_k = with_sf ? (gran_k_recipe != 0 ? gran_k_recipe : get_sf_gran_k(mma_kind)) : 1;
         const auto input_token_layout = layout::Data(num_token_bytes(hidden));
         const auto combine_token_layout = layout::Data(
             use_fp8_combine ? hidden : hidden * 2);

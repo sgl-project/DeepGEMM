@@ -32,6 +32,28 @@ static int get_block_m_for_mega_moe(
     return block_m;
 }
 
+static std::tuple<int, int, int> get_granularities_for_mega_moe(
+    std::optional<std::tuple<int, int, int>> recipe,
+    const std::optional<std::tuple<int, int>>& recipe_a,
+    const std::optional<std::tuple<int, int>>& recipe_b,
+    const MmaKind& mma_kind) {
+    if (not recipe_a.has_value() and not recipe.has_value())
+        recipe = std::make_tuple(1, 1, get_sf_gran_k(mma_kind));
+
+    DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value());
+    DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
+
+    if (recipe_a.has_value()) {
+        const auto [gran_m, gran_k_a] = recipe_a.value();
+        const auto [gran_n, gran_k_b] = recipe_b.value();
+        DG_HOST_ASSERT(gran_k_a == gran_k_b and
+                       "Mega-MoE requires one SF K granularity for the activations and the weights");
+        return {gran_m, gran_n, gran_k_a};
+    }
+    const auto [gran_m, gran_n, gran_k] = recipe.value();
+    return {gran_m, gran_n, gran_k};
+}
+
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -41,7 +63,10 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
-    const int& num_shared_experts = 0) {
+    const int& num_shared_experts = 0,
+    const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
+    const std::optional<std::tuple<int, int>>& recipe_a = std::nullopt,
+    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
@@ -94,11 +119,18 @@ get_symm_buffer_size_for_mega_moe(
     }
 
     // All buffers
+    const auto [gran_m, gran_n, gran_k] =
+        get_granularities_for_mega_moe(recipe, recipe_a, recipe_b, mma_kind);
+    DG_HOST_ASSERT(gran_m == 1 and gran_n == 1);
+    DG_HOST_ASSERT(gran_k == get_sf_gran_k(mma_kind) or gran_k == 128);
+    // Shared expert reuses the L1 epilogue that quantizes blockwise-128 activations, so it is routed-only
+    DG_HOST_ASSERT((gran_k == get_sf_gran_k(mma_kind) or num_shared_experts == 0)
+                   and "blockwise-128 SFs (recipe gran_k=128) do not support shared experts");
     const auto mega_buffer = layout::MegaMoEBuffer(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, mma_kind,
-        num_shared_experts, host_use_fp8_combine
+        num_shared_experts, host_use_fp8_combine, static_cast<uint32_t>(gran_k)
     );
 
     // Activation layout: FP8 for MXFP8FP4, raw bytes holding 2 packed FP4 values for NVFP4/MXFP4
@@ -109,7 +141,7 @@ get_symm_buffer_size_for_mega_moe(
         return num_elems * get_element_bits(mma_kind) / acts_storage_bits;
     };
     const auto num_sf_cols = [=](const int& num_elems) {
-        return num_elems / (get_sf_gran_k(mma_kind) * 4);
+        return num_elems / (gran_k * 4);
     };
 
     // Check SF buffer requirements
@@ -195,7 +227,9 @@ static void fp8_fp4_mega_moe(
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
+    const std::optional<std::tuple<int, int, int>>& recipe,
+    const std::optional<std::tuple<int, int>>& recipe_a,
+    const std::optional<std::tuple<int, int>>& recipe_b,
     const std::string& mma_type,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
@@ -216,17 +250,25 @@ static void fp8_fp4_mega_moe(
 
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 1 and rn == 1 and (rk == 32 or rk == 16));
     const auto mma_kind = parse_mma_kind(mma_type);
+    const auto [gran_m, gran_n, gran_k] =
+        get_granularities_for_mega_moe(recipe, recipe_a, recipe_b, mma_kind);
+    const bool blockwise_128 = gran_k == 128;
+    DG_HOST_ASSERT(gran_m == 1 and gran_n == 1);
+    DG_HOST_ASSERT(gran_k == 32 or gran_k == 16 or gran_k == 128);
     if (mma_kind != MmaKind::MXFP8FP4 and mma_kind != MmaKind::MXFP4 and mma_kind != MmaKind::NVFP4)
         DG_HOST_UNREACHABLE("`" + mma_type + "` activations are not implemented by the SM100 "
                             "mega-MoE kernel (only `fp8xfp4`, `mxf4xmxf4` and `nvfp4xnvfp4` are); "
                             "allocate the symmetric buffer with one of those");
-    if (rk != get_sf_gran_k(mma_kind))
-        DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(rk) + " does not match `" +
-                            mma_type + "` (expected " +
-                            std::to_string(get_sf_gran_k(mma_kind)) + ")");
+    // Blockwise-128 SFs only exist for FP8 e4m3 operands under `fp8xfp4`
+    DG_HOST_ASSERT(not blockwise_128 or mma_kind == MmaKind::MXFP8FP4);
+    // Shared expert reuses the blockwise-128 L1 epilogue, so blockwise-128 is routed-only
+    DG_HOST_ASSERT((not blockwise_128 or not shared_l1_weights_tuple_opt.has_value())
+                   and "blockwise-128 SFs (recipe gran_k=128) do not support shared experts");
+    if (gran_k != get_sf_gran_k(mma_kind) and not blockwise_128)
+        DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(gran_k) +
+                            " does not match `" + mma_type + "` (expected " +
+                            std::to_string(get_sf_gran_k(mma_kind)) + ", or 128 for blockwise-128 FP8 SFs)");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
@@ -262,7 +304,7 @@ static void fp8_fp4_mega_moe(
 
     // Check weight SF layout for byte-packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1;
-    const int kGranK = rk;
+    const int kGranK = gran_k;
     // TRT weights require matching dense TRT scales; descriptors encode their layout.
     if (use_trtllm_weights)
         DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
@@ -311,7 +353,7 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type, activation, num_shared_experts
+        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b
     );
     if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))
         DG_HOST_UNREACHABLE("symmetric buffer is " + std::to_string(sym_buffer.nbytes()) +
@@ -396,7 +438,8 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_weight_first,
                                post_expert_norm_eps,
                                mma_kind,
-                               use_fp8_combine, use_trtllm_weights, global_num_tokens,
+                               use_fp8_combine, gran_k,
+                               use_trtllm_weights, global_num_tokens,
                                situ_beta, situ_linear_beta);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

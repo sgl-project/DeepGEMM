@@ -128,6 +128,7 @@ template <
     bool kUseSM107K64 = false,
     // SIMT dispatch pull (no SMEM send buffer)
     bool kUseSimtPull = false,
+    uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -239,7 +240,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumRingTokens, kNumSFRingTokens,
         kMmaKind,
         kNumSharedExperts,
-        kUseFp8Combine
+        kUseFp8Combine,
+        kGranK
     );
     const auto workspace = buffer.workspace;
     constexpr uint32_t kNumMaxPoolTokens = layout::get_num_max_pool_tokens<uint32_t>(
@@ -270,10 +272,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
     // SF and its buffer configs
-    constexpr uint32_t kGranK = get_sf_gran_k(kMmaKind);
     constexpr uint32_t kSFChunkK = kGranK * 4;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
-    constexpr uint32_t kNumSFChunksPerBlock = BLOCK_K / kSFChunkK;
+    // SF words held by one stage, and how many K blocks one TMA load feeds.
+    constexpr uint32_t kNumSFWordsPerStage = math::constexpr_ceil_div(BLOCK_K, kSFChunkK);
+    constexpr uint32_t kNumSFStagesPerLoad = math::constexpr_ceil_div(kSFChunkK, BLOCK_K);
+    // Blockwise-128 quantizes the L2 GEMM's activations over a whole 128-element group spanning
+    // both CTAs, so the L1 epilogue merges the cluster amax before casting and stores one byte per group
+    constexpr bool kL2AmaxPer128 = kMmaKind == MmaKind::MXFP8FP4 and kGranK == 128;
+    DG_STATIC_ASSERT(not kL2AmaxPer128 or BLOCK_K == 128,
+                     "The per-128 amax group is the epilogue's 128-wide K span");
+    // One SF word per operand per K block, and the same word reused across a blockwise-128 group
+    DG_STATIC_ASSERT(kSFChunkK % BLOCK_K == 0 or BLOCK_K % kSFChunkK == 0,
+                     "An SF word must evenly divide, or be divided by, BLOCK_K");
+    DG_STATIC_ASSERT(kGranK == get_sf_gran_k(kMmaKind) or BLOCK_K == 128,
+                     "Blockwise-128 SFs need 128-wide K blocks (one SF word per four blocks)");
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
 
@@ -322,7 +335,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
     constexpr uint32_t UMMA_B_K_BYTES = kPackedFP4Weights ? UMMA_K / 2 : UMMA_A_K_BYTES;
-    constexpr uint32_t kNumMMAsPerSFChunk = kSFChunkK / UMMA_K;
+    // UMMAs per 128-wide K block: independent of the SF granularity (a blockwise-128 word is
+    // reused across four blocks, each still issuing its own UMMAs)
+    constexpr uint32_t kNumMMAsPerSFChunk = BLOCK_K / UMMA_K;
     constexpr uint32_t kNumRoutedBTxTiles = (kIsFP4Acts or kIsWeightFP8 or kPackedFP4Weights) ? 2 : 1;
     constexpr bool kSplitSharedK = kPackedFP4Weights and kHasShared;
     constexpr uint32_t SHARED_BLOCK_K = kSplitSharedK ? BLOCK_K / 2 : BLOCK_K;
@@ -351,6 +366,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Prefetch so the TMEM stage is released earlier, keeping the epilogue off the critical path
     constexpr uint32_t kNumEpiPrefetchStages = BLOCK_M == 240 ? 1 : 0;
     constexpr uint32_t ATOM_M = 8;
+    // Blockwise-128 L2 activations merge the amax across the whole cluster, one 16-byte slot per
+    // (warpgroup, store-block parity, atom, lane)
+    constexpr uint32_t kAmaxExchangeWGs = kL2AmaxPer128 ? kNumEpilogueWarpgroups : 1u;
+    constexpr uint32_t kAmaxExchangeAtoms = kL2AmaxPer128 ? STORE_BLOCK_M_L1 / ATOM_M : 1u;
 
     // Shared memory
     constexpr uint32_t kSharedMemoryAlignment = 1024;
@@ -376,8 +395,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         } smem_d;
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K_BYTES];
         alignas(kSharedMemoryAlignment) b_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * WEIGHT_BLOCK_K_BYTES];
-        uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / kSFChunkK)];
-        uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / kSFChunkK)];
+        uint32_t smem_sfa[kNumStages][SF_BLOCK_M * kNumSFWordsPerStage];
+        uint32_t smem_sfb[kNumStages][SF_BLOCK_N * kNumSFWordsPerStage];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         task_info_t task_infos[kNumScheduleStages];
         Barrier dispatch_barriers[kNumDispatchWarps];
@@ -390,6 +409,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
         float nvfp4_sf_inv_lut[kIsNVFP4 ? math::kNumNVFP4SFInvLutEntries : 1];
+        // Cross-CTA amax exchange for blockwise-128 L2 activations: the peer stores its 64-column max into
+        // our slots. Two barriers ping-pong with the two buffers so the peer never double-fills one phase.
+        Barrier amax_exchange_barriers[kAmaxExchangeWGs][2];
+        alignas(16) float4 amax_exchange[kAmaxExchangeWGs][2][kAmaxExchangeAtoms][4];
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -450,6 +473,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t i = 0; i < kNumScheduleStages; ++ i) {
                 shared_storage.task_info_full_barriers[i].init(1);
                 shared_storage.task_info_empty_barriers[i].init(kNumScheduleConsumerThreads);
+            }
+            if constexpr (kL2AmaxPer128) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumEpilogueWarpgroups; ++ i)
+                    for (uint32_t j = 0; j < 2; ++ j)
+                        shared_storage.amax_exchange_barriers[i][j].init(1);
             }
         }
         cutlass::arch::fence_barrier_init();
@@ -1061,8 +1090,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                if (task_info.block_phase == sched::BlockPhase::Linear2)
+                if (task_info.block_phase == sched::BlockPhase::Linear2) {
                     l2_k_block_dependency.wait(k_block_idx);
+                    // Blockwise-128 reuses one SF word across `kNumSFStagesPerLoad` K blocks, but its later
+                    // bytes are produced by those blocks' L1 epilogue: wait for all of them or they are stale.
+                    if constexpr (kNumSFStagesPerLoad > 1) {
+                        if ((k_block_idx % kNumSFStagesPerLoad) == 0) {
+                            #pragma unroll
+                            for (uint32_t j = 1; j < kNumSFStagesPerLoad; ++ j) {
+                                if (k_block_idx + j < num_k_blocks)
+                                    l2_k_block_dependency.wait(k_block_idx + j);
+                            }
+                        }
+                    }
+                }
 
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -1072,7 +1113,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t m_idx = block_idx * BLOCK_M;
                 uint32_t k_idx = k_block_idx * (is_split_k ? SHARED_BLOCK_K : BLOCK_K_BYTES);
                 const uint32_t sfa_m_idx = block_idx * SF_BLOCK_M;
-                uint32_t sfa_k_idx = is_split_k ? k_idx / kSFChunkK : k_block_idx * (BLOCK_K / kSFChunkK);
+                // Blockwise-128 reuses one SF word per `kNumSFStagesPerLoad` K blocks, so only the first loads SFA
+                const bool load_sfa = (k_block_idx % kNumSFStagesPerLoad) == 0;
+                uint32_t sfa_k_idx = is_split_k ? k_idx / kSFChunkK :
+                    (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage;
 
                 // Add 2 CTA offsets for non-leader CTA
                 if (not is_leader_cta)
@@ -1087,11 +1131,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false, kActsCacheHint>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
                     }
-                    tma::copy<SF_BLOCK_M, 1, 0>(
-                        tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+                    if (load_sfa) {
+                        tma::copy<SF_BLOCK_M, 1, 0>(
+                            tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+                    }
                     if (is_leader_cta) {
                         const uint32_t num_a_bytes = is_split_k ? LOAD_BLOCK_M * SHARED_BLOCK_K : sizeof(SharedStorage::smem_a[0]);
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(num_a_bytes * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                            num_a_bytes * 2 + (load_sfa ? sizeof(SharedStorage::smem_sfa[0]) * 2 : 0));
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
@@ -1134,8 +1181,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t k_idx = k_block_idx * (is_split_k ? SHARED_BLOCK_K : BLOCK_K_BYTES);
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                 uint32_t sfb_k_idx = task_info.is_shared() ?
-                    (is_split_k ? k_idx / kSFChunkK : k_block_idx * (BLOCK_K / kSFChunkK)) :
-                    task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / kSFChunkK);
+                    (is_split_k ? k_idx / kSFChunkK : (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage) :
+                    task_info.local_expert_idx * shape_sfb_k + (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage;
 
                 // TMA copy weights with SF
                 if constexpr (kUseTrtllmWeights) {
@@ -1167,7 +1214,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
                         const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
                         const uint32_t sf_row_block = expert_n_idx / 128;
-                        const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
+                        const uint32_t sf_k_chunk = k_block_idx * kNumSFWordsPerStage;
                         if (is_l1)
                             cute::SM100_TMA_2SM_LOAD_3D::copy(
                                 tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
@@ -1183,23 +1230,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
                 } else if (cute::elect_one_sync()) {
+                    // Blockwise-128 reuses one SF word per `kNumSFStagesPerLoad` K blocks, so only the first loads SFB
+                    const bool load_sfb = (k_block_idx % kNumSFStagesPerLoad) == 0;
                     if (is_split_k) {
                         tma::copy_nd<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, shared_b_dtype_t, 4>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
-                        tma::copy<BLOCK_N, 1, 0>(
-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        if (load_sfb) {
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        }
                         if (is_leader_cta) {
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(LOAD_BLOCK_N * SHARED_BLOCK_K * 2 + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                LOAD_BLOCK_N * SHARED_BLOCK_K * 2 + (load_sfb ? sizeof(SharedStorage::smem_sfb[0]) * 2 : 0));
                         } else {
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     } else if (task_info.is_shared()) {
                         tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, shared_b_dtype_t, 4>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
-                        tma::copy<BLOCK_N, 1, 0>(
-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        if (load_sfb) {
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        }
                         if (is_leader_cta) {
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) * 2 + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                sizeof(SharedStorage::smem_b[0]) * 2 + (load_sfb ? sizeof(SharedStorage::smem_sfb[0]) * 2 : 0));
                         } else {
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
@@ -1211,10 +1266,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
                                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
                         }
-                        tma::copy<BLOCK_N, 1, 0>(
-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        if (load_sfb) {
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        }
                         if (is_leader_cta) {
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) * kNumRoutedBTxTiles + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                sizeof(SharedStorage::smem_b[0]) * kNumRoutedBTxTiles +
+                                (load_sfb ? sizeof(SharedStorage::smem_sfb[0]) * 2 : 0));
                         } else {
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
@@ -1310,23 +1369,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t b_desc_base_lo = b_desc_lo + stage_idx * sizeof(SharedStorage::smem_b[0]) / 16;
                     if (cute::elect_one_sync()) {
                         #pragma unroll
-                        for (uint32_t sf_chunk_idx = 0; sf_chunk_idx < BLOCK_K / kSFChunkK; ++ sf_chunk_idx) {
+                        for (uint32_t sf_chunk_idx = 0; sf_chunk_idx < kNumSFWordsPerStage; ++ sf_chunk_idx) {
                             // UTCCP copy SFA and SFB to TMEM
                             using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
-                            #pragma unroll
-                            for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfa[stage_idx] + sf_chunk_idx * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
-                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFA + i * 4);
-                            }
-                            #pragma unroll
-                            for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                    (kUseTrtllmWeights
-                                        ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
-                                        : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
-                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFB + i * 4);
+                            // Blockwise-128 reuses the word UTCCP'd by the group's first K block, activations and weights alike
+                            if ((k_block_idx % kNumSFStagesPerLoad) == 0) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                    auto smem_ptr = shared_storage.smem_sfa[stage_idx] + sf_chunk_idx * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
+                                    mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                    cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFA + i * 4);
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                    auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
+                                        (kUseTrtllmWeights
+                                            ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
+                                            : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                    mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                    cute_utccp_t::copy(sf_desc, tmem_base + kTmemStartColOfSFB + i * 4);
+                                }
                             }
 
                             // Issue UMMA
@@ -1361,8 +1423,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     const uint32_t mma_idx = sf_chunk_idx * kNumMMAsPerSFChunk + k;
                                     const uint32_t atom_byte_offset = (mma_idx * UMMA_K_BYTES / UMMA_BLOCK_K_BYTES) * UMMA_BLOCK_K_BYTES;
                                     const uint32_t in_atom_byte_idx = mma_idx * UMMA_K_BYTES - atom_byte_offset;
-                                    // `kind::mxf4` uses `scale_vec::2X`
-                                    const uint32_t sf_id = kIsMXFP4 ? k * 2 : k;
+                                    // Weights and activations share one SF granularity, so the same `sf_id`; blockwise-128
+                                    // instead picks one of the word's four per-128 bytes. A/B are swapped on `fma` (A=weight, B=act).
+                                    const uint32_t sf_id = kGranK == get_sf_gran_k(kMmaKind) ?
+                                        (kIsMXFP4 ? k * 2 : k) : (k_block_idx % kNumSFStagesPerLoad);
                                     const auto runtime_instr_desc =
                                         mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_id, sf_id);
                                     a_desc.lo = mma::sm100::advance_umma_desc_lo<
@@ -1442,6 +1506,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
+        // Alternates the blockwise-128 amax exchange's barrier phase and buffer parity; both CTAs stay in step
+        [[maybe_unused]] uint32_t amax_exchange_idx = 0;
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
             // Wait UMMA arrival
@@ -1692,6 +1758,46 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    // Blockwise-128 quantizes the L2 activations over a 128-element K group spanning both CTAs
+                    // (64 columns each): merge this CTA's two warp pairs, then exchange with the peer for the cluster max
+                    if constexpr (kL2AmaxPer128) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            #pragma unroll
+                            for (uint32_t w = 0; w < 4; ++ w) {
+                                const float2 w_amax = shared_storage.amax_reduction[epilogue_wg_idx * 4 + w][i * (ATOM_M / 2) + lane_idx % 4];
+                                amax_values[i].x = cute::max(amax_values[i].x, w_amax.x);
+                                amax_values[i].y = cute::max(amax_values[i].y, w_amax.y);
+                            }
+                        }
+
+                        const uint32_t parity = amax_exchange_idx & 1;
+                        const uint32_t exchange_phase = (amax_exchange_idx >> 1) & 1;
+                        auto& exchange_barrier = shared_storage.amax_exchange_barriers[epilogue_wg_idx][parity];
+                        if (warp_idx_in_wg == 0) {
+                            if (lane_idx == 0)
+                                exchange_barrier.arrive_and_expect_tx(
+                                    kNumAtomsPerStore * 4 * static_cast<uint32_t>(sizeof(float4)));
+                            if (lane_idx < 4) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                                    const float4 shipped = {amax_values[i].x, amax_values[i].y, 0.0f, 0.0f};
+                                    ptx::st_async_cluster(shared_storage.amax_exchange[epilogue_wg_idx][parity][i] + lane_idx,
+                                                          shipped, is_leader_cta ? 1u : 0u, exchange_barrier);
+                                }
+                            }
+                        }
+                        exchange_barrier.wait(exchange_phase);
+                        amax_exchange_idx += 1;
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            const float4 peer_amax = shared_storage.amax_exchange[epilogue_wg_idx][parity][i][lane_idx % 4];
+                            amax_values[i].x = cute::max(amax_values[i].x, peer_amax.x);
+                            amax_values[i].y = cute::max(amax_values[i].y, peer_amax.y);
+                        }
+                    }
+
                     // Cast into the L1 output dtype and store into shared memory
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
@@ -1750,11 +1856,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Store SF to `buffer.l2_sf_buffer` (MN-major layout)
                         // For MXFP8FP4 only one warp per pair writes (both hold the same SF after the
                         // cross-warp reduce); for NVFP4 every warp owns its own 16-element group
+                        // With blockwise-128 a group is one 128-K block = one cluster's 128 output columns; both CTAs
+                        // hold the same cluster-wide amax, so the leader writes the group's single byte alone
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
-                        if ((kIsNVFP4 or warp_idx_in_wg % 2 == 0) and lane_idx < 4) {
-                            const uint32_t k_idx = kIsNVFP4 ? n_block_idx * 4 + warp_idx_in_wg
-                                                            : n_block_idx * 2 + warp_idx_in_wg / 2;
-                            const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
+                        if ((kL2AmaxPer128 ? (is_leader_cta and warp_idx_in_wg == 0) :
+                                              (kIsNVFP4 or warp_idx_in_wg % 2 == 0)) and lane_idx < 4) {
+                            const uint32_t sf_group_idx =
+                                kL2AmaxPer128 ? task_info.n_cluster_idx :
+                                kIsNVFP4 ? n_block_idx * 4 + warp_idx_in_wg
+                                         : n_block_idx * 2 + warp_idx_in_wg / 2;
+                            const uint32_t k_uint_idx = sf_group_idx / 4;
+                            const uint32_t byte_idx = sf_group_idx % 4;
                             const uint32_t mn_stride = (task_info.is_shared() ? kNumSharedSFTokens : kNumSFRingTokens) * sizeof(uint32_t);
                             const auto sf_base_ptr = task_info.is_shared() ?
                                 buffer.shared_l2_sf_buffer.get_base_ptr<uint8_t>() : buffer.l2_sf_buffer.get_base_ptr<uint8_t>();

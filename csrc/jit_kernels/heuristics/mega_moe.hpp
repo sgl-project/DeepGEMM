@@ -248,6 +248,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
         store_block_m_l1 * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
+    // Blockwise-128 merges the L2-activation amax across both CTAs of the cluster.
+    const bool l2_amax_128 = mma_kind == MmaKind::MXFP8FP4 and gran_k == 128;
+    const int smem_amax_exchange = l2_amax_128 ?
+        align(num_epilogue_warpgroups * ((2 * (store_block_m_l1 / 8) * 4) * 16 + 2 * 8), kSmemAlignment) : 0;
 
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
@@ -255,9 +259,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sf_inv_lut = mma_kind == MmaKind::NVFP4 ?
         256 * static_cast<int>(sizeof(float)) : 0;
 
-    // SF is aligned to UTCCP 128-element granularity
-    const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
-    const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
+    // One SF word packs 4 UE8M0 bytes, so a stage holds `ceil(block_k / (gran_k * 4))` words per row
+    const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ?
+        sf_block_m * ceil_div(block_k, gran_k * 4) * 4 : 0;
+    const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ?
+        sf_block_n * ceil_div(block_k, gran_k * 4) * 4 : 0;
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
     // NOTES: for `MXFP8FP4` the FP4 weights are unpacked into 8-bit containers in smem,
@@ -270,7 +276,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers;
 
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_amax_exchange + smem_barriers +
         smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
 
     // Select maximum number of stages
@@ -288,7 +294,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& num_sf_ring_tokens,
     const MmaKind& mma_kind,
     const std::optional<int64_t>& global_num_tokens,
-    const bool& fp4_weights = false) {
+    const bool& fp4_weights = false,
+    const int& gran_k = 32) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
@@ -304,7 +311,6 @@ static MegaMoEConfig get_mega_moe_config(
     // NVFP4 keeps FP4 packed, so a 128B swizzle atom covers twice as many elements
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
-    const int gran_k = is_mma_with_sf(mma_kind) ? get_sf_gran_k(mma_kind) : 32;
 
     // Thread layout
     const int num_dispatch_threads = 128;
