@@ -175,7 +175,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseTrtllmWeights = kWeightLayout == MegaMoEWeightLayout::TrtLLM;
-    constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved;
     constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
     constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -196,13 +195,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
                      "Post-expert norm weight without the post-expert norm");
     DG_STATIC_ASSERT(not kUseTrtllmWeights or
-                     (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
-                     "TRT weight layout requires routed NVFP4 experts");
-    DG_STATIC_ASSERT(not kUseInterleavedWeights or
                      (kNumSharedExperts == 0 and
                       (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
                                                       cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
-                     "Gate/up interleaved weight layout requires routed NVFP4 or FP8xFP8 experts");
+                     "TRT weight layout requires routed NVFP4 or FP8xFP8 experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -1153,9 +1149,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
-                    // L1's row swap is handled in the epilogue; L2's shuffle in the descriptor.
+                    // L1's gate/up swap is handled in the epilogue (FP8 also regroups rows in the descriptor);
+                    // L2's shuffle in the descriptor.
                     if (task_info.block_phase == sched::BlockPhase::Linear1) {
-                        if (cute::elect_one_sync()) {
+                        if constexpr (kIsWeightFP8) {
+                            // One 32-row block per lane
+                            DG_STATIC_ASSERT(LOAD_BLOCK_N % 32 == 0 and LOAD_BLOCK_N / 32 <= 32, "Invalid TRT FP8 block N");
+                            #pragma unroll
+                            for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
+                                if (lane_idx < LOAD_BLOCK_N / 32) {
+                                    cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                        tensor_map_b_ptr, reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]),
+                                        static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                        shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128 + lane_idx * 32 * 128,
+                                        k_idx + atom * 128, 0, 0, 0, (expert_n_idx + lane_idx * 32) / 4);
+                                }
+                            }
+                        } else if (cute::elect_one_sync()) {
                             tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, expert_n_idx, 2);
                         }
@@ -1179,7 +1189,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
                         const uint32_t sf_row_block = expert_n_idx / 128;
                         const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
-                        if (is_l1)
+                        if (is_l1 and kIsWeightFP8) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < BLOCK_N / 128; ++ i) {
+                                #pragma unroll
+                                for (uint32_t c = 0; c < kNumSFChunksPerBlock; ++ c)
+                                    cute::SM100_TMA_2SM_LOAD_5D::copy(
+                                        tensor_map_sfb_ptr, full, hint,
+                                        shared_storage.smem_sfb[stage_idx] + (i * kNumSFChunksPerBlock + c) * kNumUTCCPAlignedElems,
+                                        0, 0, 0, 0, ((sf_row_block + i) * shape_sfb_k + sf_k_chunk + c) * 8);
+                            }
+                        } else if (is_l1)
                             cute::SM100_TMA_2SM_LOAD_3D::copy(
                                 tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
                                 0, sf_k_chunk, sf_row_block);
@@ -1187,55 +1207,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             cute::SM100_TMA_2SM_LOAD_5D::copy(
                                 tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
                                 0, 0, 0, sf_k_chunk, sf_row_block);
-                        if (is_leader_cta)
-                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
-                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
-                        else
-                            shared_storage.full_barriers[stage_idx].arrive(0u);
-                    }
-                } else if constexpr (kUseInterleavedWeights) {
-                    // Gate/up interleaved weights: L1 rows reordered into the `megamoe` SMEM order by the
-                    // descriptor; L2 rows are plain. SFs are CUTLASS 128x4 atoms (TRT SMEM order).
-                    const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
-                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
-                    const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
-                    auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
-                    if (is_l1) {
-                        #pragma unroll
-                        for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
-                            auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
-                            if (cute::elect_one_sync()) {
-                                if constexpr (kIsWeightFP8) {
-                                    cute::SM100_TMA_2SM_LOAD_4D::copy(
-                                        tensor_map_b_ptr, full, cache_hint, tile,
-                                        k_idx + atom * 128, 0, 0, expert_n_idx / 16);
-                                } else {
-                                    cute::SM100_TMA_2SM_LOAD_5D::copy(
-                                        tensor_map_b_ptr, full, cache_hint, tile,
-                                        k_idx + atom * 128, 0, 0, 0, expert_n_idx / 32);
-                                }
-                            }
-                        }
-                    } else if (cute::elect_one_sync()) {
-                        tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
-                    }
-                    __syncwarp();
-                    if (cute::elect_one_sync()) {
-                        const uint32_t sf_row_block = expert_n_idx / 128;
-                        const uint32_t sf_k_chunk = k_block_idx * kNumSFChunksPerBlock;
-                        if (is_l1) {
-                            #pragma unroll
-                            for (uint32_t i = 0; i < BLOCK_N / 128; ++ i)
-                                cute::SM100_TMA_2SM_LOAD_5D::copy(
-                                    tensor_map_sfb_ptr, full, cache_hint,
-                                    shared_storage.smem_sfb[stage_idx] + i * kNumSFChunksPerBlock * kNumUTCCPAlignedElems,
-                                    0, 0, 0, 0, (sf_row_block + i) * shape_sfb_k + sf_k_chunk);
-                        } else {
-                            cute::SM100_TMA_2SM_LOAD_3D::copy(
-                                tensor_map_sfb_ptr, full, cache_hint, shared_storage.smem_sfb[stage_idx],
-                                0, sf_k_chunk, sf_row_block);
-                        }
                         if (is_leader_cta)
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                                 (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
@@ -1382,7 +1353,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                    ((kUseTrtllmWeights or kUseInterleavedWeights)
+                                    (kUseTrtllmWeights
                                         ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                         : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);

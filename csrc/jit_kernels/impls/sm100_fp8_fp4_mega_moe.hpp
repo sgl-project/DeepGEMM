@@ -13,55 +13,37 @@
 
 namespace deep_gemm {
 
-// `GateUpInterleaved` L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
-// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 .. u14 g1 .. g15 u1 .. u15]
-// (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
-// (SMEM row 8p + i <- GMEM row 2i + p).
-static CUtensorMap make_interleaved_l1_tma_desc(
-    const torch::Tensor& weights, const int inner_bytes, const int rows,
-    const int load_block_n, const bool packed_fp4) {
-    DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0);
-    DG_HOST_ASSERT(rows % 32 == 0 and load_block_n % 32 == 0);
+// TRT FP8 L1 rows: per 32 rows [u0 u2 .. u14 g0 g2 .. g14 u1 .. u15 g1 .. g15]. The `megamoe` FP8
+// SMEM order (with gate and up swapped, as in the epilogue) is per 16 rows [u0 .. u7 g0 .. g7]:
+// SMEM row 16b + 8s + 2q + p <- GMEM row 16p + 8s + 4b + q. The outer dim steps 4 rows, so one
+// load (box b = 2) covers 32 rows.
+static CUtensorMap make_trtllm_fp8_l1_tma_desc(
+    const torch::Tensor& weights, const int inner_bytes, const int rows) {
+    DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0 and rows % 32 == 0);
     CUtensorMap result;
     const cuuint64_t row = static_cast<cuuint64_t>(inner_bytes);
-    if (packed_fp4) {
-        const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
-        const cuuint64_t strides[4] = {4 * row, row, 2 * row, 32 * row};
-        const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
-        const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
-            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, weights.data_ptr(), dims,
-            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    } else {
-        const cuuint64_t dims[4] = {row, 8, 2, static_cast<cuuint64_t>(rows / 16)};
-        const cuuint64_t strides[3] = {2 * row, row, 16 * row};
-        const cuuint32_t box[4] = {128, 8, 2, static_cast<cuuint32_t>(load_block_n / 16)};
-        const cuuint32_t element_strides[4] = {1, 1, 1, 1};
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
-            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.data_ptr(), dims,
-            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
+    const cuuint64_t dims[5] = {row, 2, 4, 2, static_cast<cuuint64_t>(rows / 4)};
+    const cuuint64_t strides[4] = {16 * row, row, 8 * row, 4 * row};
+    const cuuint32_t box[5] = {128, 2, 4, 2, 2};
+    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, weights.data_ptr(), dims,
+        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return result;
 }
 
-// `GateUpInterleaved` L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
-// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_interleaved_l1_tma_desc`.
-// The row block and k chunk dims are flattened, so one load covers one row block.
-static CUtensorMap make_interleaved_l1_sf_tma_desc(
-    const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks,
-    const int& box_k_chunks, const bool packed_fp4) {
-    DG_HOST_ASSERT(sf.is_contiguous() and box_k_chunks <= num_k_chunks);
+// TRT FP8 L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word 4 * (row % 32) + (row / 32) % 4)
+// over TRT rows, permuted as `make_trtllm_fp8_l1_tma_desc`. The outer dim steps 4 rows (64 bytes),
+// so one load (box b = 2) covers one 512-byte atom.
+static CUtensorMap make_trtllm_fp8_l1_sf_tma_desc(
+    const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks) {
+    DG_HOST_ASSERT(sf.is_contiguous());
     CUtensorMap result;
-    const cuuint64_t dims[5] = {4, 8, 2, 2,
-                                static_cast<cuuint64_t>(num_row_blocks) * num_k_chunks};
-    // packed FP4: (q, p, e) rows 4q + 2e + p; FP8: (i, p, h) rows 16h + 2i + p (16-byte rows)
-    const cuuint64_t strides[4] = {packed_fp4 ? 64ull : 32ull, 16ull,
-                                   packed_fp4 ? 32ull : 256ull, 512ull};
-    const cuuint32_t box[5] = {4, 8, 2, 2, static_cast<cuuint32_t>(box_k_chunks)};
+    const cuuint64_t dims[5] = {4, 2, 4, 2, static_cast<cuuint64_t>(num_row_blocks) * num_k_chunks * 8};
+    const cuuint64_t strides[4] = {256, 16, 128, 64};
+    const cuuint32_t box[5] = {4, 2, 4, 2, 2};
     const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
         &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.data_ptr(), dims,
@@ -72,7 +54,7 @@ static CUtensorMap make_interleaved_l1_sf_tma_desc(
 }
 
 // Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
-static CUtensorMap make_trtllm_fp4_l2_tma_desc(
+static CUtensorMap make_trtllm_l2_tma_desc(
     const torch::Tensor& weights, const int inner_bytes, const int rows) {
     DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
     DG_HOST_ASSERT(inner_bytes % 128 == 0);
@@ -92,7 +74,7 @@ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
 }
 
 // TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
-static CUtensorMap make_trtllm_fp4_sf_tma_desc(
+static CUtensorMap make_trtllm_sf_tma_desc(
     const torch::Tensor& sf, const bool& is_l1,
     const int& num_row_blocks, const int& num_k_chunks,
     const int& box_k_chunks, const int& box_row_blocks) {
@@ -165,7 +147,6 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& broadcast_y = false
 ) {
     const bool use_trtllm_weights = weight_layout == MegaMoEWeightLayout::TrtLLM;
-    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -180,12 +161,11 @@ static void sm100_fp8_fp4_mega_moe(
         mma_kind, global_num_tokens,
         l1_weights.scalar_type() == kPackedFP4);
 
-    if (use_trtllm_weights or use_interleaved_weights) {
+    if (use_trtllm_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 or l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
     }
-    if (use_trtllm_weights)
-        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
 
     // Make tensormap
     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
@@ -215,11 +195,10 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
-    // TRT L1 rows are addressed as one 2D `[E * N, K]` matrix; the rest use the localizable 4D layout
-    const auto tensor_map_l1_weights = use_interleaved_weights ?
-        make_interleaved_l1_tma_desc(l1_weights, weight_inner(hidden),
-                                     num_experts_per_rank * intermediate_hidden * 2,
-                                     config.load_block_n, is_packed_fp4) :
+    // TRT L1 rows are addressed as one 2D `[E * N, K]` matrix (FP8: 5D, regrouping the rows);
+    // the rest use the localizable 4D layout
+    const auto tensor_map_l1_weights = use_trtllm_weights and not is_packed_fp4 ?
+        make_trtllm_fp8_l1_tma_desc(l1_weights, hidden, num_experts_per_rank * intermediate_hidden * 2) :
         use_trtllm_weights ?
         make_tma_2d_desc(weight_tensor(l1_weights),
                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
@@ -227,10 +206,9 @@ static void sm100_fp8_fp4_mega_moe(
                          static_cast<int>(l1_weights.stride(-2)),
                          config.swizzle_weights_mode, 0, false, not is_packed_fp4) :
         make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l1_weights_sf = use_interleaved_weights ? make_interleaved_l1_sf_tma_desc(
-        l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
-        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4) :
-        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l1_weights_sf = use_trtllm_weights and not is_packed_fp4 ? make_trtllm_fp8_l1_sf_tma_desc(
+        l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128, hidden / (kGranK * 4)) :
+        use_trtllm_weights ? make_trtllm_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
@@ -257,13 +235,10 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_l2_tma_desc(
         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
         make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l2_weights_sf = use_interleaved_weights ? make_trtllm_fp4_sf_tma_desc(
-        l2_weights_sf, true, num_experts_per_rank * hidden / 128,
-        intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
-        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_sf_tma_desc(
         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,

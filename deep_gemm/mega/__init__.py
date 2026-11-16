@@ -229,10 +229,9 @@ def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tens
 
 
 def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights):
-    # `gate_up_interleaved`: L1 gate/up rows interleaved per row (gate 2i, up 2i+1), unpacked
-    # `[E, N, K]` weights, and weight SFs in the CUTLASS 128x4-atom layout
-    # (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8 (`fp8xfp8`) weights.
-    if weight_layout not in ('megamoe', 'trtllm', 'gate_up_interleaved'):
+    # `trtllm`: TRT-LLM (FlashInfer) gated rows (`reorder_rows_for_gated_act_gemm` over [up; gate],
+    # then `shuffle_matrix_a(·, 128)`), and SFs with the same row shuffle in CUTLASS 128x4 atoms
+    if weight_layout not in ('megamoe', 'trtllm'):
         raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
     if weight_layout != 'megamoe' and (shared_l1_weights is not None or shared_l2_weights is not None):
         raise ValueError(f'{weight_layout} weight layout does not support shared experts')
@@ -282,10 +281,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             y.storage_offset() == gathered_y.storage_offset(), \
             '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
-    if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
-        raise ValueError('TRT-LLM packed weights require NVFP4 MMA')
-    if weight_layout == 'gate_up_interleaved' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
-        raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
+    if weight_layout == 'trtllm' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
+        raise ValueError('TRT-LLM packed weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
             '`use_x_scales` is only supported for `nvfp4xnvfp4`; '
@@ -368,8 +365,6 @@ def bf16_mega_moe(y: torch.Tensor,
                   post_expert_norm_eps: float = 1e-6,
                   post_expert_norm_weight_first: bool = False):
     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
-    if weight_layout == 'gate_up_interleaved':
-        raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     _C.bf16_mega_moe(
         y,
