@@ -766,6 +766,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
+            float pulled_x_scale = 0.0f;
 
             // Hidden bytes are divided into chunks
             constexpr uint32_t kNumHiddenTokenBytes = kHidden * kNumElemBits / 8;
@@ -793,8 +794,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).get_base_ptr();
             if constexpr (kUseSimtPull) {
                 // SIMT pull: each lane loads its 16-byte slices of the token into registers, then stores them, with no
-                // SMEM bounce buffer and no TMA round trip. All remote loads of the token (data, SF and top-k weight) are
-                // issued before any local store, so they share one remote round trip
+                // SMEM bounce buffer and no TMA round trip. All remote loads of the token (data, SF, top-k weight and
+                // x_scale) are issued before any local store, so they share one remote round trip
                 DG_STATIC_ASSERT(kNumHiddenTokenBytes % (16 * 32) == 0, "Invalid hidden for the SIMT pull");
                 constexpr uint32_t kNumPullUint4PerLane = kNumHiddenTokenBytes / (16 * 32);
                 constexpr uint32_t kNumSFUint32 = kHidden / kSFChunkK;
@@ -816,6 +817,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto weight = *sym_buffer.map(
                     buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
+                if constexpr (kUseXScales) {
+                    pulled_x_scale = *sym_buffer.map(
+                        buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx, current_rank_in_expert_idx);
+                }
 
                 // Store SF and the token locally
                 const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
@@ -842,10 +847,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     *buffer.l1_topk_weights_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = weight;
                     if constexpr (kUseXScales) {
-                        const auto x_scale = *sym_buffer.map(
-                            buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx,
-                            current_rank_in_expert_idx);
-                        *buffer.l1_x_scales_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = x_scale;
+                        *buffer.l1_x_scales_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = pulled_x_scale;
                     }
 
                     // Write source metadata for combine write-back (logical pool token)
@@ -889,10 +891,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            // Load the weight first, so that its remote latency overlaps with the SF copy below
+            // Load the weight and x_scale first, so that their remote latency overlaps with the SF copy below
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
+            if constexpr (kUseXScales) {
+                pulled_x_scale = *sym_buffer.map(
+                    buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx, current_rank_in_expert_idx);
+            }
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / kSFChunkK;
@@ -918,10 +924,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *buffer.l1_topk_weights_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = weight;
 
                 if constexpr (kUseXScales) {
-                    const auto x_scale = *sym_buffer.map(
-                        buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx,
-                        current_rank_in_expert_idx);
-                    *buffer.l1_x_scales_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = x_scale;
+                    *buffer.l1_x_scales_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = pulled_x_scale;
                 }
 
                 if constexpr (kUseFullPoolFP8FP4Path) {
