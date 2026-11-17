@@ -35,6 +35,9 @@ enum class MegaMoEWeightLayout {
     RowShuffled         = 1,
     // L1 [g0 u0 g1 u1 ..], L2 rows plain, SFs in CUTLASS 128x4 atoms.
     GateUpInterleaved   = 2,
+    // FlashInfer CuTe DSL swap-AB order. L1 per 16 pairs: [u0 .. u15, g0 .. g15]. L2 rows plain,
+    // SFs in CUTLASS 128x4 atoms.
+    UpGateBlock16       = 3,
 };
 
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {

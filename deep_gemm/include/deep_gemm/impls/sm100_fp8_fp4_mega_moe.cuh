@@ -175,7 +175,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
-    constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved;
+    constexpr bool kUseUpGateBlock16 = kWeightLayout == MegaMoEWeightLayout::UpGateBlock16;
+    constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved or kUseUpGateBlock16;
     constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
     constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -1205,7 +1206,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
                             auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
                             if (cute::elect_one_sync()) {
-                                if constexpr (kIsWeightFP8) {
+                                if constexpr (kIsWeightFP8 and not kUseUpGateBlock16) {
                                     cute::SM100_TMA_2SM_LOAD_4D::copy(
                                         tensor_map_b_ptr, full, cache_hint, tile,
                                         k_idx + atom * 128, 0, 0, expert_n_idx / 16);
@@ -1679,8 +1680,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         //   act = kSituBeta * tanh(gate/kSituBeta) * sigmoid(gate)
                         //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
-                        // TRT keeps `row ^ 8`, so up precedes gate
-                        constexpr uint32_t kGateSlot = kUseShuffledWeights ? 1u : 0u;
+                        // Row-shuffled keeps `row ^ 8` and up/gate 16-row blocks load up first, so up precedes gate
+                        constexpr uint32_t kGateSlot = (kUseShuffledWeights or kUseUpGateBlock16) ? 1u : 0u;
                         constexpr uint32_t kUpSlot = 1u - kGateSlot;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {

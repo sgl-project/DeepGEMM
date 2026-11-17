@@ -233,6 +233,7 @@ _WEIGHT_LAYOUTS = {
     'gate_up_block8': 'gate_up_block8', 'megamoe': 'gate_up_block8',
     'row_shuffled': 'row_shuffled', 'trtllm': 'row_shuffled',
     'gate_up_interleaved': 'gate_up_interleaved', 'inkling2': 'gate_up_interleaved',
+    'up_gate_block16': 'up_gate_block16',
 }
 
 
@@ -242,6 +243,8 @@ def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     # `row_shuffled`: TRT-LLM / FlashInfer `shuffle_matrix_a` order, CUTLASS 128x4-atom SFs; NVFP4 or BF16.
     # `gate_up_interleaved`: L1 gate/up rows interleaved per row, unpacked `[E, N, K]` weights,
     # CUTLASS 128x4-atom SFs (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8xFP8.
+    # `up_gate_block16`: as `gate_up_interleaved`, with L1 rows in 16-row blocks of up then gate
+    # (FlashInfer CuTe DSL swap-AB MoE order); NVFP4 or FP8xFP8.
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
     weight_layout = _WEIGHT_LAYOUTS[weight_layout]
@@ -296,7 +299,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA')
-    if weight_layout == 'gate_up_interleaved' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
+    if weight_layout in ('gate_up_interleaved', 'up_gate_block16') and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
         raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError(
@@ -380,7 +383,7 @@ def bf16_mega_moe(y: torch.Tensor,
                   post_expert_norm_eps: float = 1e-6,
                   post_expert_norm_weight_first: bool = False):
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
-    if weight_layout == 'gate_up_interleaved':
+    if weight_layout in ('gate_up_interleaved', 'up_gate_block16'):
         raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
     _C.bf16_mega_moe(

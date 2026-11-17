@@ -17,14 +17,28 @@ namespace deep_gemm {
 // the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 u2 .. u14 g1 g3 .. g15 u1 u3 .. u15]
 // (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
 // (SMEM row 8p + i <- GMEM row 2i + p).
+// `UpGateBlock16` L1 rows per 16 pairs are [u0 .. u15 g0 .. g15]. The descriptor loads up before gate
+// (the epilogue swaps the slots): packed FP4 per 32 rows [u0 u2 .. u14 g0 g2 .. g14 u1 u3 .. u15 g1 g3 .. g15]
+// (SMEM row 16e + 8h + q <- GMEM row 16h + 2q + e), FP8 per 16 rows [u0 .. u7 g0 .. g7]
+// (SMEM row 16k + 8h + i <- GMEM row 16h + 8k + i).
 static CUtensorMap make_interleaved_l1_tma_desc(
     const torch::Tensor& weights, const int inner_bytes, const int rows,
-    const int load_block_n, const bool packed_fp4) {
+    const int load_block_n, const bool packed_fp4, const bool up_gate_block16) {
     DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0);
     DG_HOST_ASSERT(rows % 32 == 0 and load_block_n % 32 == 0);
     CUtensorMap result;
     const cuuint64_t row = static_cast<cuuint64_t>(inner_bytes);
-    if (packed_fp4) {
+    if (up_gate_block16) {
+        const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
+        const cuuint64_t strides[4] = {(packed_fp4 ? 2 : 1) * row, 16 * row, (packed_fp4 ? 1 : 8) * row, 32 * row};
+        const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
+        const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, weights.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    } else if (packed_fp4) {
         const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
         const cuuint64_t strides[4] = {4 * row, row, 2 * row, 32 * row};
         const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
@@ -53,14 +67,18 @@ static CUtensorMap make_interleaved_l1_tma_desc(
 // The row block and k chunk dims are flattened, so one load covers one row block.
 static CUtensorMap make_interleaved_l1_sf_tma_desc(
     const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks,
-    const int& box_k_chunks, const bool packed_fp4) {
+    const int& box_k_chunks, const bool packed_fp4, const bool up_gate_block16) {
     DG_HOST_ASSERT(sf.is_contiguous() and box_k_chunks <= num_k_chunks);
     CUtensorMap result;
     const cuuint64_t dims[5] = {4, 8, 2, 2,
                                 static_cast<cuuint64_t>(num_row_blocks) * num_k_chunks};
     // packed FP4: (q, p, e) rows 4q + 2e + p; FP8: (i, p, h) rows 16h + 2i + p (16-byte rows)
-    const cuuint64_t strides[4] = {packed_fp4 ? 64ull : 32ull, 16ull,
-                                   packed_fp4 ? 32ull : 256ull, 512ull};
+    // `UpGateBlock16` packed FP4: (q, h, e) rows 16h + 2q + e; FP8: (i, h, k) rows 16h + 8k + i
+    const cuuint64_t strides[4] = {
+        up_gate_block16 ? (packed_fp4 ? 32ull : 16ull) : (packed_fp4 ? 64ull : 32ull),
+        up_gate_block16 ? 256ull : 16ull,
+        up_gate_block16 ? (packed_fp4 ? 16ull : 128ull) : (packed_fp4 ? 32ull : 256ull),
+        512ull};
     const cuuint32_t box[5] = {4, 8, 2, 2, static_cast<cuuint32_t>(box_k_chunks)};
     const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
@@ -165,7 +183,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& broadcast_y = false
 ) {
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
-    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved;
+    const bool use_up_gate_block16 = weight_layout == MegaMoEWeightLayout::UpGateBlock16;
+    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved or use_up_gate_block16;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -219,7 +238,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l1_weights = use_interleaved_weights ?
         make_interleaved_l1_tma_desc(l1_weights, weight_inner(hidden),
                                      num_experts_per_rank * intermediate_hidden * 2,
-                                     config.load_block_n, is_packed_fp4) :
+                                     config.load_block_n, is_packed_fp4, use_up_gate_block16) :
         use_shuffled_weights ?
         make_tma_2d_desc(weight_tensor(l1_weights),
                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
@@ -229,7 +248,7 @@ static void sm100_fp8_fp4_mega_moe(
         make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
     const auto tensor_map_l1_weights_sf = use_interleaved_weights ? make_interleaved_l1_sf_tma_desc(
         l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
-        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4) :
+        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4, use_up_gate_block16) :
         use_shuffled_weights ? make_trtllm_fp4_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :

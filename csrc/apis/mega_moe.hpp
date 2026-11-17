@@ -216,7 +216,8 @@ static void fp8_fp4_mega_moe(
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
     const auto weight_layout = parse_weight_layout(weight_layout_str);
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
-    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved;
+    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved or
+                                         weight_layout == MegaMoEWeightLayout::UpGateBlock16;
 
     // Config checks; a broadcast `y` holds every rank's rows (rank-major) inside the symmetric buffer
     const auto num_ranks_y = broadcast_y ? static_cast<int>(sym_buffer_ptrs.size()) : 1;
@@ -458,7 +459,8 @@ static void bf16_mega_moe(
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto weight_layout = parse_weight_layout(weight_layout_str);
-    DG_HOST_ASSERT(weight_layout != MegaMoEWeightLayout::GateUpInterleaved);
+    DG_HOST_ASSERT(weight_layout != MegaMoEWeightLayout::GateUpInterleaved and
+                   weight_layout != MegaMoEWeightLayout::UpGateBlock16);
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     DG_HOST_ASSERT(parse_activation(activation) == MegaMoEActivation::SwiGLU);
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());

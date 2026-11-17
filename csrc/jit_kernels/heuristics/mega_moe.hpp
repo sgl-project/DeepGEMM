@@ -152,8 +152,10 @@ static MegaMoEWeightLayout parse_weight_layout(const std::string& weight_layout_
         return MegaMoEWeightLayout::GateUpBlock8;
     if (weight_layout_str == "row_shuffled" or weight_layout_str == "trtllm")
         return MegaMoEWeightLayout::RowShuffled;
-    DG_HOST_ASSERT(weight_layout_str == "gate_up_interleaved" or weight_layout_str == "inkling2");
-    return MegaMoEWeightLayout::GateUpInterleaved;
+    if (weight_layout_str == "gate_up_interleaved" or weight_layout_str == "inkling2")
+        return MegaMoEWeightLayout::GateUpInterleaved;
+    DG_HOST_ASSERT(weight_layout_str == "up_gate_block16");
+    return MegaMoEWeightLayout::UpGateBlock16;
 }
 
 static std::string to_weight_layout_name(const MegaMoEWeightLayout& weight_layout) {
@@ -161,6 +163,7 @@ static std::string to_weight_layout_name(const MegaMoEWeightLayout& weight_layou
         case MegaMoEWeightLayout::GateUpBlock8:         return "MegaMoEWeightLayout::GateUpBlock8";
         case MegaMoEWeightLayout::RowShuffled:          return "MegaMoEWeightLayout::RowShuffled";
         case MegaMoEWeightLayout::GateUpInterleaved:    return "MegaMoEWeightLayout::GateUpInterleaved";
+        case MegaMoEWeightLayout::UpGateBlock16:        return "MegaMoEWeightLayout::UpGateBlock16";
     }
     DG_HOST_UNREACHABLE("Unknown weight layout");
 }
