@@ -57,7 +57,7 @@ static void sm100_bf16_mega_moe(
     const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::GateUpBlock8,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
-    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::EpilogueShuffled;
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));

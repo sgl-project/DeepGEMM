@@ -21,15 +21,19 @@ enum class MegaMoEActivation {
     SiTU        = 2,
 };
 
-// How MegaMoE expert weights and their SFs are stored
+// How MegaMoE expert weights and their SFs are stored, per expert. `g{j}` / `u{j}` are the gate / up rows
+// of L1 output pair j. SF rows follow their weight rows; CUTLASS 128x4 atoms are
+// `[N / 128][K / (4 * gran_k)][128 words]`, word 4 * (row % 32) + (row / 32) % 4.
 enum class MegaMoEWeightLayout {
-    // L1 gate/up alternate in 8-row blocks (packed FP4: even rows, then odd rows of each 16-row group),
-    // L2 plain, SFs transposed for UTCCP; `transform_weights_for_mega_moe` output
+    // `transform_weights_for_mega_moe` output. L1 per 16 pairs: NVFP4 and MXF4 MMA
+    // [g0 g2 .. g14, u0 u2 .. u14, g1 g3 .. g15, u1 u3 .. u15], other MMA [g0 .. g7, u0 .. u7, g8 .. g15, u8 .. u15].
+    // L2 rows plain. SFs row-major, each 128-row block transposed for UTCCP (row 4i + j holds row 32j + i).
     GateUpBlock8        = 0,
-    // TRT-LLM epilogue-tile shuffle (`shuffle_matrix_a`, 128 rows) of L1 `[up; gate]` and L2 rows,
-    // SFs in CUTLASS 128x4 atoms
-    EpilogueShuffled    = 1,
-    // L1 gate/up alternate per row (gate 2i, up 2i + 1), L2 plain, SFs in CUTLASS 128x4 atoms
+    // TRT-LLM `shuffle_matrix_a` order. L1 per 16 pairs: [u0 u2 .. u14, g0 g2 .. g14, u1 u3 .. u15, g1 g3 .. g15].
+    // L2: in each 32-row group, row 8 * i1 + i2 holds row 4 * i2 + i1. BF16 weights are also K-blocked,
+    // `[E, K / 64, N, 64]`. SFs in CUTLASS 128x4 atoms.
+    RowShuffled         = 1,
+    // L1 [g0 u0 g1 u1 ..], L2 rows plain, SFs in CUTLASS 128x4 atoms.
     GateUpInterleaved   = 2,
 };
 

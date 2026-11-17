@@ -231,18 +231,17 @@ def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tens
 # Weight layout names, and the source names (DeepGEMM, TRT-LLM, Inkling2) that map to them
 _WEIGHT_LAYOUTS = {
     'gate_up_block8': 'gate_up_block8', 'megamoe': 'gate_up_block8',
-    'epilogue_shuffled': 'epilogue_shuffled', 'trtllm': 'epilogue_shuffled',
+    'row_shuffled': 'row_shuffled', 'trtllm': 'row_shuffled',
     'gate_up_interleaved': 'gate_up_interleaved', 'inkling2': 'gate_up_interleaved',
 }
 
 
 def _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights) -> str:
-    # `gate_up_block8`: `transform_weights_for_mega_moe` output.
-    # `epilogue_shuffled`: TRT-LLM / FlashInfer `shuffle_matrix_a` rows of L1 `[up; gate]` and L2, CUTLASS
-    # 128x4-atom SFs; NVFP4 or BF16.
-    # `gate_up_interleaved`: L1 gate/up rows interleaved per row (gate 2i, up 2i+1), unpacked
-    # `[E, N, K]` weights, and weight SFs in the CUTLASS 128x4-atom layout
-    # (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8 (`fp8xfp8`) weights.
+    # Row orders are spelled out on `MegaMoEWeightLayout` (`common/types.cuh`).
+    # `gate_up_block8`: `transform_weights_for_mega_moe` output; supports shared experts.
+    # `row_shuffled`: TRT-LLM / FlashInfer `shuffle_matrix_a` order, CUTLASS 128x4-atom SFs; NVFP4 or BF16.
+    # `gate_up_interleaved`: L1 gate/up rows interleaved per row, unpacked `[E, N, K]` weights,
+    # CUTLASS 128x4-atom SFs (`[E][N / 128][K / (4 * gran_k)][128 words]`); NVFP4 or FP8xFP8.
     if weight_layout not in _WEIGHT_LAYOUTS:
         raise ValueError(f'Unsupported MegaMoE weight layout: {weight_layout!r}')
     weight_layout = _WEIGHT_LAYOUTS[weight_layout]
@@ -295,8 +294,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             y.storage_offset() == gathered_y.storage_offset(), \
             '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
-    if weight_layout == 'epilogue_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
-        raise ValueError('Epilogue-shuffled (TRT-LLM) weights require NVFP4 MMA')
+    if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
+        raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA')
     if weight_layout == 'gate_up_interleaved' and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
         raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':

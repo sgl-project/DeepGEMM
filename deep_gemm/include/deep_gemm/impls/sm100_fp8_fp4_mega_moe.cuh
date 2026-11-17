@@ -174,7 +174,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
-    constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::EpilogueShuffled;
+    constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
     constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved;
     constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
     constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;

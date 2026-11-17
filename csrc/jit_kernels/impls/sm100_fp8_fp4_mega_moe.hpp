@@ -14,7 +14,7 @@
 namespace deep_gemm {
 
 // `GateUpInterleaved` L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
-// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 .. u14 g1 .. g15 u1 .. u15]
+// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 u2 .. u14 g1 g3 .. g15 u1 u3 .. u15]
 // (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
 // (SMEM row 8p + i <- GMEM row 2i + p).
 static CUtensorMap make_interleaved_l1_tma_desc(
@@ -164,7 +164,7 @@ static void sm100_fp8_fp4_mega_moe(
     const float& situ_linear_beta = 25.0f,
     const bool& broadcast_y = false
 ) {
-    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::EpilogueShuffled;
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
