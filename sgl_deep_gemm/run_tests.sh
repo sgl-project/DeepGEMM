@@ -40,11 +40,6 @@ if [ ! -d "${TESTS_DIR}" ]; then
   exit 1
 fi
 
-if [ "${CUDA_VISIBLE_DEVICES+x}" = x ] && [ -z "${CUDA_VISIBLE_DEVICES}" ]; then
-  echo "CUDA_VISIBLE_DEVICES is set but empty; no GPUs are visible." >&2
-  exit 1
-fi
-
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "${NUM_GPUS}" -eq 0 ]; then
   echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
@@ -71,6 +66,13 @@ case "${DG_FILE}" in
     echo "       not the installed wheel. Aborting." >&2
     exit 1 ;;
 esac
+
+# CUDA reads CUDA_VISIBLE_DEVICES up to its first invalid entry; workers use that many entries.
+CUDA_GPUS=$(cd "${TESTS_DIR}" && "${PYTHON}" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null)
+if [ "${CUDA_GPUS:-0}" -eq 0 ]; then
+  echo "No GPUs visible to CUDA (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>})." >&2
+  exit 1
+fi
 
 echo "=============================================================="
 echo " DeepGEMM wheel test run"
@@ -122,7 +124,8 @@ run_parallel() {
   local n=${#jobs[@]}
   local dir; dir=$(mktemp -d)
   local gpus
-  IFS=, read -r -a gpus <<< "${CUDA_VISIBLE_DEVICES:-$(seq -s, 0 $((NUM_GPUS - 1)))}"
+  IFS=, read -r -a gpus <<< "${CUDA_VISIBLE_DEVICES-$(seq -s, 0 $((CUDA_GPUS - 1)))}"
+  gpus=("${gpus[@]:0:CUDA_GPUS}")
   local workers=$(( NPROC < ${#gpus[@]} ? NPROC : ${#gpus[@]} ))
   echo ""
   echo "----- RUN ${n} single-GPU jobs on ${workers} GPUs -----"
