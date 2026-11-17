@@ -342,9 +342,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
     constexpr uint32_t UMMA_B_K_BYTES = kPackedFP4Weights ? UMMA_K / 2 : UMMA_A_K_BYTES;
-    // UMMAs per 128-wide K block: independent of the SF granularity (a blockwise-128 word is
-    // reused across four blocks, each still issuing its own UMMAs)
-    constexpr uint32_t kNumMMAsPerSFChunk = BLOCK_K / UMMA_K;
+    // UMMAs sharing one SF word, capped at one K block: when the word is narrower than the block
+    // (FP4 activations, `kSFChunkK < BLOCK_K`) it covers `kSFChunkK / UMMA_K` UMMAs; when it is wider
+    // (blockwise-128, reused across four blocks) each block still issues its own `BLOCK_K / UMMA_K`.
+    constexpr uint32_t kNumMMAsPerSFChunk = math::constexpr_min(kSFChunkK, BLOCK_K) / UMMA_K;
     constexpr uint32_t kNumRoutedBTxTiles = (kIsFP4Acts or kIsWeightFP8 or kPackedFP4Weights) ? 2 : 1;
     constexpr bool kSplitSharedK = kPackedFP4Weights and kHasShared;
     constexpr uint32_t SHARED_BLOCK_K = kSplitSharedK ? BLOCK_K / 2 : BLOCK_K;
