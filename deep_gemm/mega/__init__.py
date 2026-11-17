@@ -228,11 +228,11 @@ def transform_scales_for_mega_moe(l1_scales: torch.Tensor, l2_scales: torch.Tens
             _transpose_sf_for_utccp(l2_scales))
 
 
-# Weight layout names, and the source names (DeepGEMM, TRT-LLM, Inkling2) that map to them
+# Weight layout names, and the source names (DeepGEMM, TRT-LLM) that map to them
 _WEIGHT_LAYOUTS = {
     'gate_up_block8': 'gate_up_block8', 'megamoe': 'gate_up_block8',
     'row_shuffled': 'row_shuffled', 'trtllm': 'row_shuffled',
-    'gate_up_interleaved': 'gate_up_interleaved', 'inkling2': 'gate_up_interleaved',
+    'gate_up_interleaved': 'gate_up_interleaved',
     'up_gate_block16': 'up_gate_block16',
 }
 
