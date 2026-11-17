@@ -54,10 +54,10 @@ static void sm100_bf16_mega_moe(
     const bool& post_expert_norm,
     const bool& post_expert_norm_weight_first,
     const float& post_expert_norm_eps,
-    const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::MegaMoE,
+    const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::GateUpBlock8,
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
-    const bool use_trtllm_weights = weight_layout == MegaMoEWeightLayout::TrtLLM;
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::EpilogueShuffled;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -71,7 +71,7 @@ static void sm100_bf16_mega_moe(
     // The BF16 kernel has a single store block size for both layers
     DG_HOST_ASSERT(config.store_block_m_l1 == config.store_block_m_l2);
 
-    if (use_trtllm_weights) {
+    if (use_shuffled_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
         DG_HOST_ASSERT(hidden % 64 == 0 and intermediate_hidden % 64 == 0);
         DG_HOST_ASSERT(config.block_k % 64 == 0 and config.block_n == 128);
@@ -84,7 +84,7 @@ static void sm100_bf16_mega_moe(
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     // BlockMajorK storage: [expert, K/64, row, 64].
-    const auto tensor_map_l1_weights = use_trtllm_weights ? make_trtllm_bf16_weight_tma_desc(
+    const auto tensor_map_l1_weights = use_shuffled_weights ? make_trtllm_bf16_weight_tma_desc(
         l1_weights, num_experts_per_rank * (hidden / 64) * intermediate_hidden * 2, true) :
         make_tma_weights_3d_desc(l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode);
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
@@ -97,7 +97,7 @@ static void sm100_bf16_mega_moe(
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_bf16_weight_tma_desc(
+    const auto tensor_map_l2_weights = use_shuffled_weights ? make_trtllm_bf16_weight_tma_desc(
         l2_weights, num_experts_per_rank * (intermediate_hidden / 64) * hidden, false) :
         make_tma_weights_3d_desc(l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode);
 

@@ -122,7 +122,7 @@ template <
     bool kPostNormWeightFirst = false,
     bool kPostNormHasWeight = false,
     float kPostNormEps = 0.0f,
-    MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::MegaMoE,
+    MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::GateUpBlock8,
     // SM107 only: K=64 `kind::mxf8f6f4` MMAs on packed FP4 routed weights (FP8 x FP4)
     bool kUseSM107K64 = false,
     // SIMT dispatch pull (no SMEM send buffer)
@@ -174,7 +174,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
-    constexpr bool kUseTrtllmWeights = kWeightLayout == MegaMoEWeightLayout::TrtLLM;
+    constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::EpilogueShuffled;
     constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved;
     constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
     constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
@@ -195,7 +195,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                      "Post-expert norm does not support shared experts");
     DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
                      "Post-expert norm weight without the post-expert norm");
-    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+    DG_STATIC_ASSERT(not kUseShuffledWeights or
                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
                      "TRT weight layout requires routed NVFP4 experts");
     DG_STATIC_ASSERT(not kUseInterleavedWeights or
@@ -326,7 +326,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kPackedFP4Weights = kUseSM107K64;
     DG_STATIC_ASSERT(not kPackedFP4Weights or
                      (kMmaKind == MmaKind::MXFP8FP4 and not kIsWeightFP8 and kGranK == 32 and
-                      BLOCK_K == 128 and not kUseTrtllmWeights),
+                      BLOCK_K == 128 and not kUseShuffledWeights),
                      "The K=64 MMA only applies to FP8 x FP4 with per-32 SFs and 128-wide K blocks");
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
@@ -1149,7 +1149,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / kSFChunkK);
 
                 // TMA copy weights with SF
-                if constexpr (kUseTrtllmWeights) {
+                if constexpr (kUseShuffledWeights) {
                     // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
@@ -1382,7 +1382,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                    ((kUseTrtllmWeights or kUseInterleavedWeights)
+                                    ((kUseShuffledWeights or kUseInterleavedWeights)
                                         ? i * (kNumSFChunksPerBlock * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                         : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1680,7 +1680,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
                         // TRT keeps `row ^ 8`, so up precedes gate
-                        constexpr uint32_t kGateSlot = kUseTrtllmWeights ? 1u : 0u;
+                        constexpr uint32_t kGateSlot = kUseShuffledWeights ? 1u : 0u;
                         constexpr uint32_t kUpSlot = 1u - kGateSlot;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {

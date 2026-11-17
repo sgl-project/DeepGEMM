@@ -23,11 +23,13 @@ enum class MegaMoEActivation {
 
 // How MegaMoE expert weights and their SFs are stored
 enum class MegaMoEWeightLayout {
-    // `transform_weights_for_mega_moe` output
-    MegaMoE             = 0,
-    // TRT-LLM (FlashInfer) shuffled rows, SFs in CUTLASS 128x4 atoms
-    TrtLLM              = 1,
-    // L1 rows alternate gate/up (gate 2i, up 2i + 1), SFs in CUTLASS 128x4 atoms
+    // L1 gate/up alternate in 8-row blocks (packed FP4: even rows, then odd rows of each 16-row group),
+    // L2 plain, SFs transposed for UTCCP; `transform_weights_for_mega_moe` output
+    GateUpBlock8        = 0,
+    // TRT-LLM epilogue-tile shuffle (`shuffle_matrix_a`, 128 rows) of L1 `[up; gate]` and L2 rows,
+    // SFs in CUTLASS 128x4 atoms
+    EpilogueShuffled    = 1,
+    // L1 gate/up alternate per row (gate 2i, up 2i + 1), L2 plain, SFs in CUTLASS 128x4 atoms
     GateUpInterleaved   = 2,
 };
 
