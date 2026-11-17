@@ -40,6 +40,11 @@ if [ ! -d "${TESTS_DIR}" ]; then
   exit 1
 fi
 
+if [ "${CUDA_VISIBLE_DEVICES+x}" = x ] && [ -z "${CUDA_VISIBLE_DEVICES}" ]; then
+  echo "CUDA_VISIBLE_DEVICES is set but empty; no GPUs are visible." >&2
+  exit 1
+fi
+
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "${NUM_GPUS}" -eq 0 ]; then
   echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
