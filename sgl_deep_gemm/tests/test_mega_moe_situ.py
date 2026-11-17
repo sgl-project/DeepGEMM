@@ -145,21 +145,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert len(kernel_sources) == 3
     assert any(
         re.search(
-            r"cute::numeric_limits<float>::infinity\(\),\s+0x0p[+-]\d+f,\s+true,\s+true",
+            r"cute::numeric_limits<float>::infinity\(\),\s+MegaMoEActivation::SiTU,\s+true",
             source,
         )
         for source in kernel_sources
-    ), "explicit SiTU did not instantiate kUseSitu=true"
+    ), "explicit SiTU did not instantiate MegaMoEActivation::SiTU"
     assert any(
         re.search(
-            r"cute::numeric_limits<float>::infinity\(\),\s+0x0p[+-]\d+f,\s+true,\s+false",
+            r"cute::numeric_limits<float>::infinity\(\),\s+MegaMoEActivation::SiTU,\s+false",
             source,
         )
         for source in kernel_sources
     ), "fast_math=False SiTU did not instantiate kFastMath=false"
     assert any(
-        re.search(r"0x1p-5f,\s+0x0p[+-]\d+f,\s+false,\s+true", source) for source in kernel_sources
-    ), "activation_clamp=0.03125 still instantiated kUseSitu=true"
+        re.search(r"0x1p-5f,\s+MegaMoEActivation::SwiGLU,\s+true", source) for source in kernel_sources
+    ), "activation_clamp=0.03125 did not instantiate MegaMoEActivation::SwiGLU"
 
     try:
         run("situ", activation_clamp=0.03125)
