@@ -37,7 +37,7 @@ template <
     bool kPostNormWeightFirst = false,
     bool kPostNormHasWeight = false,
     float kPostNormEps = 1e-6f,
-    bool kUseTrtllmWeights = false,
+    MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::GateUpBlock8,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -72,6 +72,7 @@ sm100_bf16_mega_moe_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                          const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = ptx::Allocator2Sm;
 
@@ -85,9 +86,9 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-    DG_STATIC_ASSERT(not kUseTrtllmWeights or kNumSharedExperts == 0,
+    DG_STATIC_ASSERT(not kUseShuffledWeights or kNumSharedExperts == 0,
                      "TRTLLM weight layout does not support shared experts");
-    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+    DG_STATIC_ASSERT(not kUseShuffledWeights or
                      (kHidden % 64 == 0 and kIntermediateHidden % 64 == 0 and BLOCK_K % 64 == 0),
                      "TRTLLM BF16 weights require complete 128-byte K blocks");
 
@@ -168,7 +169,7 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
-    DG_STATIC_ASSERT(not kUseTrtllmWeights or (LOAD_BLOCK_N % 32 == 0 and LOAD_BLOCK_N / 32 <= 32),
+    DG_STATIC_ASSERT(not kUseShuffledWeights or (LOAD_BLOCK_N % 32 == 0 and LOAD_BLOCK_N / 32 <= 32),
                      "TRTLLM L1 loads one 32-row permutation block per lane");
 
     // Swizzle configs
@@ -757,7 +758,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 uint32_t k_idx = k_block_idx * BLOCK_K;
 
                 // TMA copy weights
-                if constexpr (kUseTrtllmWeights) {
+                if constexpr (kUseShuffledWeights) {
                     const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
                     #pragma unroll
                     for (uint32_t atom = 0; atom < BLOCK_K / 64; ++ atom) {
@@ -1021,7 +1022,7 @@ sm100_bf16_mega_moe_impl(void* y,
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
                         auto fp32_values = reinterpret_cast<float*>(values);
                         // TRT keeps `row ^ 8`, so up precedes gate
-                        constexpr uint32_t kGateOff = kUseTrtllmWeights ? 2u : 0u;
+                        constexpr uint32_t kGateOff = kUseShuffledWeights ? 2u : 0u;
                         constexpr uint32_t kUpOff = 2u - kGateOff;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {

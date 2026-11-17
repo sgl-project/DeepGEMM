@@ -129,6 +129,45 @@ static std::string to_mma_kind_name(const MmaKind& mma_kind) {
     DG_HOST_UNREACHABLE("Unknown MMA kind");
 }
 
+static MegaMoEActivation parse_activation(const std::string& activation_str) {
+    if (activation_str == "swiglu")
+        return MegaMoEActivation::SwiGLU;
+    if (activation_str == "swigluoai")
+        return MegaMoEActivation::SwiGLUOAI;
+    DG_HOST_ASSERT(activation_str == "situ");
+    return MegaMoEActivation::SiTU;
+}
+
+static std::string to_activation_name(const MegaMoEActivation& activation) {
+    switch (activation) {
+        case MegaMoEActivation::SwiGLU:     return "MegaMoEActivation::SwiGLU";
+        case MegaMoEActivation::SwiGLUOAI:  return "MegaMoEActivation::SwiGLUOAI";
+        case MegaMoEActivation::SiTU:       return "MegaMoEActivation::SiTU";
+    }
+    DG_HOST_UNREACHABLE("Unknown activation");
+}
+
+static MegaMoEWeightLayout parse_weight_layout(const std::string& weight_layout_str) {
+    if (weight_layout_str == "gate_up_block8" or weight_layout_str == "megamoe")
+        return MegaMoEWeightLayout::GateUpBlock8;
+    if (weight_layout_str == "row_shuffled" or weight_layout_str == "trtllm")
+        return MegaMoEWeightLayout::RowShuffled;
+    if (weight_layout_str == "gate_up_interleaved")
+        return MegaMoEWeightLayout::GateUpInterleaved;
+    DG_HOST_ASSERT(weight_layout_str == "up_gate_block16");
+    return MegaMoEWeightLayout::UpGateBlock16;
+}
+
+static std::string to_weight_layout_name(const MegaMoEWeightLayout& weight_layout) {
+    switch (weight_layout) {
+        case MegaMoEWeightLayout::GateUpBlock8:         return "MegaMoEWeightLayout::GateUpBlock8";
+        case MegaMoEWeightLayout::RowShuffled:          return "MegaMoEWeightLayout::RowShuffled";
+        case MegaMoEWeightLayout::GateUpInterleaved:    return "MegaMoEWeightLayout::GateUpInterleaved";
+        case MegaMoEWeightLayout::UpGateBlock16:        return "MegaMoEWeightLayout::UpGateBlock16";
+    }
+    DG_HOST_UNREACHABLE("Unknown weight layout");
+}
+
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4 or mma_kind == MmaKind::NVFP4;
 }
