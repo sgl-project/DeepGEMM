@@ -2178,8 +2178,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t load_stage_idx = 0;
 
         // Every rank makes the same calls, so the per-call epoch tags combine readiness on all of them
+        // NOTES: bit 63 keeps these tags apart from the BF16 kernel's grid-index tags in a shared buffer
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
-        const uint64_t call_tag = static_cast<uint64_t>(ptx::ld_volatile(workspace.get_grid_sync_count_ptr<kCallEpochIndex>())) + 1;
+        const uint64_t call_tag = (1ull << 63) |
+            (static_cast<uint64_t>(ptx::ld_volatile(workspace.get_grid_sync_count_ptr<kCallEpochIndex>())) + 1);
 
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
