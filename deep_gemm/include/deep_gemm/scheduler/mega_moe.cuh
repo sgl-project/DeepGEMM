@@ -338,7 +338,14 @@ struct MegaMoEScheduler {
         const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs / 2);
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
-        num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+
+        // Issue every L1 task before the first L2 task when the L1 work is decode-sized: decode tiles
+        // (`BLOCK_M <= 64`), or at most one L1 wave left after the warmup. The last M blocks then start
+        // their L1 earlier, and their L1 -> L2 chain sets the tail. Larger loads keep the interleaved order.
+        // With a ring slot for every pool block, no L1 task waits for an L2 task to free a slot.
+        const bool is_l1_first = num_total_m_blocks <= kNumRingBlocks and
+            (BLOCK_M <= 64 or num_total_l1_waves <= min_l1_warmup_waves + 1);
+        num_sched_l1_waves = is_l1_first ? num_total_l1_waves : cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -474,9 +481,12 @@ struct MegaMoEScheduler {
         const auto lane_idx = ptx::get_lane_idx();
         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
 
-        // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
+        // With decode tiles (`BLOCK_M <= 64`), shared L2 tasks go before the routed tasks if one wave fits the
+        // dispatch gap. Otherwise they go at the tail, where they fill the CTA pairs that idle during the last
+        // routed M blocks' L1 -> L2 chain instead of waiting for the shared L1 ahead of the routed L1 tasks.
         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
-        const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
+        const bool is_shared_l2_early = BLOCK_M <= 64 and
+            math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
         if constexpr (kHasShared) {
             // Shared expert L1 tasks do not depend on dispatch.
             shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
