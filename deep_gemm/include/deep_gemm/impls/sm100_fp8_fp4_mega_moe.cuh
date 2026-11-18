@@ -104,8 +104,7 @@ template <
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
-    float kSwiGLUAlpha,
-    bool kUseSitu,
+    MegaMoEActivation kActivation,
     bool kFastMath,
     bool kUseXScales,
     bool kWithL1Alphas,
@@ -123,13 +122,12 @@ template <
     bool kPostNormWeightFirst = false,
     bool kPostNormHasWeight = false,
     float kPostNormEps = 0.0f,
-    bool kUseTrtllmWeights = false,
+    MegaMoEWeightLayout kWeightLayout = MegaMoEWeightLayout::GateUpBlock8,
     // SM107 only: K=64 `kind::mxf8f6f4` MMAs on packed FP4 routed weights (FP8 x FP4)
     bool kUseSM107K64 = false,
     // SIMT dispatch pull (no SMEM send buffer)
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
-    bool kUseInkling2Weights = false,
     bool kBroadcastY = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -177,6 +175,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
+    constexpr bool kUseUpGateBlock16 = kWeightLayout == MegaMoEWeightLayout::UpGateBlock16;
+    constexpr bool kUseInterleavedWeights = kWeightLayout == MegaMoEWeightLayout::GateUpInterleaved or kUseUpGateBlock16;
+    constexpr bool kUseSitu = kActivation == MegaMoEActivation::SiTU;
+    constexpr float kSwiGLUAlpha = kActivation == MegaMoEActivation::SwiGLUOAI ? 1.702f : 0.0f;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = ptx::Allocator2Sm;
 
@@ -194,14 +197,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                      "Post-expert norm does not support shared experts");
     DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
                      "Post-expert norm weight without the post-expert norm");
-    DG_STATIC_ASSERT(not kUseTrtllmWeights or
+    DG_STATIC_ASSERT(not kUseShuffledWeights or
                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
                      "TRT weight layout requires routed NVFP4 experts");
-    DG_STATIC_ASSERT(not kUseInkling2Weights or
-                     (not kUseTrtllmWeights and kNumSharedExperts == 0 and
+    DG_STATIC_ASSERT(not kUseInterleavedWeights or
+                     (kNumSharedExperts == 0 and
                       (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
                                                       cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
-                     "Inkling2 weight layout requires routed NVFP4 or FP8xFP8 experts");
+                     "Gate/up interleaved weight layout requires routed NVFP4 or FP8xFP8 experts");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -337,7 +340,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kPackedFP4Weights = kUseSM107K64;
     DG_STATIC_ASSERT(not kPackedFP4Weights or
                      (kMmaKind == MmaKind::MXFP8FP4 and not kIsWeightFP8 and kGranK == 32 and
-                      BLOCK_K == 128 and not kUseTrtllmWeights),
+                      BLOCK_K == 128 and not kUseShuffledWeights),
                      "The K=64 MMA only applies to FP8 x FP4 with per-32 SFs and 128-wide K blocks");
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
@@ -1195,7 +1198,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     task_info.local_expert_idx * shape_sfb_k + (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage;
 
                 // TMA copy weights with SF
-                if constexpr (kUseTrtllmWeights) {
+                if constexpr (kUseShuffledWeights) {
                     // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
@@ -1239,8 +1242,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         else
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
-                } else if constexpr (kUseInkling2Weights) {
-                    // Inkling2 weights: L1 rows reordered into the `megamoe` SMEM order by the
+                } else if constexpr (kUseInterleavedWeights) {
+                    // Gate/up interleaved weights: L1 rows reordered into the `megamoe` SMEM order by the
                     // descriptor; L2 rows are plain. SFs are CUTLASS 128x4 atoms (TRT SMEM order).
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
                     const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
@@ -1251,7 +1254,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
                             auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
                             if (cute::elect_one_sync()) {
-                                if constexpr (kIsWeightFP8) {
+                                if constexpr (kIsWeightFP8 and not kUseUpGateBlock16) {
                                     cute::SM100_TMA_2SM_LOAD_4D::copy(
                                         tensor_map_b_ptr, full, cache_hint, tile,
                                         k_idx + atom * 128, 0, 0, expert_n_idx / 16);
@@ -1442,7 +1445,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                     auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                        ((kUseTrtllmWeights or kUseInkling2Weights)
+                                        ((kUseShuffledWeights or kUseInterleavedWeights)
                                             ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                             : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                     mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1744,8 +1747,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         //   act = kSituBeta * tanh(gate/kSituBeta) * sigmoid(gate)
                         //   up' = kSituLinearBeta * tanh(up/kSituLinearBeta)
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
-                        // TRT keeps `row ^ 8`, so up precedes gate
-                        constexpr uint32_t kGateSlot = kUseTrtllmWeights ? 1u : 0u;
+                        // Row-shuffled keeps `row ^ 8` and up/gate 16-row blocks load up first, so up precedes gate
+                        constexpr uint32_t kGateSlot = (kUseShuffledWeights or kUseUpGateBlock16) ? 1u : 0u;
                         constexpr uint32_t kUpSlot = 1u - kGateSlot;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {

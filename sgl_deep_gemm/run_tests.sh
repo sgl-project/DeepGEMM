@@ -67,6 +67,13 @@ case "${DG_FILE}" in
     exit 1 ;;
 esac
 
+# CUDA reads CUDA_VISIBLE_DEVICES up to its first invalid entry; workers use that many entries.
+CUDA_GPUS=$(cd "${TESTS_DIR}" && "${PYTHON}" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null)
+if [ "${CUDA_GPUS:-0}" -eq 0 ]; then
+  echo "No GPUs visible to CUDA (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>})." >&2
+  exit 1
+fi
+
 echo "=============================================================="
 echo " DeepGEMM wheel test run"
 echo "   deep_gemm:    ${DG_FILE}"
@@ -83,13 +90,8 @@ PASSED=()
 FAILED=()
 SKIPPED=()
 
-run_test() {
-  local name="$1"; shift
-  echo ""
-  echo "----- RUN ${name} $* -----"
-  local log; log=$(mktemp)
-  (cd "${TESTS_DIR}" && "${PYTHON}" -u "${name}" "$@") 2>&1 | tee "${log}"
-  local rc=${PIPESTATUS[0]}
+record_result() {
+  local name="$1" rc="$2" log="$3"
   # Fork-based multiprocessing tests can crash in child processes while the
   # launcher still exits 0; treat an unhandled traceback as a failure too.
   if [ "${rc}" -eq 0 ] && grep -q "Traceback (most recent call last)" "${log}"; then
@@ -102,7 +104,54 @@ run_test() {
     echo "----- FAIL ${name} (exit ${rc}) -----"
     FAILED+=("${name}")
   fi
+}
+
+run_test() {
+  local name="$1"; shift
+  echo ""
+  echo "----- RUN ${name} $* -----"
+  local log; log=$(mktemp)
+  (cd "${TESTS_DIR}" && "${PYTHON}" -u "${name}" "$@") 2>&1 | tee "${log}"
+  record_result "${name}" "${PIPESTATUS[0]}" "${log}"
   rm -f "${log}"
+}
+
+# Runs single-GPU jobs ("test.py args...") at the same time, one per GPU.
+# Each GPU worker claims the next unclaimed job in list order, so list long jobs first.
+# Logs are printed in list order after all jobs finish.
+run_parallel() {
+  local jobs=("$@")
+  local n=${#jobs[@]}
+  local dir; dir=$(mktemp -d)
+  local gpus
+  IFS=, read -r -a gpus <<< "${CUDA_VISIBLE_DEVICES-$(seq -s, 0 $((CUDA_GPUS - 1)))}"
+  gpus=("${gpus[@]:0:CUDA_GPUS}")
+  local workers=$(( NPROC < ${#gpus[@]} ? NPROC : ${#gpus[@]} ))
+  echo ""
+  echo "----- RUN ${n} single-GPU jobs on ${workers} GPUs -----"
+  local w
+  for ((w = 0; w < workers; w++)); do
+    (
+      local j argv start
+      for ((j = 0; j < n; j++)); do
+        mkdir "${dir}/claim.${j}" 2>/dev/null || continue
+        read -r -a argv <<< "${jobs[j]}"
+        start=${SECONDS}
+        echo "----- START ${jobs[j]} (GPU ${gpus[w]}) -----"
+        (cd "${TESTS_DIR}" && CUDA_VISIBLE_DEVICES="${gpus[w]}" "${PYTHON}" -u "${argv[@]}") > "${dir}/${j}.log" 2>&1
+        echo $? > "${dir}/${j}.rc"
+        echo "----- DONE ${jobs[j]} (GPU ${gpus[w]}, exit $(cat "${dir}/${j}.rc"), $((SECONDS - start)) s) -----"
+      done
+    ) &
+  done
+  wait
+  for ((j = 0; j < n; j++)); do
+    echo ""
+    echo "----- RUN ${jobs[j]} -----"
+    cat "${dir}/${j}.log"
+    record_result "${jobs[j]}" "$(cat "${dir}/${j}.rc")" "${dir}/${j}.log"
+  done
+  rm -rf "${dir}"
 }
 
 skip_test() {
@@ -140,21 +189,34 @@ else
   SINGLE_GPU_TESTS=("${DEFAULT_SINGLE_GPU_TESTS[@]}")
 fi
 
+# test_fp8_fp4.py runs as one job per test function, ahead of the other tests.
+SINGLE_GPU_JOBS=()
 for t in "${SINGLE_GPU_TESTS[@]}"; do
-  if [ -f "${TESTS_DIR}/${t}" ]; then
-    run_test "${t}"
-  else
+  if [ ! -f "${TESTS_DIR}/${t}" ]; then
     skip_test "${t}" "not present in this branch"
+  elif [ "${t}" = test_fp8_fp4.py ]; then
+    SINGLE_GPU_JOBS=(
+      "${t} test_k_grouped_gemm_contiguous"
+      "${t} test_gemm"
+      "${t} test_m_grouped_gemm_contiguous"
+      "${t} test_m_grouped_gemm_masked"
+      "${t} test_sm90_block32"
+      "${SINGLE_GPU_JOBS[@]}"
+    )
+  else
+    SINGLE_GPU_JOBS+=("${t}")
   fi
 done
 
 for t in test_mega_gate.py test_mega_mhc.py test_locality_domain.py; do
   if [ "${ARCH_MAJOR}" -eq 10 ]; then
-    run_test "${t}"
+    SINGLE_GPU_JOBS+=("${t}")
   else
     skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
   fi
 done
+
+run_parallel "${SINGLE_GPU_JOBS[@]}"
 
 if [ "${ARCH_MAJOR}" -eq 12 ]; then
   for t in "${SM120_UNSUPPORTED_SINGLE_GPU_TESTS[@]}"; do

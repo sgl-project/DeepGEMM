@@ -72,8 +72,8 @@ get_symm_buffer_size_for_mega_moe(
 
     // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
+    DG_HOST_ASSERT(parse_activation(activation) != MegaMoEActivation::SiTU or
+                   mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -242,13 +242,16 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
     const float& post_expert_norm_eps = 1e-6f,
     const bool& post_expert_norm_weight_first = false,
-    const bool& use_trtllm_weights = false,
+    const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
-    const bool& use_inkling2_weights = false,
     const bool& broadcast_y = false
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+    const auto weight_layout = parse_weight_layout(weight_layout_str);
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
+    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved or
+                                         weight_layout == MegaMoEWeightLayout::UpGateBlock16;
 
     // Config checks; a broadcast `y` holds every rank's rows (rank-major) inside the symmetric buffer
     const auto num_ranks_y = broadcast_y ? static_cast<int>(sym_buffer_ptrs.size()) : 1;
@@ -279,13 +282,11 @@ static void fp8_fp4_mega_moe(
                             " does not match `" + mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ", or 128 for blockwise-128 FP8 SFs)");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(not (use_trtllm_weights and use_inkling2_weights));
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
-                   ((mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4) and activation == "situ"));
-    DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
-    const bool use_situ = activation == "situ";
-    const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
+    DG_HOST_ASSERT(not use_shuffled_weights or mma_kind == MmaKind::NVFP4);
+    const auto activation_kind = parse_activation(activation);
+    DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or
+                   mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
+    DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or not activation_clamp_opt.has_value());
     // K3 SiTU config (activation_situ_{beta,linear_beta}). Passed to the kernel as template
     // parameters: it only takes its equal-transform shortcut for this pair, and computes the
     // literal SiTU for any other.
@@ -303,11 +304,11 @@ static void fp8_fp4_mega_moe(
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
-    DG_HOST_ASSERT(not use_trtllm_weights or not is_localized(l1_weights));
-    DG_HOST_ASSERT(not use_inkling2_weights or not is_localized(l1_weights));
+    DG_HOST_ASSERT(not use_shuffled_weights or not is_localized(l1_weights));
+    DG_HOST_ASSERT(not use_interleaved_weights or not is_localized(l1_weights));
     const auto weight_dtype = l1_weights.scalar_type();
     DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
-    DG_HOST_ASSERT(not use_inkling2_weights or mma_kind == MmaKind::NVFP4 or
+    DG_HOST_ASSERT(not use_interleaved_weights or mma_kind == MmaKind::NVFP4 or
                    (mma_kind == MmaKind::MXFP8FP4 and weight_dtype == torch::kFloat8_e4m3fn));
     DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
@@ -319,18 +320,18 @@ static void fp8_fp4_mega_moe(
     constexpr int kGranMN = 1;
     const int kGranK = gran_k;
     // TRT weights require matching dense TRT scales; descriptors encode their layout.
-    if (use_trtllm_weights or use_inkling2_weights)
+    if (use_shuffled_weights or use_interleaved_weights)
         DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and l2_weights_sf.is_contiguous());
-    if (use_inkling2_weights) {
+    if (use_interleaved_weights) {
         // CUTLASS 128x4 atoms: one byte per (row, K group) over 128-row-padded rows
         DG_HOST_ASSERT(intermediate_hidden * 2 % 128 == 0 and hidden % 128 == 0);
         DG_HOST_ASSERT(l1_weights_sf.nbytes() == int64_t(num_experts_per_rank) * intermediate_hidden * 2 * (hidden / kGranK));
         DG_HOST_ASSERT(l2_weights_sf.nbytes() == int64_t(num_experts_per_rank) * hidden * (intermediate_hidden / kGranK));
     } else {
         check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+                        num_experts_per_rank, not use_shuffled_weights, false, torch::kInt);
         check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                        num_experts_per_rank, not use_trtllm_weights, false, torch::kInt);
+                        num_experts_per_rank, not use_shuffled_weights, false, torch::kInt);
     }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
@@ -444,7 +445,7 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, swiglu_alpha, use_situ, fast_math,
+                               activation_clamp, activation_kind, fast_math,
                                use_x_scales,
                                l1_alphas.has_value()
                                    ? l1_alphas->const_data_ptr<float>() : nullptr,
@@ -458,10 +459,8 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_weight_first,
                                post_expert_norm_eps,
                                mma_kind,
-                               use_fp8_combine, gran_k,
-                               use_trtllm_weights, global_num_tokens,
-                               situ_beta, situ_linear_beta,
-                               use_inkling2_weights, broadcast_y);
+                               use_fp8_combine, gran_k, weight_layout, global_num_tokens,
+                               situ_beta, situ_linear_beta, broadcast_y);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -496,12 +495,16 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
     const float& post_expert_norm_eps = 1e-6f,
     const bool& post_expert_norm_weight_first = false,
-    const bool& use_trtllm_weights = false,
+    const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    DG_HOST_ASSERT(activation == "swiglu");
+    const auto weight_layout = parse_weight_layout(weight_layout_str);
+    DG_HOST_ASSERT(weight_layout != MegaMoEWeightLayout::GateUpInterleaved and
+                   weight_layout != MegaMoEWeightLayout::UpGateBlock16);
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
+    DG_HOST_ASSERT(parse_activation(activation) == MegaMoEActivation::SwiGLU);
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
 
     // Activation checks
@@ -514,7 +517,7 @@ static void bf16_mega_moe(
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_weights_layout_3d(l1_weights);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_weights_layout_3d(l2_weights);
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
-    DG_HOST_ASSERT(not use_trtllm_weights or not is_localized(l1_weights));
+    DG_HOST_ASSERT(not use_shuffled_weights or not is_localized(l1_weights));
     DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
@@ -596,7 +599,7 @@ static void bf16_mega_moe(
                             post_expert_norm_weight.has_value()
                                 ? post_expert_norm_weight->const_data_ptr<float>() : nullptr,
                             post_expert_norm, post_expert_norm_weight_first,
-                            post_expert_norm_eps, use_trtllm_weights, global_num_tokens);
+                            post_expert_norm_eps, weight_layout, global_num_tokens);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

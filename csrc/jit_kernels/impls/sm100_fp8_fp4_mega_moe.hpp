@@ -13,18 +13,32 @@
 
 namespace deep_gemm {
 
-// Inkling2 L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
-// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 .. u14 g1 .. g15 u1 .. u15]
+// `GateUpInterleaved` L1 rows interleave gate/up per row (gate 2i, up 2i+1). The descriptor loads them in
+// the `megamoe` SMEM order: packed FP4 per 32 rows [g0 g2 .. g14 u0 u2 .. u14 g1 g3 .. g15 u1 u3 .. u15]
 // (SMEM row 16e + 8p + q <- GMEM row 4q + 2e + p), FP8 per 16 rows [g0 .. g7 u0 .. u7]
 // (SMEM row 8p + i <- GMEM row 2i + p).
-static CUtensorMap make_inkling2_l1_tma_desc(
+// `UpGateBlock16` L1 rows per 16 pairs are [u0 .. u15 g0 .. g15]. The descriptor loads up before gate
+// (the epilogue swaps the slots): packed FP4 per 32 rows [u0 u2 .. u14 g0 g2 .. g14 u1 u3 .. u15 g1 g3 .. g15]
+// (SMEM row 16e + 8h + q <- GMEM row 16h + 2q + e), FP8 per 16 rows [u0 .. u7 g0 .. g7]
+// (SMEM row 16k + 8h + i <- GMEM row 16h + 8k + i).
+static CUtensorMap make_interleaved_l1_tma_desc(
     const torch::Tensor& weights, const int inner_bytes, const int rows,
-    const int load_block_n, const bool packed_fp4) {
+    const int load_block_n, const bool packed_fp4, const bool up_gate_block16) {
     DG_HOST_ASSERT(weights.is_contiguous() and inner_bytes % 128 == 0);
     DG_HOST_ASSERT(rows % 32 == 0 and load_block_n % 32 == 0);
     CUtensorMap result;
     const cuuint64_t row = static_cast<cuuint64_t>(inner_bytes);
-    if (packed_fp4) {
+    if (up_gate_block16) {
+        const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
+        const cuuint64_t strides[4] = {(packed_fp4 ? 2 : 1) * row, 16 * row, (packed_fp4 ? 1 : 8) * row, 32 * row};
+        const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
+        const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, weights.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    } else if (packed_fp4) {
         const cuuint64_t dims[5] = {row, 8, 2, 2, static_cast<cuuint64_t>(rows / 32)};
         const cuuint64_t strides[4] = {4 * row, row, 2 * row, 32 * row};
         const cuuint32_t box[5] = {128, 8, 2, 2, static_cast<cuuint32_t>(load_block_n / 32)};
@@ -48,19 +62,23 @@ static CUtensorMap make_inkling2_l1_tma_desc(
     return result;
 }
 
-// Inkling2 L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
-// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_inkling2_l1_tma_desc`.
+// `GateUpInterleaved` L1 SFs: CUTLASS 128x4 atoms (`[row block][k chunk][128 words]`, word
+// 4 * (row % 32) + (row / 32) % 4) with the rows permuted as `make_interleaved_l1_tma_desc`.
 // The row block and k chunk dims are flattened, so one load covers one row block.
-static CUtensorMap make_inkling2_l1_sf_tma_desc(
+static CUtensorMap make_interleaved_l1_sf_tma_desc(
     const torch::Tensor& sf, const int& num_row_blocks, const int& num_k_chunks,
-    const int& box_k_chunks, const bool packed_fp4) {
+    const int& box_k_chunks, const bool packed_fp4, const bool up_gate_block16) {
     DG_HOST_ASSERT(sf.is_contiguous() and box_k_chunks <= num_k_chunks);
     CUtensorMap result;
     const cuuint64_t dims[5] = {4, 8, 2, 2,
                                 static_cast<cuuint64_t>(num_row_blocks) * num_k_chunks};
     // packed FP4: (q, p, e) rows 4q + 2e + p; FP8: (i, p, h) rows 16h + 2i + p (16-byte rows)
-    const cuuint64_t strides[4] = {packed_fp4 ? 64ull : 32ull, 16ull,
-                                   packed_fp4 ? 32ull : 256ull, 512ull};
+    // `UpGateBlock16` packed FP4: (q, h, e) rows 16h + 2q + e; FP8: (i, h, k) rows 16h + 8k + i
+    const cuuint64_t strides[4] = {
+        up_gate_block16 ? (packed_fp4 ? 32ull : 16ull) : (packed_fp4 ? 64ull : 32ull),
+        up_gate_block16 ? 256ull : 16ull,
+        up_gate_block16 ? (packed_fp4 ? 16ull : 128ull) : (packed_fp4 ? 32ull : 256ull),
+        512ull};
     const cuuint32_t box[5] = {4, 8, 2, 2, static_cast<cuuint32_t>(box_k_chunks)};
     const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
@@ -146,8 +164,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const float& swiglu_alpha,
-    const bool& use_situ,
+    const MegaMoEActivation& activation,
     const bool& fast_math,
     const bool& use_x_scales,
     const float* l1_alphas,
@@ -160,13 +177,15 @@ static void sm100_fp8_fp4_mega_moe(
     const MmaKind& mma_kind,
     const bool& use_fp8_combine,
     const int& gran_k,
-    const bool& use_trtllm_weights = false,
+    const MegaMoEWeightLayout& weight_layout = MegaMoEWeightLayout::GateUpBlock8,
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
     const float& situ_beta = 4.0f,
     const float& situ_linear_beta = 25.0f,
-    const bool& use_inkling2_weights = false,
     const bool& broadcast_y = false
 ) {
+    const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
+    const bool use_up_gate_block16 = weight_layout == MegaMoEWeightLayout::UpGateBlock16;
+    const bool use_interleaved_weights = weight_layout == MegaMoEWeightLayout::GateUpInterleaved or use_up_gate_block16;
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -182,11 +201,11 @@ static void sm100_fp8_fp4_mega_moe(
         l1_weights.scalar_type() == kPackedFP4,
         gran_k);
 
-    if (use_trtllm_weights or use_inkling2_weights) {
+    if (use_shuffled_weights or use_interleaved_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
     }
-    if (use_trtllm_weights)
+    if (use_shuffled_weights)
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
 
     // Make tensormap
@@ -202,7 +221,7 @@ static void sm100_fp8_fp4_mega_moe(
     // SM107 K=64 MMA: routed FP4 weights are loaded packed with 64B swizzle, and the shared expert's activations
     // and FP8 weights are loaded in 64-wide K halves with 64B swizzle
     const bool use_k64 = config.use_sm107_k64;
-    DG_HOST_ASSERT(not use_k64 or (not use_trtllm_weights and config.block_k == 128 and to_inner(config.block_k) == 128));
+    DG_HOST_ASSERT(not use_k64 or (not use_shuffled_weights and config.block_k == 128 and to_inner(config.block_k) == 128));
     const int routed_weights_swizzle_mode = use_k64 ? 64 : config.swizzle_weights_mode;
     const int shared_block_k_inner = use_k64 ? block_k_inner / 2 : block_k_inner;
     const int shared_acts_swizzle_mode = use_k64 ? 64 : config.swizzle_acts_mode;
@@ -218,21 +237,21 @@ static void sm100_fp8_fp4_mega_moe(
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
     // TRT L1 rows are addressed as one 2D `[E * N, K]` matrix; the rest use the localizable 4D layout
-    const auto tensor_map_l1_weights = use_inkling2_weights ?
-        make_inkling2_l1_tma_desc(l1_weights, weight_inner(hidden),
-                                 num_experts_per_rank * intermediate_hidden * 2,
-                                 config.load_block_n, is_packed_fp4) :
-        use_trtllm_weights ?
+    const auto tensor_map_l1_weights = use_interleaved_weights ?
+        make_interleaved_l1_tma_desc(l1_weights, weight_inner(hidden),
+                                     num_experts_per_rank * intermediate_hidden * 2,
+                                     config.load_block_n, is_packed_fp4, use_up_gate_block16) :
+        use_shuffled_weights ?
         make_tma_2d_desc(weight_tensor(l1_weights),
                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
                          block_k_inner, config.load_block_n,
                          static_cast<int>(l1_weights.stride(-2)),
                          config.swizzle_weights_mode, 0, false, not is_packed_fp4) :
         make_tma_weights_3d_desc(weight_tensor(l1_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l1_weights_sf = use_inkling2_weights ? make_inkling2_l1_sf_tma_desc(
+    const auto tensor_map_l1_weights_sf = use_interleaved_weights ? make_interleaved_l1_sf_tma_desc(
         l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
-        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4) :
-        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4, use_up_gate_block16) :
+        use_shuffled_weights ? make_trtllm_fp4_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (config.gran_k * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
@@ -259,13 +278,13 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+    const auto tensor_map_l2_weights = use_shuffled_weights ? make_trtllm_fp4_l2_tma_desc(
         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
         make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
-    const auto tensor_map_l2_weights_sf = use_inkling2_weights ? make_trtllm_fp4_sf_tma_desc(
+    const auto tensor_map_l2_weights_sf = use_interleaved_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, true, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
-        use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        use_shuffled_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (config.gran_k * 4), sf_smem_outer_dim, config.block_n / 128) :
         make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
@@ -353,10 +372,10 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -373,8 +392,7 @@ static void __instantiate_kernel() {{
     config.num_bytes_per_pull,
     config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
     num_sms, num_ranks,
-    to_string(activation_clamp), to_string(swiglu_alpha),
-    use_situ ? "true" : "false",
+    to_string(activation_clamp), to_activation_name(activation),
     fast_math ? "true" : "false",
     use_x_scales ? "true" : "false",
     (l1_alphas != nullptr) ? "true" : "false",
@@ -387,11 +405,10 @@ static void __instantiate_kernel() {{
     post_norm_weight_first ? "true" : "false",
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
-    use_trtllm_weights ? "true" : "false",
+    to_weight_layout_name(weight_layout),
     config.use_sm107_k64 ? "true" : "false",
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
-    use_inkling2_weights ? "true" : "false",
     broadcast_y ? "true" : "false"));
     // Launch
     launch_with_shared_memory_mode(
