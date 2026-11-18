@@ -167,7 +167,8 @@ struct SM100PagedMQALogitsScheduler {
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     // Cache one page coordinate per lane
     static constexpr uint32_t kNumCachedPages = 32;
-    DG_STATIC_ASSERT(BLOCK_Q * kNumHeads <= 128, "Invalid Q block shape");
+    // Per-row KV bounds are exchanged one row per lane; the kernel limits UMMA_N to 256
+    DG_STATIC_ASSERT(BLOCK_Q <= 32 and BLOCK_Q * kNumHeads <= 256, "Invalid Q block shape");
     DG_STATIC_ASSERT(SPLIT_KV % PAGE_KV == 0 and kNumPagesPerSplit <= kNumCachedPages, "Invalid split shape");
 
     using Info = RequestInfo<BLOCK_Q, SPLIT_KV, PAGE_KV>;

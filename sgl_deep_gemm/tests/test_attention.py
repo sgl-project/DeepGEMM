@@ -455,6 +455,82 @@ def test_paged_mqa_logits():
     print()
 
 
+def test_paged_mqa_logits_block_q_override():
+    # `DG_MQA_PAGED_BLOCK_Q` sizes the paged Q blocks to the caller's rows per request instead of `128 / num_heads`;
+    # a Q tile wider than 128 (token, head) rows runs 256-token KV splits. Only the schedule changes, so the logits
+    # must be bitwise equal to the default for requests with fewer, as many and more rows than the block
+    if get_arch_major() != 10:
+        return
+
+    env_name = 'DG_MQA_PAGED_BLOCK_Q'
+    saved_env = os.environ.pop(env_name, None)
+
+    def run(kwargs: dict, block_q: int = 0) -> torch.Tensor:
+        if block_q > 0:
+            os.environ[env_name] = str(block_q)
+        try:
+            # The metadata and the kernel must see the same value
+            schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                kwargs['context_lens'], kwargs['kv_cache'].size(1), deep_gemm.get_num_sms(), kwargs['indices'])
+            return deep_gemm.fp8_fp4_paged_mqa_logits(schedule_meta=schedule_meta, **kwargs)
+        finally:
+            os.environ.pop(env_name, None)
+
+    print('Testing Paged MQA Logits with DG_MQA_PAGED_BLOCK_Q:')
+    num_heads, num_sequences, avg_kv, max_rows_per_seq = 32, 48, 8192, 8
+    try:
+        for fmt, head_dim, block_kv in (('mxfp4', 128, 64), ('mxfp4', 64, 128), ('mxfp8', 128, 64), ('mxfp8', 64, 32)):
+            tokens_per_seq = torch.randint(1, max_rows_per_seq + 1, (num_sequences, ), device='cuda', dtype=torch.int)
+            indices = torch.arange(num_sequences, device='cuda', dtype=torch.int).repeat_interleave(tokens_per_seq)
+            num_q_tokens = tokens_per_seq.sum().item()
+
+            # Rows of a sequence see growing prefixes, the last one the full length
+            context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (num_sequences, ), device='cuda', dtype=torch.int)
+            offsets_within_seq = torch.cat([torch.arange(n.item(), device='cuda', dtype=torch.int) for n in tokens_per_seq])
+            context_lens_rows = (context_lens.repeat_interleave(tokens_per_seq) + offsets_within_seq).view(-1, 1)
+            num_blocks_per_seq = ceil_div(context_lens + (tokens_per_seq - 1), block_kv)
+            max_model_len = num_blocks_per_seq.max().item() * block_kv
+            num_total_blocks = num_blocks_per_seq.sum().item()
+            block_table = torch.zeros((num_sequences, num_blocks_per_seq.max().item()), device='cuda', dtype=torch.int)
+            block_idx_pool = torch.randperm(num_total_blocks, device='cuda', dtype=torch.int)
+            offset = 0
+            for i, num_blocks in enumerate(num_blocks_per_seq.tolist()):
+                block_table[i, :num_blocks] = block_idx_pool[offset:offset + num_blocks]
+                offset += num_blocks
+            block_table = block_table.repeat_interleave(tokens_per_seq, dim=0)
+
+            kv_cache_cast = {'mxfp4': kv_cache_cast_to_mxfp4, 'mxfp8': kv_cache_cast_to_mxfp8}[fmt]
+            kv_in, _ = kv_cache_cast(torch.randn((num_total_blocks, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16))
+            q_in, _ = quantize_mqa_q(torch.randn((num_q_tokens, 1, num_heads, head_dim), device='cuda', dtype=torch.bfloat16), fmt)
+            weights = to_mqa_weights(torch.randn((num_q_tokens, num_heads), device='cuda', dtype=torch.bfloat16))
+            kwargs = dict(q=q_in, kv_cache=kv_in, weights=weights, context_lens=context_lens_rows,
+                          block_table=block_table, max_context_len=max_model_len, indices=indices)
+
+            # Only the valid span of each row is written
+            valid = torch.arange(max_model_len, device='cuda').unsqueeze(0) < context_lens_rows
+            ref = run(kwargs).masked_fill(~valid, 0)
+            for block_q in (2, 6):
+                logits = run(kwargs, block_q).masked_fill(~valid, 0)
+                assert_bitwise_equal(logits, ref, f'paged mqa logits with {env_name}={block_q}')
+
+            # 8 x 32 accumulator columns do not fit two TMEM stages next to the scale factors
+            try:
+                run(kwargs, 8)
+            except Exception as e:
+                assert 'Assertion' in str(e), e
+            else:
+                assert False, f'{env_name}=8 with {num_heads} heads must be rejected'
+
+            print(f' > Fmt={fmt:5}, PAGE_KV={block_kv:3}, H={num_heads}, D={head_dim:3}, Q tokens={num_q_tokens:3}: '
+                  f'{env_name}=2 and 6 match the default bitwise; 8 is rejected')
+            del kwargs, kv_in, q_in, weights, valid, ref, logits
+            torch.cuda.empty_cache()
+    finally:
+        if saved_env is not None:
+            os.environ[env_name] = saved_env
+    print()
+
+
 def make_sparse_kv_block_indices(context_lens: List[int], request_indices: List[int] | None,
                                  sparse_block_kv: int, num_max_sparse_blocks: int,
                                  seed: int, context_starts: List[int] | None = None) -> Tuple[torch.Tensor, List[int]]:
@@ -728,4 +804,5 @@ if __name__ == '__main__':
 
     test_mqa_logits()
     test_paged_mqa_logits()
+    test_paged_mqa_logits_block_q_override()
     test_sparse_mqa_logits()

@@ -13,14 +13,34 @@ namespace deep_gemm {
 static constexpr int kMQALogitsSplitCost = 2;
 static constexpr int kMQALogitsSegmentCost = 3;
 static constexpr int kMQALogitsSplitKV = 384;
-static constexpr int kMQALogitsNumTmemStages = 3;
+static constexpr int kMQALogitsWideQSplitKV = 256;
 static constexpr int kMQALogitsSplitsPerChunk = 8;
 static constexpr int kMQALogitsNumSpecializedThreads = 128;
+// The paged metadata API takes no head count: its schedule is tuned for H32
+static constexpr int kMQALogitsPagedMetadataNumHeads = 32;
 
-// The Q tile always covers 128 (token, head) rows
+// The default Q tile covers 128 (token, head) rows
 static int get_mqa_logits_block_q(const int& num_heads) {
     DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
     return 128 / num_heads;
+}
+
+// Paged Q-block size. Paged rows arrive one token per row and are grouped into requests by `indices` on the device,
+// so the host cannot see how many rows a request has. With the default, a request with more than `128 / num_heads`
+// rows (e.g. a 6-row speculative-decoding verify at H32) takes several Q blocks that each walk the same KV chunk,
+// and the next chunk cannot load into the KV ring until the last of them is done with it. Callers that know their
+// rows per request can set `DG_MQA_PAGED_BLOCK_Q` to it, so that one Q block covers each request and its KV streams
+// through the ring once. Q blocks never span requests, and the paged scheduler keeps one row per lane (at most 32)
+static int get_paged_mqa_logits_block_q(const int& num_heads) {
+    const int block_q = deep_jit::get_env<int>("DG_MQA_PAGED_BLOCK_Q", 0);
+    DG_HOST_ASSERT(block_q >= 0 and block_q <= 32);
+    return block_q > 0 ? block_q : get_mqa_logits_block_q(num_heads);
+}
+
+// Each math warpgroup owns one TMEM accumulator stage of UMMA_M = 128 KV rows. Three stages of a Q tile wider than
+// 128 (token, head) rows do not fit the 512 TMEM columns, so such tiles run 256-token KV splits on two warpgroups
+static int get_mqa_logits_split_kv(const int& block_q, const int& num_heads) {
+    return block_q * num_heads <= 128 ? kMQALogitsSplitKV : kMQALogitsWideQSplitKV;
 }
 
 // Paged metadata: per-SM starts as (q_token_idx, kv_split_idx)
@@ -28,8 +48,10 @@ static void sm100_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
                                             const torch::Tensor& schedule_meta,
                                             const int& num_q_tokens_total, const int& num_sms,
                                             const int* indices_ptr) {
-    // Tuned for H32, other head counts may have slightly less balanced schedules
-    constexpr int block_q = 4;
+    // Tuned for H32, other head counts may have slightly less balanced schedules. The split indices are in units of
+    // the KV split, which the paged runtime checks against its own
+    const int block_q = get_paged_mqa_logits_block_q(kMQALogitsPagedMetadataNumHeads);
+    const int split_kv = get_mqa_logits_split_kv(block_q, kMQALogitsPagedMetadataNumHeads);
     const uint32_t num_threads = num_q_tokens_total <= 512 ? 256 : (num_q_tokens_total <= 2048 ? 512 : 1024);
     // Request starts, work prefix, warp sums, and block total
     const int smem_size = (2 * num_q_tokens_total + num_threads / 32 + 1) * static_cast<int>(sizeof(int));
@@ -46,7 +68,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}
     >);
 }};
-)", kMQALogitsSplitKV, num_sms, block_q, num_threads));
+)", split_kv, num_sms, block_q, num_threads));
 
     // Launch
     jit->launch(
@@ -115,29 +137,38 @@ static void __instantiate_kernel() {{
 }
 
 // Kernel geometry shared by the contiguous and paged runtimes: every math warpgroup consumes one UMMA_M = 128 KV
-// tile, the Q tile always covers 128 (token, head) rows, and the FP4 pipelines are deeper (half-size stages)
+// tile, the Q tile covers 128 (token, head) rows unless `DG_MQA_PAGED_BLOCK_Q` widens a paged one (up to 256, with
+// 256-token KV splits), and the FP4 pipelines are deeper (half-size stages)
 struct MQALogitsConfig {
     bool is_fp4, is_paged;
     int num_heads, head_dim, block_q, umma_n;
+    int split_kv, num_tmem_stages, num_math_threads;
     int num_q_stages, num_kv_stages, splits_per_chunk;
-    static constexpr int split_kv = kMQALogitsSplitKV;
-    static constexpr int num_tmem_stages = kMQALogitsNumTmemStages;
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
-    static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
     MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged):
             is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
-            block_q(get_mqa_logits_block_q(num_heads)) {
+            block_q(is_paged ? get_paged_mqa_logits_block_q(num_heads) : get_mqa_logits_block_q(num_heads)) {
         DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
         else
             DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
         umma_n = align(block_q * num_heads, 8);
+        DG_HOST_ASSERT(umma_n <= 256);
+        // One TMEM accumulator stage per math warpgroup
+        split_kv = get_mqa_logits_split_kv(block_q, num_heads);
+        num_tmem_stages = split_kv / 128;
+        num_math_threads = split_kv;
         num_q_stages = is_fp4 ? 2 : 3;
         num_kv_stages = is_fp4 ? 8 : 3;
         // Paged FP4 on 10.7 runs 4-split chunks, and so a 4-stage KV ring, inside the 8-stage allocation
         splits_per_chunk = is_fp4 and is_paged and SM107ArchSpec::is_current() ? 4 : kMQALogitsSplitsPerChunk;
+
+        // Mirrors the kernel's TMEM budget: accumulator stages, then the SF Q stages and the SF KV ring
+        const int num_kv_ring_stages = is_paged and splits_per_chunk < num_kv_stages ? splits_per_chunk : num_kv_stages;
+        DG_HOST_ASSERT(umma_n * num_tmem_stages + num_q_stages * align(umma_n, 128) / 32 +
+                       num_kv_ring_stages * align(split_kv, 128) / 32 <= 512);
     }
 
     const char* qk_dtype_name() const {
@@ -316,6 +347,10 @@ static void sm100_paged_mqa_logits(const MQALogitsConfig& config,
     DG_HOST_ASSERT(logits_stride % config.split_kv == 0);
     const int num_sms = runtime->get_num_sms();
     DG_HOST_ASSERT(schedule_meta.size(0) == num_sms + 1);
+    // The metadata's split indices must count the same KV splits as the kernel; only `DG_MQA_PAGED_BLOCK_Q` with a
+    // head count other than 32 can make them differ
+    const int metadata_block_q = get_paged_mqa_logits_block_q(kMQALogitsPagedMetadataNumHeads);
+    DG_HOST_ASSERT(config.split_kv == get_mqa_logits_split_kv(metadata_block_q, kMQALogitsPagedMetadataNumHeads));
 
     const auto tensor_map_q = make_tma_2d_desc(q, config.head_dim, num_q_tokens_total * config.num_heads,
                                                config.head_dim, config.block_q * config.num_heads,
