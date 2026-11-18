@@ -774,17 +774,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
             uint32_t src_token_topk_idx;
             if constexpr (kSentinelDispatch) {
-                // Each slot is read once per call, so the reader re-arms it
                 do {
                     src_token_topk_idx = ptx::ld_volatile(src_token_topk_idx_ptr);
                 } while (src_token_topk_idx == 0);
                 src_token_topk_idx -= 1;
-                __syncwarp();
-                if (lane_idx == 0)
-                    *src_token_topk_idx_ptr = 0;
             } else {
                 src_token_topk_idx = *src_token_topk_idx_ptr;
             }
+            // Each slot is read once per call; every config re-arms it, so a buffer shared with a sentinel config stays zeroed
+            __syncwarp();
+            if (lane_idx == 0)
+                *src_token_topk_idx_ptr = 0;
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -1032,8 +1032,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 
                 // Clean per-rank token count
-                for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                // NOTES: with sentinel dispatch, counts of experts without tokens are never polled by the pull, so wait
+                // for every count to arrive; a store landing after the clear would read as the next call's count
+                for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads) {
+                    const auto count_ptr = workspace.get_expert_recv_count_ptr(j, i);
+                    if constexpr (kSentinelDispatch) {
+                        while (ptx::ld_volatile(count_ptr) == 0);
+                    }
+                    *count_ptr = 0;
+                }
                 __syncwarp();
 
                 // Clean L1 and L2 full stuffs and ring buffer counts

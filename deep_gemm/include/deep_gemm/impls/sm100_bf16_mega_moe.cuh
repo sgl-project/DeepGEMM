@@ -528,8 +528,13 @@ sm100_bf16_mega_moe_impl(void* y,
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
-            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+            const auto src_token_topk_idx_ptr = workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+            const uint32_t src_token_topk_idx = *src_token_topk_idx_ptr;
+            // Re-arm the slot: a buffer shared with the FP8/FP4 sentinel dispatch must stay zeroed
+            __syncwarp();
+            if (lane_idx == 0)
+                *src_token_topk_idx_ptr = 0;
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
