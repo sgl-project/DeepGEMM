@@ -40,6 +40,19 @@ def _check_legacy_fp4_acts_env() -> None:
             )
 
 
+_DEFAULT_SF_GRAN_K = {'fp8xfp4': 32, 'fp8xfp8': 32, 'mxf4xmxf4': 32, 'nvfp4xnvfp4': 16, 'bf16xbf16': 0}
+
+
+def _recipe_gran_k(recipe: Optional[Tuple[int, int, int]],
+                   recipe_a: Optional[Tuple[int, int]],
+                   mma_type: str) -> int:
+    if recipe_a is not None:
+        return recipe_a[1]
+    if recipe is not None:
+        return recipe[2]
+    return _DEFAULT_SF_GRAN_K[mma_type]
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -48,6 +61,9 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
+                 recipe: Optional[Tuple[int, int, int]] = None,
+                 recipe_a: Optional[Tuple[int, int]] = None,
+                 recipe_b: Optional[Tuple[int, int]] = None,
                  base: Optional['SymmBuffer'] = None,
                  gather_output: bool = False):
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
@@ -65,12 +81,12 @@ class SymmBuffer:
         self.mma_type = mma_type
         self.activation = activation
 
-        # Allocate or reuse a symmetric buffer
+        # Allocate or reuse a symmetric buffer; the recipe's K granularity sizes every SF view
         layout_args = (group.size(), num_experts,
                        num_max_tokens_per_rank, num_topk,
                        hidden, intermediate_hidden,
                        mma_type, activation,
-                       num_shared_experts)
+                       num_shared_experts, recipe, recipe_a, recipe_b)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
         num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
@@ -106,6 +122,9 @@ class SymmBuffer:
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf,
          self.x_scales) = _C.slice_symm_buffer_for_mega_moe(self.buffer, *layout_args)
+        self.recipe = recipe
+        self.recipe_a = recipe_a
+        self.recipe_b = recipe_b
 
     def destroy(self):
         self.handle = None
@@ -124,7 +143,10 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 recipe: Optional[Tuple[int, int, int]] = None,
+                                 recipe_a: Optional[Tuple[int, int]] = None,
+                                 recipe_b: Optional[Tuple[int, int]] = None) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -138,7 +160,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b
     )
 
 
@@ -272,7 +295,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                     recipe: Tuple[int, int, int] = (1, 1, 32),
+                     recipe: Optional[Tuple[int, int, int]] = None,
+                     recipe_a: Optional[Tuple[int, int]] = None,
+                     recipe_b: Optional[Tuple[int, int]] = None,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
@@ -307,6 +332,17 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             f'got mma_type={sym_buffer.mma_type!r}'
         )
 
+    if recipe is None and recipe_a is None and recipe_b is None:
+        recipe, recipe_a, recipe_b = sym_buffer.recipe, sym_buffer.recipe_a, sym_buffer.recipe_b
+    else:
+        buffer_gran_k = _recipe_gran_k(sym_buffer.recipe, sym_buffer.recipe_a, sym_buffer.mma_type)
+        assert recipe is None or recipe[2] == buffer_gran_k, \
+            f'recipe K granularity {recipe[2]} does not match the buffer layout gran_k {buffer_gran_k}'
+        assert recipe_a is None or recipe_a[1] == buffer_gran_k, \
+            f'recipe_a K granularity {recipe_a[1]} does not match the buffer layout gran_k {buffer_gran_k}'
+        assert recipe_b is None or recipe_b[1] == buffer_gran_k, \
+            f'recipe_b K granularity {recipe_b[1]} does not match the buffer layout gran_k {buffer_gran_k}'
+
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     (shared_l1_data, shared_l1_sf) = shared_l1_weights if shared_l1_weights is not None else (None, None)
@@ -322,7 +358,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe, sym_buffer.mma_type,
+        recipe, recipe_a, recipe_b, sym_buffer.mma_type,
         activation, activation_clamp,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,

@@ -124,7 +124,8 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
             DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));
         // Check contiguity in the MN direction
         DG_HOST_ASSERT(sf.stride(-2) == 1 or mn == 1);
-        const auto compact_stride = get_tma_aligned_size(mn, sf.element_size());
+        // One MN row per `gran_mn` elements, so the packed rows are TMA-aligned per row block
+        const auto compact_stride = get_tma_aligned_size(ceil_div(mn, gran_mn), sf.element_size());
         DG_HOST_ASSERT(sf.stride(-1) >= compact_stride);
         DG_HOST_ASSERT(sf.stride(-1) % 4 == 0);
     }
