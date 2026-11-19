@@ -93,6 +93,13 @@ class SymmBuffer:
                 (f'The reused Mega MoE config requires {num_bytes} bytes, '
                  f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
             assert num_gathered_bytes == 0 or base.gathered_y is not None, 'The reused buffer has no gathered output'
+            # SM100 dispatch polls index slots that must start zeroed; a different slot extent would overlap
+            # another config's per-call metadata
+            assert torch.cuda.get_device_capability()[0] < 10 or \
+                num_experts * num_max_tokens_per_rank == base.num_experts * base.num_max_tokens_per_rank, \
+                (f'The reused Mega MoE config needs `num_experts * num_max_tokens_per_rank` '
+                 f'({num_experts} x {num_max_tokens_per_rank}) equal to the base buffer\'s '
+                 f'({base.num_experts} x {base.num_max_tokens_per_rank})')
             self.buffer = base.buffer
             self.handle = base.handle
         self.gathered_y = (self.buffer[self.buffer.nbytes - num_gathered_bytes:].view(torch.bfloat16).view(-1, hidden)
