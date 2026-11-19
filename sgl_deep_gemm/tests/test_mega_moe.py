@@ -106,7 +106,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
         mma_type=args.mma_type,
-        recipe=(1, 1, gran_k)
+        recipe=None if is_bf16xbf16 else (1, 1, gran_k)
     )
 
     # Cast routed weights into FP4 or FP8

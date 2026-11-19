@@ -334,10 +334,14 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
 
     if recipe is None and recipe_a is None and recipe_b is None:
         recipe, recipe_a, recipe_b = sym_buffer.recipe, sym_buffer.recipe_a, sym_buffer.recipe_b
-    elif recipe is not None:
+    else:
         buffer_gran_k = _recipe_gran_k(sym_buffer.recipe, sym_buffer.recipe_a, sym_buffer.mma_type)
-        assert recipe[2] == buffer_gran_k, \
+        assert recipe is None or recipe[2] == buffer_gran_k, \
             f'recipe K granularity {recipe[2]} does not match the buffer layout gran_k {buffer_gran_k}'
+        assert recipe_a is None or recipe_a[1] == buffer_gran_k, \
+            f'recipe_a K granularity {recipe_a[1]} does not match the buffer layout gran_k {buffer_gran_k}'
+        assert recipe_b is None or recipe_b[1] == buffer_gran_k, \
+            f'recipe_b K granularity {recipe_b[1]} does not match the buffer layout gran_k {buffer_gran_k}'
 
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
