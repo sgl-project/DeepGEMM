@@ -1021,11 +1021,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                // Clean expert token count, and add cumulative results
-                DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
+                // Add cumulative results; SM 0 clears the expert token count after the grid sync below
                 if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
-                } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                     __syncwarp();
@@ -1054,12 +1051,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
+        // Before the NVLink barrier, there is a grid sync; the pull barrier's waiters rely on it
+        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+            workspace, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+        );
+
+        // NOTES: without the pull barrier, the other SMs can fetch the expert token counts, find no tokens and clean
+        // while SM 0 is still sending counts and has not fetched them; clear them once every SM is past this grid sync
+        if (sm_idx == 0) {
+            for (uint32_t i = thread_idx; i < kNumExpertsPerRank; i += kNumDispatchThreads)
+                *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        }
+
         // Wait for all ranks to finish cleaning
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync; the pull barrier's waiters rely on it */ true,
+            /* Synced above */ false,
             /* At the end of kernel does not need to sync */ false
         );
         if (sm_idx == 0 and thread_idx == 0)
