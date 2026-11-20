@@ -280,8 +280,10 @@ static void sm90_fp8_fused_mega_moe(
             config.num_epilogue_threads == 512 ? 32 : 48;
         const int non_epilogue_registers =
             config.num_epilogue_threads == 512 ? 24 : 40;
-        DG_HOST_ASSERT(dispatch_registers * config.num_dispatch_threads +
-                       non_epilogue_registers * config.num_non_epilogue_threads +
+        const int mixed_role_threads = config.num_dispatch_threads % 128;
+        DG_HOST_ASSERT(dispatch_registers * (config.num_dispatch_threads - mixed_role_threads) +
+                       non_epilogue_registers * (config.num_non_epilogue_threads - mixed_role_threads) +
+                       2 * mixed_role_threads * std::max(dispatch_registers, non_epilogue_registers) +
                        epilogue_registers * config.num_epilogue_threads <= 64512);
     }
     const bool reuse_accum_as_final = config.block_m == 128;

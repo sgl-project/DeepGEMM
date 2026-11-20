@@ -835,10 +835,9 @@ sm90_fp8_fused_mega_moe_impl(void* y,
     // release flags, the tail on the launch-parity banks)
     constexpr uint32_t kBeforeCombineReduceBarrierTag   = 2;
 
-    // Register reconfiguration counts (64512 budget). 256-epilogue-thread split-N decode: 64*48 + 64*40 + 256*168 = 48640;
-    // kNumThreads <= 256 decode: 64*48 + 64*40 + 128*256 = 38400 (launch-bounds ceiling 256, the accumulator double-buffer fits);
-    // 2 math warpgroups on the 128x256 split-M tile: 64*104 + 64*104 + 256*200 = 64512 (setmaxnreg is warpgroup-collective,
-    // so the dispatch warps and the TMA loader warps share one count); the 512-epilogue-thread split-MN path trims both roles.
+    // setmaxnreg is warpgroup-collective. When dispatch and loaders share a
+    // warpgroup, both roles use the larger budget. The split-M tile keeps
+    // 128*104 + 256*200 = 64512 registers; MXFP4 split-N uses 128*48 + 256*224 = 63488.
     constexpr bool kSplitMWide = kNumEpilogueThreads == 256 and BLOCK_M == 128 and BLOCK_N == 256 and
                                  kNumDispatchThreads == 64 and kNumNonEpilogueThreads == 64;
     constexpr uint32_t kNumEpilogueRegisters    =
@@ -852,8 +851,12 @@ sm90_fp8_fused_mega_moe_impl(void* y,
         kNumEpilogueThreads == 512 ? 32 : (kSplitMWide ? 104 : 48);
     constexpr uint32_t kNumNonEpilogueRegisters =
         kNumEpilogueThreads == 512 ? 24 : (kSplitMWide ? 104 : 40);
-    DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
-                     kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
+    constexpr uint32_t kNumMixedRoleThreads = kNumDispatchThreads % 128;
+    constexpr uint32_t kMixedWarpgroupRegisters =
+        kNumDispatchRegisters > kNumNonEpilogueRegisters ? kNumDispatchRegisters : kNumNonEpilogueRegisters;
+    DG_STATIC_ASSERT((kNumDispatchThreads - kNumMixedRoleThreads) * kNumDispatchRegisters +
+                     (kNumNonEpilogueThreads - kNumMixedRoleThreads) * kNumNonEpilogueRegisters +
+                     2 * kNumMixedRoleThreads * kMixedWarpgroupRegisters +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
                      "Too many registers");
     DG_STATIC_ASSERT(kNumEpilogueRegisters % 8 == 0 and kNumEpilogueRegisters >= 24 and kNumEpilogueRegisters <= 256 and
@@ -866,14 +869,23 @@ sm90_fp8_fused_mega_moe_impl(void* y,
     // dynamic tail: pair ticket counter (a spare grid-sync slot; zeroed by the dispatch cleanup every launch)
     constexpr uint32_t kTailCounterGridSyncIndex = 2;
 
+    // Keep each setmaxnreg at a warpgroup-uniform program point, before any
+    // individual warp selects its dispatch or TMA-loader role.
+    const uint32_t warpgroup_idx = warp_idx / 4;
+    if (warpgroup_idx < kNumDispatchThreads / 128) {
+        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+    } else if (warpgroup_idx < (kNumDispatchThreads + kNumNonEpilogueThreads) / 128) {
+        constexpr uint32_t kLoaderWarpgroupRegisters =
+            kNumMixedRoleThreads != 0 ? kMixedWarpgroupRegisters : kNumNonEpilogueRegisters;
+        cutlass::arch::warpgroup_reg_dealloc<kLoaderWarpgroupRegisters>();
+    }
+
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
     //   SF is per-128 channel float, stored straight into the local L1 SF buffer in MN-major layout
     //   `local_sf[k_chunk * num_padded_sf_pool_tokens + token_idx]`; token_idx_in_expert -> SF token index is the per-block linear mapping.
     // =====================================================================
     if (warp_idx < kNumDispatchWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
-
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
@@ -1456,7 +1468,6 @@ sm90_fp8_fused_mega_moe_impl(void* y,
     // ROLE 2: GEMM TMA LOAD warps (warp 0 of `kNumNonEpilogueThreads` loads A + SFA, warp 1 loads B + SFB)
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
         // the tile table is initialised by the dispatch warps after routing (its head is the routing-count region)
         ptx::sync_aligned(kNumDispatchWithLoadersThreads, kDispatchWithLoadersBarrierIdx);
 
@@ -1584,7 +1595,6 @@ sm90_fp8_fused_mega_moe_impl(void* y,
             });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
         // publish only into the initialised table (see the A loader / the dispatch warps)
         ptx::sync_aligned(kNumDispatchWithLoadersThreads, kDispatchWithLoadersBarrierIdx);
         bool bfd_pending = kBFillDefer;   // deferred ring fill: the ring fill waits for the CTA's dispatch warps' first-row publishes
@@ -1690,10 +1700,7 @@ sm90_fp8_fused_mega_moe_impl(void* y,
             kClusterSize > 1 ? cute::block_rank_in_cluster() : 0u, kNumTileTableEntries, process_b_block);
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
-        // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
-        // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        // Remaining loader-warpgroup warps have already released registers.
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
     // =====================================================================
