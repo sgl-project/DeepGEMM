@@ -57,20 +57,63 @@ __forceinline__ __device__ uint32_t pre_dispatch_e2m1_encode(float v) {
     return code;
 }
 
+__forceinline__ __device__ float pre_dispatch_warp_max_nonneg(float val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const uint32_t mask = __activemask();
+    const uint32_t u = __float_as_uint(val);
+    uint32_t m;
+    asm volatile("redux.sync.max.u32 %0, %1, %2;" : "=r"(m) : "r"(u), "r"(mask));
+    return __uint_as_float(m);
+#else
+    return math::warp_reduce<32, /*kIntergroupReduce=*/false>(val, math::ReduceMax<float>{});
+#endif
+}
+
 __forceinline__ __device__ float pre_dispatch_block_reduce_max(float val) {
     __shared__ float smem[32];
     const uint32_t lane = threadIdx.x % 32u;
     const uint32_t warp = threadIdx.x / 32u;
     const uint32_t num_warps = (blockDim.x + 31u) / 32u;
-    val = math::warp_reduce<32, /*kIntergroupReduce=*/false>(val, math::ReduceMax<float>{});
+    val = pre_dispatch_warp_max_nonneg(val);
     if (lane == 0)
         smem[warp] = val;
     __syncthreads();
     val = (lane < num_warps) ? smem[lane] : 0.0f;
-    return math::warp_reduce<32, /*kIntergroupReduce=*/false>(val, math::ReduceMax<float>{});
+    return pre_dispatch_warp_max_nonneg(val);
 }
 
-template <uint32_t kGroupSize, MmaKind kMmaKind, bool kUsePDL>
+__forceinline__ __device__ uint32_t pre_dispatch_pack_f32x8_to_e2m1x8(
+    const float2 p0, const float2 p1, const float2 p2, const float2 p3) {
+    uint32_t packed = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+        "}\n"
+        : "=r"(packed)
+        : "f"(p0.x), "f"(p0.y), "f"(p1.x), "f"(p1.y),
+          "f"(p2.x), "f"(p2.y), "f"(p3.x), "f"(p3.y));
+    // Canonicalize E2M1 -0 (0x8) to +0 (0x0) across all 8 nibbles to match
+    // `per_token_cast_to_fp4` / `pre_dispatch_e2m1_encode` byte-for-byte.
+    packed &= ~((0x88888888u - (packed & 0x77777777u)) & 0x88888888u);
+#else
+    const float vals[8] = {p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y};
+    #pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t lo = pre_dispatch_e2m1_encode(vals[2 * i + 0]);
+        const uint32_t hi = pre_dispatch_e2m1_encode(vals[2 * i + 1]);
+        packed |= ((lo & 0xFu) | ((hi & 0xFu) << 4u)) << (8u * i);
+    }
+#endif
+    return packed;
+}
+
+template <uint32_t kGroupSize, MmaKind kMmaKind, bool kUsePDL, uint32_t kVecElems = 8>
 __launch_bounds__(1024, 2)
 __global__ void mega_moe_pre_dispatch_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -89,6 +132,7 @@ __global__ void mega_moe_pre_dispatch_kernel(
     const uint32_t top_k) {
     static_assert(kGroupSize == 16 || kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128,
                   "kGroupSize must be 16, 32, 64, or 128");
+    static_assert(kVecElems == 8 || kVecElems == 16, "kVecElems must be 8 or 16");
     constexpr bool kNvfp4 = kMmaKind == MmaKind::NVFP4;
     constexpr bool kPackedFp4 = get_element_bits(kMmaKind) == 4;
     static_assert(kMmaKind == MmaKind::MXFP8FP4 || kMmaKind == MmaKind::MXFP4 || kNvfp4,
@@ -97,8 +141,9 @@ __global__ void mega_moe_pre_dispatch_kernel(
                   "NVFP4 acts use 16-element UE4M3 blocks");
     static_assert(kNvfp4 || kGroupSize >= 32,
                   "UE8M0 modes keep the original 32/64/128 group sizes");
-    constexpr uint32_t kVecElems = 8;  // 16-byte BF16 load per thread
-    static_assert(kGroupSize % kVecElems == 0, "kGroupSize must be a multiple of 8");
+    static_assert(kVecElems == 8 || kNvfp4,
+                  "16-element per-thread vectorization is specialized for 1-group/thread NVFP4");
+    static_assert(kGroupSize % kVecElems == 0, "kGroupSize must be a multiple of kVecElems");
     constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;
 
     const uint32_t bid = blockIdx.x;
@@ -111,104 +156,139 @@ __global__ void mega_moe_pre_dispatch_kernel(
     if (bid < num_tokens) {
         // ---- Quantize path: one CTA per valid token ----
         const uint32_t token_id = bid;
-
         const auto* token_in = x + static_cast<uint64_t>(token_id) * hidden;
-        // Coalesced 16-byte BF16 vector load. Threads cover columns
-        // [tid*kVecElems, tid*kVecElems + kVecElems) — each thread owns
-        // one contiguous slice of one token.
-        uint4 in_bits = reinterpret_cast<const uint4*>(token_in)[tid];
-        const auto* bf16_pairs = reinterpret_cast<const __nv_bfloat162*>(&in_bits);
 
-        float vals[kVecElems];
-        float local_max = 0.0f;
-        #pragma unroll
-        for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-            float2 fp = __bfloat1622float2(bf16_pairs[i]);
-            vals[2 * i + 0] = fp.x;
-            vals[2 * i + 1] = fp.y;
-            local_max = fmaxf(local_max, fmaxf(fabsf(fp.x), fabsf(fp.y)));
-        }
+        if constexpr (kVecElems == 16) {
+            // 1-group/thread NVFP4 path: each thread loads 16 BF16 elements (2 x uint4),
+            // eliminating cross-lane group amax shuffles and halving CTA thread count.
+            const auto* in_u4 = reinterpret_cast<const uint4*>(token_in) + tid * 2u;
+            const uint4 bits0 = in_u4[0];
+            const uint4 bits1 = in_u4[1];
+            const auto* p0 = reinterpret_cast<const __nv_bfloat162*>(&bits0);
+            const auto* p1 = reinterpret_cast<const __nv_bfloat162*>(&bits1);
 
-        // Reduce absmax across the kThreadsPerGroup threads that cover one
-        // group. Lanes outside the group keep their own value (different
-        // group's max), so SF write below is gated to one thread per group.
-        local_max = math::warp_reduce<kThreadsPerGroup, /*kIntergroupReduce=*/false>(
-            local_max, math::ReduceMax<float>{});
+            const __nv_bfloat162 m0 = __hmax2(__habs2(p0[0]), __habs2(p0[1]));
+            const __nv_bfloat162 m1 = __hmax2(__habs2(p0[2]), __habs2(p0[3]));
+            const __nv_bfloat162 m2 = __hmax2(__habs2(p1[0]), __habs2(p1[1]));
+            const __nv_bfloat162 m3 = __hmax2(__habs2(p1[2]), __habs2(p1[3]));
+            const __nv_bfloat162 m_all = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
+            const float local_max = __bfloat162float(__hmax(m_all.x, m_all.y));
 
-        float inv_scale;
-        uint32_t sf_byte;
-        if constexpr (kNvfp4) {
-            // NVFP4 per-token recipe (matches the flashinfer per-token
-            // quantizer's dequant contract): x ≈ e2m1 * ue4m3(sf) * pts with
-            //   pts = row_absmax / (448 * 6)
-            //   sf  = e4m3_rn(group_absmax / (6 * pts))   (≤ 448 by construction)
-            // Encode divides by the ROUNDED sf so dequant is exact w.r.t. it.
-            const float row_max = fmaxf(
-                pre_dispatch_block_reduce_max(local_max), 1e-4f);
+            const float row_max = fmaxf(pre_dispatch_block_reduce_max(local_max), 1e-4f);
             const float pts = row_max / (448.0f * 6.0f);
             const __nv_fp8_storage_t sf_fp8 = __nv_cvt_float_to_fp8(
                 local_max / (6.0f * pts), __NV_SATFINITE, __NV_E4M3);
             const __half_raw sf_hr = __nv_cvt_fp8_to_halfraw(sf_fp8, __NV_E4M3);
             const float sf_dec = __half2float(*reinterpret_cast<const __half*>(&sf_hr));
-            inv_scale = sf_dec > 0.0f ? 1.0f / (sf_dec * pts) : 0.0f;
-            sf_byte = static_cast<uint32_t>(sf_fp8);
+            const float inv_scale = sf_dec > 0.0f ? 1.0f / (sf_dec * pts) : 0.0f;
+
             if (tid == 0u)
                 buf_x_scales[token_id] = pts;
-        } else {
-            // Match host `per_token_cast_to_fp4/fp8`: clamp absmax to 1e-4
-            // before dividing by the dtype's max representable value.
-            const float absmax = fmaxf(local_max, 1e-4f);
-            constexpr float kFinfoMax = kPackedFp4 ? 6.0f : 448.0f;
-            const float raw_scale = absmax / kFinfoMax;
-            const uint32_t ue8m0_exp = pre_dispatch_cast_to_ue8m0(raw_scale);
-            // 1 / 2^(ue8m0_exp - 127) = 2^(127 - ue8m0_exp); fp32 bits =
-            // (127 - ue8m0_exp + 127) << 23 = (254 - ue8m0_exp) << 23.
-            sf_byte = ue8m0_exp;
-            inv_scale = __uint_as_float((254u - sf_byte) << 23u);
-        }
 
-        if constexpr (kPackedFp4) {
-            // 8 BF16 → 4 packed nibbles → 4 bytes (uint32_t). Output stride
-            // per token is hidden/2; thread tid writes 4 bytes at offset
-            // [tid*4, tid*4+4) in the output row. Pairing matches host
-            // `per_token_cast_to_fp4`: byte b's low nibble is column 2b
-            // (even), high nibble is column 2b+1 (odd).
-            uint32_t packed = 0;
+            // Coalesce 4 adjacent groups' UE4M3 SF bytes into one int32_t store.
+            const uint32_t sf_u32 = static_cast<uint32_t>(sf_fp8);
+            const uint32_t sf01 = __byte_perm(sf_u32, __shfl_xor_sync(0xffffffffu, sf_u32, 1), 0x0040u);
+            const uint32_t sf0123 = __byte_perm(sf01, __shfl_xor_sync(0xffffffffu, sf01, 2), 0x5410u);
+            if ((tid & 3u) == 0u) {
+                buf_x_sf[(token_id * num_groups + tid) >> 2u] = static_cast<int32_t>(sf0123);
+            }
+
+            const float2 inv2 = {inv_scale, inv_scale};
+            const uint32_t lo32 = pre_dispatch_pack_f32x8_to_e2m1x8(
+                __fmul2_rn(__bfloat1622float2(p0[0]), inv2),
+                __fmul2_rn(__bfloat1622float2(p0[1]), inv2),
+                __fmul2_rn(__bfloat1622float2(p0[2]), inv2),
+                __fmul2_rn(__bfloat1622float2(p0[3]), inv2));
+            const uint32_t hi32 = pre_dispatch_pack_f32x8_to_e2m1x8(
+                __fmul2_rn(__bfloat1622float2(p1[0]), inv2),
+                __fmul2_rn(__bfloat1622float2(p1[1]), inv2),
+                __fmul2_rn(__bfloat1622float2(p1[2]), inv2),
+                __fmul2_rn(__bfloat1622float2(p1[3]), inv2));
+
+            auto* row_out64 = static_cast<uint64_t*>(buf_x) +
+                              static_cast<uint64_t>(token_id) * (hidden / 16u);
+            row_out64[tid] = (static_cast<uint64_t>(hi32) << 32u) | static_cast<uint64_t>(lo32);
+        } else {
+            // Coalesced 16-byte BF16 vector load (8 elements per thread).
+            uint4 in_bits = reinterpret_cast<const uint4*>(token_in)[tid];
+            const auto* bf16_pairs = reinterpret_cast<const __nv_bfloat162*>(&in_bits);
+
+            float vals[kVecElems];
+            const __nv_bfloat162 m01 = __hmax2(__habs2(bf16_pairs[0]), __habs2(bf16_pairs[1]));
+            const __nv_bfloat162 m23 = __hmax2(__habs2(bf16_pairs[2]), __habs2(bf16_pairs[3]));
+            float local_max = __bfloat162float(__hmax(__hmax2(m01, m23).x, __hmax2(m01, m23).y));
             #pragma unroll
             for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-                const uint32_t lo = pre_dispatch_e2m1_encode(vals[2 * i + 0] * inv_scale);
-                const uint32_t hi = pre_dispatch_e2m1_encode(vals[2 * i + 1] * inv_scale);
-                packed |= ((lo & 0xFu) | ((hi & 0xFu) << 4u)) << (8u * i);
+                float2 fp = __bfloat1622float2(bf16_pairs[i]);
+                vals[2 * i + 0] = fp.x;
+                vals[2 * i + 1] = fp.y;
             }
-            auto* row_out = static_cast<uint32_t*>(buf_x) +
-                            static_cast<uint64_t>(token_id) * (hidden / 8u);
-            row_out[tid] = packed;
-        } else {
-            // 8 BF16 → 4 fp8x2 = 8 FP8 bytes (uint64_t). Output stride per
-            // token is `hidden` bytes. Use CUDA's saturating fp8 conversion
-            // (RNE), matching PyTorch's `.to(torch.float8_e4m3fn)`.
-            uint64_t packed = 0;
-            #pragma unroll
-            for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-                const __nv_fp8x2_storage_t fp8x2 = __nv_cvt_float2_to_fp8x2(
-                    make_float2(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale),
-                    __NV_SATFINITE, __NV_E4M3);
-                packed |= static_cast<uint64_t>(fp8x2) << (16u * i);
-            }
-            auto* row_out = static_cast<uint64_t*>(buf_x) +
-                            static_cast<uint64_t>(token_id) * (hidden / 8u);
-            row_out[tid] = packed;
-        }
 
-        // One thread per group writes its scale byte (UE8M0 exponent, or the
-        // UE4M3 block SF for NVFP4 acts). Row-major contiguous layout into
-        // `buf_x_sf` viewed as bytes: byte_off = token_id * num_groups + group_id.
-        const uint32_t group_id = tid / kThreadsPerGroup;
-        const uint32_t within_group_id = tid % kThreadsPerGroup;
-        if (within_group_id == 0u && group_id < num_groups) {
-            const uint32_t byte_off = token_id * num_groups + group_id;
-            reinterpret_cast<uint8_t*>(buf_x_sf)[byte_off] =
-                static_cast<uint8_t>(sf_byte);
+            // Reduce absmax across the kThreadsPerGroup threads that cover one
+            // group. Lanes outside the group keep their own value (different
+            // group's max), so SF write below is gated to one thread per group.
+            local_max = math::warp_reduce<kThreadsPerGroup, /*kIntergroupReduce=*/false>(
+                local_max, math::ReduceMax<float>{});
+
+            float inv_scale;
+            uint32_t sf_byte;
+            if constexpr (kNvfp4) {
+                // NVFP4 per-token recipe: x ≈ e2m1 * ue4m3(sf) * pts with
+                //   pts = row_absmax / (448 * 6)
+                //   sf  = e4m3_rn(group_absmax / (6 * pts))   (≤ 448 by construction)
+                const float row_max = fmaxf(
+                    pre_dispatch_block_reduce_max(local_max), 1e-4f);
+                const float pts = row_max / (448.0f * 6.0f);
+                const __nv_fp8_storage_t sf_fp8 = __nv_cvt_float_to_fp8(
+                    local_max / (6.0f * pts), __NV_SATFINITE, __NV_E4M3);
+                const __half_raw sf_hr = __nv_cvt_fp8_to_halfraw(sf_fp8, __NV_E4M3);
+                const float sf_dec = __half2float(*reinterpret_cast<const __half*>(&sf_hr));
+                inv_scale = sf_dec > 0.0f ? 1.0f / (sf_dec * pts) : 0.0f;
+                sf_byte = static_cast<uint32_t>(sf_fp8);
+                if (tid == 0u)
+                    buf_x_scales[token_id] = pts;
+            } else {
+                // Match host `per_token_cast_to_fp4/fp8`: clamp absmax to 1e-4
+                // before dividing by the dtype's max representable value.
+                const float absmax = fmaxf(local_max, 1e-4f);
+                constexpr float kFinfoMax = kPackedFp4 ? 6.0f : 448.0f;
+                const float raw_scale = absmax / kFinfoMax;
+                const uint32_t ue8m0_exp = pre_dispatch_cast_to_ue8m0(raw_scale);
+                sf_byte = ue8m0_exp;
+                inv_scale = __uint_as_float((254u - sf_byte) << 23u);
+            }
+
+            if constexpr (kPackedFp4) {
+                const float2 inv2 = {inv_scale, inv_scale};
+                const uint32_t packed = pre_dispatch_pack_f32x8_to_e2m1x8(
+                    __fmul2_rn({vals[0], vals[1]}, inv2),
+                    __fmul2_rn({vals[2], vals[3]}, inv2),
+                    __fmul2_rn({vals[4], vals[5]}, inv2),
+                    __fmul2_rn({vals[6], vals[7]}, inv2));
+                auto* row_out = static_cast<uint32_t*>(buf_x) +
+                                static_cast<uint64_t>(token_id) * (hidden / 8u);
+                row_out[tid] = packed;
+            } else {
+                uint64_t packed = 0;
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+                    const __nv_fp8x2_storage_t fp8x2 = __nv_cvt_float2_to_fp8x2(
+                        make_float2(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale),
+                        __NV_SATFINITE, __NV_E4M3);
+                    packed |= static_cast<uint64_t>(fp8x2) << (16u * i);
+                }
+                auto* row_out = static_cast<uint64_t*>(buf_x) +
+                                static_cast<uint64_t>(token_id) * (hidden / 8u);
+                row_out[tid] = packed;
+            }
+
+            const uint32_t group_id = tid / kThreadsPerGroup;
+            const uint32_t within_group_id = tid % kThreadsPerGroup;
+            if (within_group_id == 0u && group_id < num_groups) {
+                const uint32_t byte_off = token_id * num_groups + group_id;
+                reinterpret_cast<uint8_t*>(buf_x_sf)[byte_off] =
+                    static_cast<uint8_t>(sf_byte);
+            }
         }
 
         // Copy this token's topk row, optionally folding a per-expert scale
@@ -225,15 +305,27 @@ __global__ void mega_moe_pre_dispatch_kernel(
         }
     } else {
         // ---- Pad path: trailing CTAs fill [num_tokens, padded_max) topk
-        // slots with (-1, 0.0) so the dispatch sentinel matches an empty
-        // expert assignment. blockDim.x slots per pad CTA.
-        const uint32_t copy_bid = bid - num_tokens;
-        const uint32_t pad_base = num_tokens * top_k;
-        const uint32_t slot     = pad_base + copy_bid * blockDim.x + tid;
-        const uint32_t total    = padded_max * top_k;
-        if (slot < total) {
-            buf_topk_idx[slot]     = static_cast<int64_t>(-1);
-            buf_topk_weights[slot] = 0.0f;
+        // slots with (-1, 0.0), 4 slots per thread (vectorized int4/float4 on
+        // 16B-aligned interior, scalar fallback at unaligned edges).
+        const uint32_t copy_bid  = bid - num_tokens;
+        const uint32_t pad_base  = num_tokens * top_k;
+        const uint32_t total     = padded_max * top_k;
+        const uint32_t base_slot = pad_base + (copy_bid * blockDim.x + tid) * 4u;
+        const uintptr_t align_mask =
+            reinterpret_cast<uintptr_t>(buf_topk_idx + base_slot) |
+            reinterpret_cast<uintptr_t>(buf_topk_weights + base_slot);
+        if ((align_mask & 15u) == 0u && base_slot + 3u < total) {
+            reinterpret_cast<int4*>(&buf_topk_idx[base_slot])[0]      = make_int4(-1, -1, -1, -1);
+            reinterpret_cast<int4*>(&buf_topk_idx[base_slot])[1]      = make_int4(-1, -1, -1, -1);
+            reinterpret_cast<float4*>(&buf_topk_weights[base_slot])[0] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        } else {
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; ++k) {
+                if (base_slot + k < total) {
+                    buf_topk_idx[base_slot + k]     = static_cast<int64_t>(-1);
+                    buf_topk_weights[base_slot + k] = 0.0f;
+                }
+            }
         }
     }
 
