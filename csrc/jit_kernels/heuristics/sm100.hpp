@@ -14,6 +14,10 @@
 
 namespace deep_gemm {
 
+struct SM103ArchSpec {
+    static bool is_current() { return jit->device.get_arch_pair() == std::make_pair(10, 3); }
+};
+
 struct SM107ArchSpec {
     static constexpr int oversized_smem_capacity = 334848;
 
