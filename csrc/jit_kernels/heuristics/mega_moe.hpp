@@ -194,9 +194,12 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const float num_total_tokens = global_num_tokens.has_value() ?
         static_cast<float>(*global_num_tokens) : static_cast<float>(num_tokens) * num_ranks;
 
-    // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
+    // Expected tokens per expert, plus a routing dispersion margin for the tile choice:
+    // multi-block prefill loads exhibit super-Poisson expert skew across prompts, where a 3-sigma
+    // margin avoids spilling hot experts into an extra M block (and reloading their weight tiles).
     const float num_expected_tokens = num_total_tokens * num_topk / num_experts;
-    const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
+    const float sigma_mult = num_expected_tokens >= 240.0f ? 3.0f : 1.0f;
+    const float num_covered_tokens = num_expected_tokens + sigma_mult * std::sqrt(num_expected_tokens);
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
