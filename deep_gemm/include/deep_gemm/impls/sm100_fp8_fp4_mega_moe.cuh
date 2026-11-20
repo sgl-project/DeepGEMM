@@ -368,8 +368,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwizzleK64Mode = 64;
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
-    constexpr uint64_t kActsCacheHint = static_cast<uint64_t>(BLOCK_M <= 128 ?
-        cute::TMA::CacheHintSm100::EVICT_LAST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
+    // Every M block's activations are reused across all N clusters of L1 and L2
+    constexpr uint64_t kActsCacheHint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_LAST);
 
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = 2;
@@ -514,7 +514,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks, kNumLocalityDomains,
-        kNumSharedExperts>(
+        kNumSharedExperts,
+        /*kEnableLPTSwizzle=*/not kHasShared>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -732,6 +733,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (current_expert_idx >= kNumExpertsPerRank)
                 break;
 
+            const uint32_t phys_expert_idx = scheduler.get_expert_id(current_expert_idx);
             // Load per-rank counts when expert changes
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
@@ -740,7 +742,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
                     stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, phys_expert_idx)) : 0;
                 }
             }
 
@@ -796,7 +798,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Read source token-topk index (written by remote dispatch via NVLink)
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
-                current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+                phys_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
             float pulled_x_scale = 0.0f;
@@ -1023,11 +1025,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *workspace.get_shared_l2_full_count_ptr(i) = 0;
             __syncwarp();
         } else {
-            // Other SMs: clean blocks
+            // Other SMs: clean blocks (walk LPT-sorted slots -> physical expert IDs)
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
-                // Read expert token count before clearing
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    *workspace.get_expert_recv_count_sum_ptr(i));
+                const uint32_t phys_expert_idx = scheduler.get_expert_id(i);
+                const auto num_recv_tokens = scheduler.get_num_tokens(i);
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
@@ -1039,16 +1040,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Clean expert token count, and add cumulative results
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    *workspace.get_expert_recv_count_sum_ptr(phys_expert_idx) = 0;
                 } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
-                        ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                        ptx::red_add(cumulative_local_expert_recv_stats + phys_expert_idx, static_cast<int>(num_recv_tokens));
                     __syncwarp();
                 }
 
                 // Clean per-rank token count
                 for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                    *workspace.get_expert_recv_count_ptr(j, phys_expert_idx) = 0;
                 __syncwarp();
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
@@ -1187,6 +1188,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
             const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
+            constexpr uint64_t kWeightEvictLast = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_LAST);
+            constexpr uint64_t kWeightEvictNormal = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+            const bool reuse_weights_in_l2 = not task_info.is_shared() and task_info.num_m_blocks >= 2;
+            const uint64_t weight_cache_hint = reuse_weights_in_l2 ? kWeightEvictLast : kWeightEvictNormal;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
@@ -1208,18 +1213,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // L1's row swap is handled in the epilogue; L2's shuffle in the descriptor.
                     if (task_info.block_phase == sched::BlockPhase::Linear1) {
                         if (cute::elect_one_sync()) {
-                            tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, expert_n_idx, 2);
+                            if (reuse_weights_in_l2) {
+                                tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, false, kWeightEvictLast>(
+                                    tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, expert_n_idx, 2);
+                            } else {
+                                tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, false, kWeightEvictNormal>(
+                                    tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, expert_n_idx, 2);
+                            }
                         }
                     } else {
                         #pragma unroll
                         for (uint32_t atom = 0; atom < BLOCK_K_BYTES / 128; ++ atom) {
                             auto* tile = shared_storage.smem_b[stage_idx] + atom * LOAD_BLOCK_N * 128;
                             auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
-                            const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
                             if (cute::elect_one_sync()) {
                                 cute::SM100_TMA_2SM_LOAD_4D::copy(
-                                    tensor_map_b_ptr, full, cache_hint, tile,
+                                    tensor_map_b_ptr, full, weight_cache_hint, tile,
                                     k_idx + atom * 128, 0, 0, expert_n_idx / 32);
                             }
                         }
@@ -1228,16 +1237,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (cute::elect_one_sync()) {
                         const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
                         auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
-                        const auto hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
                         const uint32_t sf_row_block = expert_n_idx / 128;
                         const uint32_t sf_k_chunk = k_block_idx * kNumSFWordsPerStage;
                         if (is_l1)
                             cute::SM100_TMA_2SM_LOAD_3D::copy(
-                                tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                tensor_map_sfb_ptr, full, weight_cache_hint, shared_storage.smem_sfb[stage_idx],
                                 0, sf_k_chunk, sf_row_block);
                         else
                             cute::SM100_TMA_2SM_LOAD_5D::copy(
-                                tensor_map_sfb_ptr, full, hint, shared_storage.smem_sfb[stage_idx],
+                                tensor_map_sfb_ptr, full, weight_cache_hint, shared_storage.smem_sfb[stage_idx],
                                 0, 0, 0, sf_k_chunk, sf_row_block);
                         if (is_leader_cta)
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
@@ -1250,7 +1258,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // descriptor; L2 rows are plain. SFs are CUTLASS 128x4 atoms (TRT SMEM order).
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
                     const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
-                    const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
                     auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
                     if (is_l1) {
                         #pragma unroll
@@ -1259,18 +1266,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             if (cute::elect_one_sync()) {
                                 if constexpr (kIsWeightFP8 and not kUseUpGateBlock16) {
                                     cute::SM100_TMA_2SM_LOAD_4D::copy(
-                                        tensor_map_b_ptr, full, cache_hint, tile,
+                                        tensor_map_b_ptr, full, weight_cache_hint, tile,
                                         k_idx + atom * 128, 0, 0, expert_n_idx / 16);
                                 } else {
                                     cute::SM100_TMA_2SM_LOAD_5D::copy(
-                                        tensor_map_b_ptr, full, cache_hint, tile,
+                                        tensor_map_b_ptr, full, weight_cache_hint, tile,
                                         k_idx + atom * 128, 0, 0, 0, expert_n_idx / 32);
                                 }
                             }
                         }
                     } else if (cute::elect_one_sync()) {
-                        tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                        if (reuse_weights_in_l2) {
+                            tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightEvictLast>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                        } else {
+                            tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightEvictNormal>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                        }
                     }
                     __syncwarp();
                     if (cute::elect_one_sync()) {
@@ -1280,12 +1292,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < BLOCK_N / 128; ++ i)
                                 cute::SM100_TMA_2SM_LOAD_5D::copy(
-                                    tensor_map_sfb_ptr, full, cache_hint,
+                                    tensor_map_sfb_ptr, full, weight_cache_hint,
                                     shared_storage.smem_sfb[stage_idx] + i * kNumSFWordsPerStage * kNumUTCCPAlignedElems,
                                     0, 0, 0, 0, (sf_row_block + i) * shape_sfb_k + sf_k_chunk);
                         } else {
                             cute::SM100_TMA_2SM_LOAD_3D::copy(
-                                tensor_map_sfb_ptr, full, cache_hint, shared_storage.smem_sfb[stage_idx],
+                                tensor_map_sfb_ptr, full, weight_cache_hint, shared_storage.smem_sfb[stage_idx],
                                 0, sf_k_chunk, sf_row_block);
                         }
                         if (is_leader_cta)
@@ -1325,15 +1337,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     } else {
                         if constexpr (kPackedFP4Weights) {
-                            tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, cutlass::float_e2m1_t, 4>(
-                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<cutlass::float_e2m1_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
+                            if (reuse_weights_in_l2) {
+                                tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, cutlass::float_e2m1_t, 4, kWeightEvictLast>(
+                                    tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<cutlass::float_e2m1_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
+                            } else {
+                                tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleK64Mode, cutlass::float_e2m1_t, 4, kWeightEvictNormal>(
+                                    tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<cutlass::float_e2m1_t*>(shared_storage.smem_b[stage_idx]), 2, k_idx, half_n_idx, half_idx, expert_idx);
+                            }
+                        } else if (reuse_weights_in_l2) {
+                            tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightEvictLast>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
                         } else {
-                            tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                            tma::copy_nd<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4, kWeightEvictNormal>(
                                 tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
                         }
                         if (load_sfb) {
-                            tma::copy<BLOCK_N, 1, 0>(
-                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                            if (reuse_weights_in_l2) {
+                                tma::copy<BLOCK_N, 1, 0, uint32_t, false, kWeightEvictLast>(
+                                    tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                            } else {
+                                tma::copy<BLOCK_N, 1, 0, uint32_t, false, kWeightEvictNormal>(
+                                    tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                            }
                         }
                         if (is_leader_cta) {
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
