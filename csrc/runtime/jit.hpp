@@ -41,7 +41,9 @@ inline void init_jit(const std::string& library_root_path) {
         // DeepJIT requires CUDA 12.9+, where the family suffix is available.
         const auto major = runtime->device.get_arch_major();
         const auto minor = runtime->device.get_arch_minor();
-        if (major == 10 and minor == 7 and nvcc_at_least(runtime->backend.compiler_info.version, 13, 4))
+        if (major == 10 and minor == 3 and nvcc_at_least(runtime->backend.compiler_info.version, 12, 9))
+            runtime->default_compiler_options.arch = "103a";
+        else if (major == 10 and minor == 7 and nvcc_at_least(runtime->backend.compiler_info.version, 13, 4))
             runtime->default_compiler_options.arch = "107a";
         else if (major == 10 and minor != 1)
             runtime->default_compiler_options.arch = "100f";
