@@ -106,6 +106,15 @@ struct SM90ArchSpec {
                         if (block_m > 128 and block_n > 128)
                             continue;
 
+                        // 256-row 1D2D tiles need multicast and one SFB row per block (`block_k % block_n == 0`):
+                        // without multicast they run at half speed, and 256x112 loses to 256x128 or 128x160/192.
+                        // Normal GEMMs only: they always keep the 64/128-row candidates, while a grouped GEMM
+                        // with 256-row alignment has no other block M to fall back to
+                        if (desc.gemm_type == GemmType::Normal and
+                            desc.kernel_type == KernelType::Kernel1D2D and not block32 and block_m > 128 and
+                            (cluster_m * cluster_n == 1 or block_k % block_n != 0))
+                            continue;
+
                         // Calculate swizzling
                         const auto layout = Layout{0, block_m, block_n, block_k, cluster_m, cluster_n};
                         const auto storage_config = get_storage_config(desc, layout);
