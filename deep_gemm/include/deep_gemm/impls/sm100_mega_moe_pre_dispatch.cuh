@@ -43,74 +43,37 @@ __forceinline__ __device__ uint32_t pre_dispatch_cast_to_ue8m0(float raw_scale) 
     return exp;
 }
 
-// E2M1 (FP4) bucketize encode matching `deep_gemm.utils.math._quantize_to_fp4_e2m1`.
-// Boundaries are midpoints between adjacent representable magnitudes. A tie
-// selects the even code, matching the host helper and PTX `cvt.rn.satfinite`.
-__forceinline__ __device__ uint32_t pre_dispatch_e2m1_encode(float v) {
-    float ax = fabsf(v);
-    if (ax > 6.0f) ax = 6.0f;
-    uint32_t idx = (ax > 0.25f) + (ax >= 0.75f) + (ax > 1.25f) +
-                   (ax >= 1.75f) + (ax > 2.5f) + (ax >= 3.5f) + (ax > 5.0f);
-    uint32_t code = idx;
-    if ((v < 0.0f) && (idx != 0u))
-        code |= 0x8u;
-    return code;
-}
-
-__forceinline__ __device__ float pre_dispatch_warp_max_nonneg(float val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    const uint32_t mask = __activemask();
+__forceinline__ __device__ float pre_dispatch_warp_max_nonneg(float val, uint32_t mask) {
     const uint32_t u = __float_as_uint(val);
     uint32_t m;
     asm volatile("redux.sync.max.u32 %0, %1, %2;" : "=r"(m) : "r"(u), "r"(mask));
     return __uint_as_float(m);
-#else
-    return math::warp_reduce<32, /*kIntergroupReduce=*/false>(val, math::ReduceMax<float>{});
-#endif
 }
 
+template <bool kFullWarps>
 __forceinline__ __device__ float pre_dispatch_block_reduce_max(float val) {
     __shared__ float smem[32];
-    const uint32_t lane = threadIdx.x % 32u;
-    const uint32_t warp = threadIdx.x / 32u;
-    const uint32_t num_warps = (blockDim.x + 31u) / 32u;
-    val = pre_dispatch_warp_max_nonneg(val);
-    if (lane == 0)
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t num_warps = (blockDim.x + 31u) >> 5u;
+    uint32_t lanes = 32u;
+    uint32_t mask = 0xffffffffu;
+    if constexpr (!kFullWarps) {
+        lanes = min(32u, blockDim.x - (threadIdx.x & ~31u));
+        mask  = lanes == 32u ? 0xffffffffu : (1u << lanes) - 1u;
+    }
+    val = pre_dispatch_warp_max_nonneg(val, mask);
+    if (lane == 0u)
         smem[warp] = val;
     __syncthreads();
-    val = (lane < num_warps) ? smem[lane] : 0.0f;
-    return pre_dispatch_warp_max_nonneg(val);
-}
-
-__forceinline__ __device__ uint32_t pre_dispatch_pack_f32x8_to_e2m1x8(
-    const float2 p0, const float2 p1, const float2 p2, const float2 p3) {
-    uint32_t packed = 0;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    asm volatile(
-        "{\n\t"
-        ".reg .b8 b0, b1, b2, b3;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
-        "mov.b32 %0, {b0, b1, b2, b3};\n\t"
-        "}\n"
-        : "=r"(packed)
-        : "f"(p0.x), "f"(p0.y), "f"(p1.x), "f"(p1.y),
-          "f"(p2.x), "f"(p2.y), "f"(p3.x), "f"(p3.y));
-    // Canonicalize E2M1 -0 (0x8) to +0 (0x0) across all 8 nibbles to match
-    // `per_token_cast_to_fp4` / `pre_dispatch_e2m1_encode` byte-for-byte.
-    packed &= ~((0x88888888u - (packed & 0x77777777u)) & 0x88888888u);
-#else
-    const float vals[8] = {p0.x, p0.y, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y};
-    #pragma unroll
-    for (uint32_t i = 0; i < 4; ++i) {
-        const uint32_t lo = pre_dispatch_e2m1_encode(vals[2 * i + 0]);
-        const uint32_t hi = pre_dispatch_e2m1_encode(vals[2 * i + 1]);
-        packed |= ((lo & 0xFu) | ((hi & 0xFu) << 4u)) << (8u * i);
+    if constexpr (kFullWarps) {
+        val = (lane < num_warps) ? smem[lane] : 0.0f;
+    } else {
+        val = 0.0f;
+        for (uint32_t w = lane; w < num_warps; w += lanes)
+            val = fmaxf(val, smem[w]);
     }
-#endif
-    return packed;
+    return pre_dispatch_warp_max_nonneg(val, mask);
 }
 
 template <uint32_t kGroupSize, MmaKind kMmaKind, bool kUsePDL, uint32_t kVecElems = 8>
@@ -174,7 +137,7 @@ __global__ void mega_moe_pre_dispatch_kernel(
             const __nv_bfloat162 m_all = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
             const float local_max = __bfloat162float(__hmax(m_all.x, m_all.y));
 
-            const float row_max = fmaxf(pre_dispatch_block_reduce_max(local_max), 1e-4f);
+            const float row_max = fmaxf(pre_dispatch_block_reduce_max<true>(local_max), 1e-4f);
             const float pts = row_max / (448.0f * 6.0f);
             const __nv_fp8_storage_t sf_fp8 = __nv_cvt_float_to_fp8(
                 local_max / (6.0f * pts), __NV_SATFINITE, __NV_E4M3);
@@ -194,12 +157,12 @@ __global__ void mega_moe_pre_dispatch_kernel(
             }
 
             const float2 inv2 = {inv_scale, inv_scale};
-            const uint32_t lo32 = pre_dispatch_pack_f32x8_to_e2m1x8(
+            const uint32_t lo32 = math::cvt_pack_f32x8_to_e2m1x8<true>(
                 __fmul2_rn(__bfloat1622float2(p0[0]), inv2),
                 __fmul2_rn(__bfloat1622float2(p0[1]), inv2),
                 __fmul2_rn(__bfloat1622float2(p0[2]), inv2),
                 __fmul2_rn(__bfloat1622float2(p0[3]), inv2));
-            const uint32_t hi32 = pre_dispatch_pack_f32x8_to_e2m1x8(
+            const uint32_t hi32 = math::cvt_pack_f32x8_to_e2m1x8<true>(
                 __fmul2_rn(__bfloat1622float2(p1[0]), inv2),
                 __fmul2_rn(__bfloat1622float2(p1[1]), inv2),
                 __fmul2_rn(__bfloat1622float2(p1[2]), inv2),
@@ -237,7 +200,7 @@ __global__ void mega_moe_pre_dispatch_kernel(
                 //   pts = row_absmax / (448 * 6)
                 //   sf  = e4m3_rn(group_absmax / (6 * pts))   (≤ 448 by construction)
                 const float row_max = fmaxf(
-                    pre_dispatch_block_reduce_max(local_max), 1e-4f);
+                    pre_dispatch_block_reduce_max<false>(local_max), 1e-4f);
                 const float pts = row_max / (448.0f * 6.0f);
                 const __nv_fp8_storage_t sf_fp8 = __nv_cvt_float_to_fp8(
                     local_max / (6.0f * pts), __NV_SATFINITE, __NV_E4M3);
@@ -260,7 +223,7 @@ __global__ void mega_moe_pre_dispatch_kernel(
 
             if constexpr (kPackedFp4) {
                 const float2 inv2 = {inv_scale, inv_scale};
-                const uint32_t packed = pre_dispatch_pack_f32x8_to_e2m1x8(
+                const uint32_t packed = math::cvt_pack_f32x8_to_e2m1x8<true>(
                     __fmul2_rn({vals[0], vals[1]}, inv2),
                     __fmul2_rn({vals[2], vals[3]}, inv2),
                     __fmul2_rn({vals[4], vals[5]}, inv2),

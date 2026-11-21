@@ -173,6 +173,9 @@ def _run_nvfp4(hidden: int, top_k: int, args: argparse.Namespace) -> None:
             [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0,
              -0.05, -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, 6.0],
             dtype=x.dtype, device=x.device)
+    if M > 1:
+        # Plant row_max in the tail group to exercise partial-last-warp reduction (e.g. H=2880).
+        x[1, -1] = 448.0 * 6.0
 
     num_experts = args.num_experts
     topk_idx = torch.randint(-1, num_experts, (M, K), dtype=torch.int32, device='cuda')
@@ -232,8 +235,11 @@ def main():
     if args.dtype in ('nvfp4', 'all'):
         _run_nvfp4(hidden=args.hidden, top_k=args.top_k, args=args)
         if args.hidden == 1024:
-            # Also cover the 8-elem/thread fallback (non-512 hidden) and unaligned odd-top_k pad-fill.
+            # Also cover the 8-elem/thread fallback with full warps (H=1280 -> 160 threads),
+            # a partial last warp (H=2880 -> 360 threads = 11*32 + 8, max planted in warp 11),
+            # and unaligned odd-top_k pad-fill.
             _run_nvfp4(hidden=1280, top_k=3, args=args)
+            _run_nvfp4(hidden=2880, top_k=3, args=args)
     print('OK')
 
 
