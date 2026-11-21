@@ -269,6 +269,30 @@ CUTLASS_DEVICE uint32_t cvt_pack_f32x4_to_e2m1x4(
     return out;
 }
 
+// Pack eight FP32 values into one uint32 (8 FP4 E2M1 nibbles, low nibble first per pair).
+// When `kCanonicalizeNegZero` is set, E2M1 -0 (0x8) nibbles are mapped to +0 (0x0).
+template <bool kCanonicalizeNegZero = false>
+CUTLASS_DEVICE uint32_t cvt_pack_f32x8_to_e2m1x8(
+        const float2& p0, const float2& p1, const float2& p2, const float2& p3) {
+    uint32_t out;
+    asm volatile(
+        "{\n\t"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n\t"
+        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n"
+        : "=r"(out)
+        : "f"(p0.x), "f"(p0.y), "f"(p1.x), "f"(p1.y),
+          "f"(p2.x), "f"(p2.y), "f"(p3.x), "f"(p3.y));
+    if constexpr (kCanonicalizeNegZero) {
+        out &= ~((0x88888888u - (out & 0x77777777u)) & 0x88888888u);
+    }
+    return out;
+}
+
 /// Reduction
 template <typename T>
 CUTLASS_DEVICE T warp_inclusive_sum(T value, const uint32_t lane_idx) {

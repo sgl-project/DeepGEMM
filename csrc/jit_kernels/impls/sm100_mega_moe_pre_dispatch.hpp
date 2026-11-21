@@ -21,6 +21,7 @@ public:
         int group_size;
         MmaKind mma_kind;
         bool use_pdl;
+        int vec_elems;
 
         // Runtime args (passed to the kernel via the params struct).
         const void* x;
@@ -49,12 +50,13 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&mega_moe_pre_dispatch_kernel<
-        {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )", args.group_size,
     to_mma_kind_name(args.mma_kind),
-    args.use_pdl ? "true" : "false");
+    args.use_pdl ? "true" : "false",
+    args.vec_elems);
     }
 
     static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
@@ -159,13 +161,19 @@ static void mega_moe_pre_dispatch(
     }
 
     DG_HOST_ASSERT(hidden % 8 == 0);
-    const auto num_threads = hidden / 8;
+    // Use 1-group/thread (16 BF16 elements per thread) for NVFP4 when hidden
+    // divides into full 32-lane warps and fits within the 1024-thread CTA cap;
+    // wider hidden sizes up to 16384 are also supported by this 16-elem path.
+    const bool use_vec16 = (mma_kind == MmaKind::NVFP4) and (hidden % 512 == 0) and
+                           ((hidden / 16) >= top_k) and ((hidden / 16) <= 1024);
+    const int vec_elems = use_vec16 ? 16 : 8;
+    const auto num_threads = hidden / vec_elems;
     DG_HOST_ASSERT(num_threads <= 1024);
     DG_HOST_ASSERT(num_threads >= top_k);
 
     const auto pad_slots = (padded_max - num_tokens) * top_k;
     const auto num_pad_blocks = pad_slots == 0 ? 0
-        : math::ceil_div(pad_slots, num_threads);
+        : math::ceil_div(pad_slots, num_threads * 4);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
     if (num_total_blocks == 0) return;
 
@@ -175,6 +183,7 @@ static void mega_moe_pre_dispatch(
         .group_size = group_size,
         .mma_kind = mma_kind,
         .use_pdl = use_pdl,
+        .vec_elems = vec_elems,
         .x = x.const_data_ptr(),
         .topk_idx = topk_idx.const_data_ptr(),
         .topk_weights = topk_weights.const_data_ptr(),
