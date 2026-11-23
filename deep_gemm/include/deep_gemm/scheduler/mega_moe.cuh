@@ -412,9 +412,9 @@ struct MegaMoEScheduler {
         // at most one extra L1 wave, or `kMaxDecodeL1FirstExtraWaves` with decode tiles (`BLOCK_M <= 64`).
         // The last M blocks then start their L1 earlier, and their L1 -> L2 chain sets the tail. The extra
         // waves also hold back every L2 task and its combine writes, which costs more than it saves past the
-        // cap (e.g. many local experts with a few tokens each). Larger loads keep the interleaved order.
-        // With a ring slot for every pool block, no L1 task waits for an L2 task to free a slot.
-        constexpr uint32_t kMaxDecodeL1FirstExtraWaves = 8;
+        // cap (more M blocks per expert, or many local experts with a few tokens each). Larger loads keep the
+        // interleaved order. With a ring slot for every pool block, no L1 task waits for an L2 task to free a slot.
+        constexpr uint32_t kMaxDecodeL1FirstExtraWaves = 4;
         constexpr uint32_t kMaxL1FirstExtraWaves = BLOCK_M <= 64 ? kMaxDecodeL1FirstExtraWaves : 1;
         const bool is_l1_first = num_total_m_blocks <= kNumRingBlocks and
             num_total_l1_waves <= min_l1_warmup_waves + kMaxL1FirstExtraWaves;
@@ -586,13 +586,11 @@ struct MegaMoEScheduler {
         const auto lane_idx = ptx::get_lane_idx();
         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
 
-        // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap and the tiles are small:
-        // decode tiles (`BLOCK_M <= 64`), or 128-row tiles with fewer than 100 CTA pairs (B300 / GB300 have 74-76;
-        // the tail was ~1% slower there, and 1-2% faster with Vera Rubin's 106). Otherwise they go at the tail,
-        // where they fill the CTA pairs that idle during the last routed M blocks' L1 -> L2 chain instead of
-        // waiting for the shared L1 ahead of the routed L1 tasks.
+        // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap and `BLOCK_M < 192`.
+        // With 192- and 240-row tiles they go at the tail, where they fill the CTA pairs that idle during the
+        // last routed M blocks' L1 -> L2 chain instead of waiting for the shared L1 ahead of the routed L1 tasks.
         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
-        constexpr bool kIsSharedL2EarlyTile = BLOCK_M <= 64 or (BLOCK_M < 192 and kNumSMs / 2 < 100);
+        constexpr bool kIsSharedL2EarlyTile = BLOCK_M < 192;
         const bool is_shared_l2_early = kIsSharedL2EarlyTile and
             math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
         if constexpr (kHasShared) {
