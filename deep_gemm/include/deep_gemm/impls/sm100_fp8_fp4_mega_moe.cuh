@@ -965,11 +965,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
+            // A store waits for its own load, so a load-store loop spends one remote round trip per 32 SF words.
+            // Issue every load first, so that they share one round trip with the weight and x_scale
+            // NOTES: this keeps one more register per 32 SF words alive; untested with 48 dispatch registers
+            constexpr bool kLoadSFBeforeStores = kNumDispatchRegisters >= 96;
+            constexpr uint32_t kNumSFUint32PerLane = math::constexpr_ceil_div(kNumSFUint32, 32u);
+            uint32_t pulled_sf[kNumSFUint32PerLane];
+            if constexpr (kLoadSFBeforeStores) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumSFUint32PerLane; ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    pulled_sf[i] = j < kNumSFUint32 ? remote_sf_ptr[j] : 0;
+                }
+            }
             #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
+            for (uint32_t i = 0; i < kNumSFUint32PerLane; ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
-                    __stcg(local_sf_ptr + j * kNumSFRingTokens + sf_ring_token_idx, remote_sf_ptr[j]);
+                if (j < kNumSFUint32) {
+                    __stcg(local_sf_ptr + j * kNumSFRingTokens + sf_ring_token_idx,
+                           kLoadSFBeforeStores ? pulled_sf[i] : remote_sf_ptr[j]);
+                }
             }
             __syncwarp();
 
