@@ -50,8 +50,8 @@ struct MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
-    // SM107 K=64 `kind::mxf8f6f4` MMAs on packed FP4 weights, and the SIMT dispatch pull
-    bool use_sm107_k64, use_simt_pull;
+    // SM107 K=64 `kind::mxf8f6f4` MMAs, SM103 K=96 `kind::mxf4nvf4` Ultra MMAs, and the SIMT dispatch pull
+    bool use_sm107_k64, use_sm103_k96, use_simt_pull;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
@@ -68,7 +68,9 @@ struct MegaMoEConfig {
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
            << ", num_bytes_per_pull=" << config.num_bytes_per_pull
-           << ", use_sm107_k64=" << config.use_sm107_k64 << ", use_simt_pull=" << config.use_simt_pull << ")";
+           << ", use_sm107_k64=" << config.use_sm107_k64
+           << ", use_sm103_k96=" << config.use_sm103_k96
+           << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
     }
 };
@@ -261,14 +263,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Always multicast on A
     const int load_block_m = block_m / 2;
 
-    // Dispatch region
+    // Dispatch region (`expert_token_count` and `dispatch_send_buffer` have disjoint lifetimes and share a union)
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
     const int smem_send_buffers_size = align(use_simt_pull ? 16 * num_dispatch_warps :
         static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
-    const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
+    const int smem_dispatch_size = std::max(smem_expert_count_size, smem_send_buffers_size);
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
@@ -337,7 +339,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int& gran_k = 32) {
 
     // Block config
-    const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
+    auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens,
                                       mma_kind, global_num_tokens);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
@@ -368,6 +370,16 @@ static MegaMoEConfig get_mega_moe_config(
     // routed weights packed and splits the FP8 shared expert's K blocks. `DG_MEGA_MOE_SM107_K64=0` disables it
     const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
         SM107ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
+    // SM103 (CC 10.3, Blackwell Ultra) has a K=96 `kind::mxf4nvf4.block_scale.block16` MMA (1.5x per-instruction K
+    // width over K=64) spanning 3-stage 768-element groups via `lbo_mode=1` (`block_m <= 192` uses 3-chunk TMEM SF
+    // slots; `block_m == 240` uses a compact 32-col double-buffered 2-chunk TMEM SF ring when `umma_n <= 128` and
+    // 2-slot double-buffered K=64 otherwise). Asymmetric store tiles on `block_m == 192` fit a 6-stage (2x3) pipeline.
+    const bool use_sm103_k96 = mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
+        SM103ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM103_K96", 1) != 0;
+    if (use_sm103_k96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
+        store_block_m_l1 = 32;
+        store_block_m_l2 = 8;
+    }
     // The SIMT dispatch pull loads each token with one remote round trip instead of chunked TMA copies through the
     // SMEM send buffers. It needs the normal SMEM budget, so it is on by default on CC 10.7 only with packed FP4
     // weight stages: FP4 activations, or FP8 x FP4 with the K=64 MMA. `DG_MEGA_MOE_SIMT_PULL=0/1` forces it
@@ -394,7 +406,7 @@ static MegaMoEConfig get_mega_moe_config(
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
         num_bytes_per_pull,
-        use_sm107_k64, use_simt_pull
+        use_sm107_k64, use_sm103_k96, use_simt_pull
     };
 
     // Print configs for the first time

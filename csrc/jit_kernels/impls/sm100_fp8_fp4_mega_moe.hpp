@@ -375,7 +375,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -407,6 +407,7 @@ static void __instantiate_kernel() {{
     to_string(post_norm_eps),
     to_weight_layout_name(weight_layout),
     config.use_sm107_k64 ? "true" : "false",
+    config.use_sm103_k96 ? "true" : "false",
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
     broadcast_y ? "true" : "false"));
