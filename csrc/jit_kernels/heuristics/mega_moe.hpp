@@ -371,9 +371,10 @@ static MegaMoEConfig get_mega_moe_config(
     const bool use_sm107_k64 = fp4_weights and mma_kind == MmaKind::MXFP8FP4 and block_k == 128 and gran_k == 32 and
         SM107ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM107_K64", 1) != 0;
     // SM103 (CC 10.3, Blackwell Ultra) has a K=96 `kind::mxf4nvf4.block_scale.block16` MMA (1.5x per-instruction K
-    // width over K=64) spanning 3-stage 768-element groups via `lbo_mode=1` when 3-chunk SF slots fit in TMEM
-    // (`block_m <= 192`). Asymmetric store tiles on `block_m == 192` fit a 6-stage (2x3) SMEM pipeline.
-    const bool use_sm103_k96 = mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 192 and
+    // width over K=64) spanning 3-stage 768-element groups via `lbo_mode=1` (`block_m <= 192` uses 3-chunk TMEM SF
+    // slots; `block_m == 240` uses a compact 32-col double-buffered 2-chunk TMEM SF ring when `umma_n <= 128` and
+    // 2-slot double-buffered K=64 otherwise). Asymmetric store tiles on `block_m == 192` fit a 6-stage (2x3) pipeline.
+    const bool use_sm103_k96 = mma_kind == MmaKind::NVFP4 and block_k == 256 and gran_k == 16 and block_m <= 240 and
         SM103ArchSpec::is_current() and deep_jit::get_env<int>("DG_MEGA_MOE_SM103_K96", 1) != 0;
     if (use_sm103_k96 and block_m == 192 and deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES").empty()) {
         store_block_m_l1 = 32;
