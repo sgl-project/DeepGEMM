@@ -208,7 +208,7 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
     // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
     // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
-    int block_m = num_expected_tokens <= 2 ? 16 : 64;
+    int block_m = num_expected_tokens <= 2 ? 16 : (SM103ArchSpec::is_current() and mma_kind == MmaKind::NVFP4 ? 128 : 64);
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
@@ -386,7 +386,7 @@ static MegaMoEConfig get_mega_moe_config(
     const int simt_pull_env = deep_jit::get_env<int>("DG_MEGA_MOE_SIMT_PULL", -1);
     const bool packed_weight_stages = use_sm107_k64 or mma_kind != MmaKind::MXFP8FP4;
     const bool use_simt_pull = is_mma_with_sf(mma_kind) and num_token_bytes % 512 == 0 and
-        (simt_pull_env >= 0 ? simt_pull_env != 0 : SM107ArchSpec::is_current() and packed_weight_stages);
+        (simt_pull_env >= 0 ? simt_pull_env != 0 : (SM107ArchSpec::is_current() and packed_weight_stages) or (SM103ArchSpec::is_current() and mma_kind == MmaKind::NVFP4));
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
