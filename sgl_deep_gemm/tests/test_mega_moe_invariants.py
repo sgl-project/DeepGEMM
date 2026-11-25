@@ -1,10 +1,7 @@
-# FP8xFP4 SiTU MegaMoE: one-rank groups: expert token counts without the global count protocol.
+# FP8xFP4 SiTU MegaMoE: invariants of the one-rank and scheduler fast paths.
 #
-# Covers:
-#   all three count paths of a one-rank group and the switch points between them: the scan
-#   (`tokens * ceil(experts / 32) <= 64`), the token masks (up to 128 tokens) and the send counts (above)
-#
-# Checks, per shape and call size (there is no second code path to compare with, so the checks are invariants):
+# One driver, one suite per change. A suite is a set of group shapes and call sizes chosen to reach the code it
+# names; there is no second code path to compare with, so every suite checks the same invariants:
 #   * every local expert receives exactly the tokens routed to it (`cumulative_local_expert_recv_stats`);
 #   * the same call twice is bitwise equal (nothing is left behind in the workspace);
 #   * a row's result does not depend on the other rows: a call on a prefix of the tokens and a call on a
@@ -13,7 +10,9 @@
 #   * a captured CUDA graph replays correctly with other inputs.
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_one_rank_local_counts.py
+#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py
+#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py --suite pull_lookup
+#   CUDA_VISIBLE_DEVICES=0,1 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py --num-processes 2
 
 import argparse
 import os
@@ -27,9 +26,44 @@ import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist
 
-# (experts of the group, top-k, routing pattern)
-CASES = [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse'), (112, 8, 'uniform'), (160, 4, 'high')]
-SIZES = (1, 2, 4, 5, 16, 17, 32, 64, 65, 128, 129, 256, 512)
+# name: (what it covers, [(experts of the group, top-k, routing pattern)], call sizes, also run with several ranks)
+SUITES = {
+    'pull_lookup': (
+        "expert lookup of the dispatch pull (prefix sum + ballot)",
+        [(160, 8, 'high'), (160, 1, 'sparse'), (48, 4, 'uniform'), (16, 8, 'uniform')],
+        (1, 2, 3, 16, 33, 128, 512), True,
+    ),
+    'one_rank_peer_sync': (
+        "one-rank groups: no peer synchronization (pull barrier, clean barrier, combine-ready word)",
+        [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse')],
+        (1, 2, 16, 84, 85, 128, 512), False,
+    ),
+    'one_rank_barrier': (
+        "one-rank groups: the NVLink barrier is the group's grid sync",
+        [(16, 8, 'uniform'), (16, 1, 'uniform'), (64, 4, 'sparse')],
+        (1, 2, 16, 84, 128, 512), False,
+    ),
+    'one_rank_local_counts': (
+        "one-rank groups: expert token counts without the global count protocol",
+        [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse'), (112, 8, 'uniform'), (160, 4, 'high')],
+        (1, 2, 4, 5, 16, 17, 32, 64, 65, 128, 129, 256, 512), False,
+    ),
+    'scheduler_counts': (
+        "scheduler: expert count loads issued together, pool block offsets computed once",
+        [(16, 8, 'uniform'), (160, 8, 'high'), (160, 2, 'sparse'), (48, 4, 'uniform')],
+        (1, 2, 16, 33, 128, 512), True,
+    ),
+    'scheduler_deps': (
+        "scheduler-side dependency checks of the L1-first order",
+        [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse'), (4, 4, 'uniform')],
+        (1, 2, 4, 8, 16, 64, 128, 256, 512), True,
+    ),
+    'm8_acts': (
+        "8-row activation tiles for 16-row MMA blocks (experts that receive 9 to 16 tokens)",
+        [(2, 1, 'uniform'), (4, 2, 'uniform'), (16, 8, 'uniform'), (1, 1, 'uniform')],
+        (1, 9, 12, 16, 17, 24, 31, 32, 40, 64, 512), False,
+    ),
+}
 NUM_MAX_TOKENS = 512
 HIDDEN = 1024
 INTERMEDIATE_HIDDEN = 512
@@ -58,7 +92,7 @@ def _route(pattern: str, num_tokens: int, num_experts: int, num_topk: int, gener
     return scores.topk(num_topk, dim=-1).indices
 
 
-def _run_case(group, rank_idx: int, num_experts: int, num_topk: int, pattern: str):
+def _run_case(group, rank_idx: int, num_experts: int, num_topk: int, pattern: str, sizes):
     num_ranks = group.size()
     num_local_experts = num_experts // num_ranks
     first_expert = rank_idx * num_local_experts
@@ -121,7 +155,7 @@ def _run_case(group, rank_idx: int, num_experts: int, num_topk: int, pattern: st
         if num_ranks > 1:
             dist.barrier(group)
 
-    for num_tokens in SIZES:
+    for num_tokens in sizes:
         x, ids, weights = inputs(num_tokens, 1000 + num_tokens)
         ref = run(num_tokens, x, ids, weights)
         assert torch.equal(ref, run(num_tokens, x, ids, weights)), f"not reproducible: {num_tokens} tokens, {tag}"
@@ -169,7 +203,7 @@ def _run_case(group, rank_idx: int, num_experts: int, num_topk: int, pattern: st
 
 
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    jit_cache = tempfile.TemporaryDirectory(prefix="deep-gemm-one-rank-local-counts-")
+    jit_cache = tempfile.TemporaryDirectory(prefix="deep-gemm-mega-moe-invariants-")
     os.environ["DG_JIT_CACHE_DIR"] = jit_cache.name
     if "MASTER_PORT" not in os.environ and num_local_ranks == 1:
         # One process: any free port, so that the test can run next to other DeepGEMM tests on the same host
@@ -179,10 +213,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     os.environ["DG_COMM_KERNEL_DEBUG"] = "0"
 
-    for num_experts, num_topk, pattern in CASES:
-        if num_experts % num_ranks == 0:
-            _run_case(group, rank_idx, num_experts, num_topk, pattern)
-    dist_print("one-rank groups: expert token counts without the global count protocol: invariants hold", once_in_node=True)
+    for name in args.suite or SUITES:
+        what, cases, sizes, multi_rank = SUITES[name]
+        if num_ranks > 1 and not multi_rank:
+            continue
+        for num_experts, num_topk, pattern in cases:
+            if num_experts % num_ranks == 0:
+                _run_case(group, rank_idx, num_experts, num_topk, pattern, sizes)
+        dist_print(f"{what}: invariants hold", once_in_node=True)
     dist.destroy_process_group()
     jit_cache.cleanup()
 
@@ -190,6 +228,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-processes", type=int, default=1)
+    parser.add_argument("--suite", action="append", choices=list(SUITES), help="default: all")
     parsed_args = parser.parse_args()
     torch.multiprocessing.spawn(
         test,

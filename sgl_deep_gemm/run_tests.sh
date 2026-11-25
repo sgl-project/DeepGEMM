@@ -239,13 +239,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_situ_equal_transform.py
   test_mega_moe_packed_topk.py
   test_mega_moe_trtllm_numerics.py
-  test_mega_moe_pull_lookup.py
-  test_mega_moe_one_rank_barrier.py
-  test_mega_moe_one_rank_local_counts.py
-  test_mega_moe_one_rank_peer_sync.py
-  test_mega_moe_scheduler_counts.py
-  test_mega_moe_scheduler_deps.py
-  test_mega_moe_m8_acts.py
+  test_mega_moe_invariants.py
   test_mega_moe_compact_buffer.py
   test_mega_moe_fp8_fp4_row_shuffled_gates.py
   test_mega_moe_l1_fp4_accuracy.py
@@ -297,16 +291,8 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   [ -f "${TESTS_DIR}/test_mega_moe_packed_topk.py" ] && run_test test_mega_moe_packed_topk.py
   [ -f "${TESTS_DIR}/test_mega_moe_trtllm_numerics.py" ] && run_test test_mega_moe_trtllm_numerics.py --num-processes 1
   [ -f "${TESTS_DIR}/test_mega_moe_trtllm_numerics.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_trtllm_numerics.py --num-processes 2
-  [ -f "${TESTS_DIR}/test_mega_moe_pull_lookup.py" ] && run_test test_mega_moe_pull_lookup.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_pull_lookup.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_pull_lookup.py --num-processes 2
-  [ -f "${TESTS_DIR}/test_mega_moe_one_rank_barrier.py" ] && run_test test_mega_moe_one_rank_barrier.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_one_rank_local_counts.py" ] && run_test test_mega_moe_one_rank_local_counts.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_one_rank_peer_sync.py" ] && run_test test_mega_moe_one_rank_peer_sync.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_counts.py" ] && run_test test_mega_moe_scheduler_counts.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_counts.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_scheduler_counts.py --num-processes 2
-  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_deps.py" ] && run_test test_mega_moe_scheduler_deps.py --num-processes 1
-  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_deps.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_scheduler_deps.py --num-processes 2
-  [ -f "${TESTS_DIR}/test_mega_moe_m8_acts.py" ] && run_test test_mega_moe_m8_acts.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_invariants.py" ] && run_test test_mega_moe_invariants.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_invariants.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_invariants.py --num-processes 2
   [ -f "${TESTS_DIR}/test_mega_moe_compact_buffer.py" ] && run_test test_mega_moe_compact_buffer.py --num-processes 1
   [ -f "${TESTS_DIR}/test_mega_moe_fp8_fp4_row_shuffled_gates.py" ] && run_test test_mega_moe_fp8_fp4_row_shuffled_gates.py --num-processes 1
   # Temporarily skip the CPU-only SiTU identity check while its FP32 numerical
