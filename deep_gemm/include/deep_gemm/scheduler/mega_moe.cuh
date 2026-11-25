@@ -251,6 +251,27 @@ struct MegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t stored_expert_id[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
+    // Layout: `stored_pool_block_offset[i]` holds the pool block offset of slot (i * 32 + lane_idx)'s first block.
+    uint32_t stored_pool_block_offset[kNumExpertsPerLane] = {};
+
+    // One-rank groups: where the expert token counts come from (set by the kernel, all off by default).
+    // The global count protocol makes every SM add its counts to the workspace, and SM 0 relay the sums after a
+    // grid sync. With one rank every routed id is local, so the counts are a function of `topk_idx` alone:
+    //   - `use_local_counts`: each scheduler and dispatch warp counts from `topk_idx` itself, either by scanning
+    //     it (few tokens), or from per-expert token bitmasks its CTA built in shared memory (`use_token_masks`);
+    //   - `use_send_counts`: larger calls keep the per-SM atomics and the grid sync, and read the send counts
+    //     directly instead of the sums SM 0 relays.
+    bool use_local_counts = false, use_token_masks = false, use_send_counts = false;
+    // The scheduler warp must wait for its own CTA's dispatch warps; the dispatch warps are already ordered
+    bool is_scheduler_warp = false;
+    const int64_t* topk_idx = nullptr;
+    uint32_t num_call_tokens = 0, num_topk = 0;
+    // `token_masks[expert_idx * num_token_mask_words + w]`: bit `t % 32` of word `t / 32` is set if token `t` routes to the expert
+    const uint32_t* token_masks = nullptr;
+    uint32_t num_token_mask_words = 4;
+    // Shared memory words the CTA's dispatch warps set once the masks / the send counts are complete
+    const uint32_t* token_masks_ready = nullptr;
+    const uint32_t* send_counts_ready = nullptr;
 
     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
@@ -339,17 +360,48 @@ struct MegaMoEScheduler {
         uint32_t raw_tokens[kNumExpertsPerLane] = {};
         uint32_t raw_keys[kNumExpertsPerLane] = {};
         uint32_t lane_max_nb = 0u;
+        // One-rank send counts: wait for this CTA's dispatch grid sync, after which every SM's count is in
+        if (use_send_counts and is_scheduler_warp)
+            while (ptx::ld_volatile_shared(send_counts_ready) == 0u) {}
+
+        // Issue every expert's load before the first check, then re-poll only the incomplete ones
+        // NOTES: each lane caches experts at indices (i * 32 + lane_idx); `pending_mask` holds one bit per `i`
+        DG_STATIC_ASSERT(kNumExpertsPerLane <= 32, "The pending mask covers at most 1024 experts per rank");
+        uint32_t pending_mask = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + lane_idx;
-            uint64_t value = 0;
-            if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+            // NOTES: the one-rank paths need no arrival tag, their values are complete (send counts) or unused (local counts)
+            const uint64_t value = use_send_counts ?
+                ((static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
+                 (expert_idx < kNumExpertsPerRank ? static_cast<uint32_t>(ptx::ld_volatile(workspace.get_expert_send_count_ptr(expert_idx))) : 0u)) :
+                (not use_local_counts and expert_idx < kNumExpertsPerRank) ?
+                ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx)) :
+                (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32);
+            stored_num_tokens_per_expert[i] = expert_idx < kNumExpertsPerRank ? static_cast<uint32_t>(value) : 0u;
+            if (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks)
+                pending_mask |= 1u << i;
+        }
+        while (pending_mask) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                if (pending_mask >> i & 1) {
+                    const uint64_t value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(i * 32 + lane_idx));
+                    if (static_cast<uint32_t>(value >> 32) == kNumSMs * kNumRanks) {
+                        stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+                        pending_mask &= ~(1u << i);
+                    }
+                }
             }
-            raw_tokens[i] = static_cast<uint32_t>(value);
-            stored_num_tokens_per_expert[i] = raw_tokens[i];
+        }
+        if (use_local_counts)
+            count_local_tokens();
+
+        // Slots start in physical expert order; the LPT keys are built from the final counts
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + lane_idx;
+            raw_tokens[i] = stored_num_tokens_per_expert[i];
             stored_expert_id[i] = expert_idx;
             if constexpr (kEnableLPTSwizzle and not kHasShared and kNumExpertsPerRank <= 64u and kNumExpertsPerRank > 1u) {
                 const uint32_t nb = (expert_idx < kNumExpertsPerRank) ? math::ceil_div(raw_tokens[i], BLOCK_M) : 0u;
@@ -421,6 +473,108 @@ struct MegaMoEScheduler {
         num_sched_l1_waves = is_l1_first ? num_total_l1_waves : cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }
 
+    // One-rank groups: per-expert token counts from `topk_idx`
+    // NOTES: relies on each token's top-k ids being distinct
+    CUTLASS_DEVICE void count_local_tokens() {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i)
+            stored_num_tokens_per_expert[i] = 0;
+
+        // Token masks: an expert's count is the population count of its mask
+        if (use_token_masks) {
+            if (is_scheduler_warp)
+                while (ptx::ld_volatile_shared(token_masks_ready) == 0u) {}
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                const uint32_t expert_idx = i * 32 + lane_idx;
+                uint32_t count = 0;
+                if (expert_idx < kNumExpertsPerRank) {
+                    #pragma unroll
+                    for (uint32_t w = 0; w < 4; ++ w)
+                        if (w < num_token_mask_words) count += __popc(ptx::ld_shared(token_masks + expert_idx * num_token_mask_words + w));
+                }
+                stored_num_tokens_per_expert[i] = count;
+            }
+            return;
+        }
+
+        // Scan: lane `s` reads slot `s`; 8 tokens per round, so their id loads share one global latency
+        for (uint32_t token_idx = 0; token_idx < num_call_tokens; token_idx += 8) {
+            int expert_ids[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; ++ k)
+                expert_ids[k] = (token_idx + k < num_call_tokens and lane_idx < num_topk) ?
+                    static_cast<int>(topk_idx[(token_idx + k) * num_topk + lane_idx]) : -1;
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; ++ k) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                    const uint32_t bits = __reduce_or_sync(0xffffffff,
+                        (expert_ids[k] >= 0 and static_cast<uint32_t>(expert_ids[k]) / 32 == i) ? (1u << (static_cast<uint32_t>(expert_ids[k]) % 32)) : 0u);
+                    stored_num_tokens_per_expert[i] += (bits >> lane_idx) & 1u;
+                }
+            }
+        }
+    }
+
+    // One-rank groups: the source `token * num_topk + slot` of pool slot `token_idx_in_expert` of an expert, i.e. the
+    // `token_idx_in_expert`-th token (ascending) whose top-k holds the expert. Replaces the index the dispatch pushes
+    CUTLASS_DEVICE uint32_t find_src_token_topk_idx(const uint32_t& expert_idx, const uint32_t& token_idx_in_expert) const {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        if (use_token_masks) {
+            // The token from the expert's mask, then the expert's slot in that token
+            uint32_t num_seen = 0, found_token_idx = 0;
+            #pragma unroll
+            for (uint32_t w = 0; w < 4; ++ w) {
+                const uint32_t mask = w < num_token_mask_words ? ptx::ld_shared(token_masks + expert_idx * num_token_mask_words + w) : 0u;
+                const uint32_t count = __popc(mask);
+                if (token_idx_in_expert >= num_seen and token_idx_in_expert < num_seen + count)
+                    found_token_idx = w * 32 + __fns(mask, 0, token_idx_in_expert - num_seen + 1);
+                num_seen += count;
+            }
+            const int slot_expert_idx = lane_idx < num_topk ? static_cast<int>(topk_idx[found_token_idx * num_topk + lane_idx]) : -1;
+            const uint32_t slot_mask = __ballot_sync(0xffffffff, slot_expert_idx == static_cast<int>(expert_idx));
+            return found_token_idx * num_topk + static_cast<uint32_t>(__ffs(slot_mask) - 1);
+        }
+
+        uint32_t num_seen = 0, src_token_topk_idx = 0;
+        bool found = false;
+        for (uint32_t token_idx = 0; token_idx < num_call_tokens and not found; token_idx += 8) {
+            int expert_ids[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; ++ k)
+                expert_ids[k] = (token_idx + k < num_call_tokens and lane_idx < num_topk) ?
+                    static_cast<int>(topk_idx[(token_idx + k) * num_topk + lane_idx]) : -1;
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; ++ k) {
+                const uint32_t slot_mask = __ballot_sync(0xffffffff, expert_ids[k] == static_cast<int>(expert_idx));
+                if (slot_mask and not found) {
+                    if (num_seen == token_idx_in_expert) {
+                        src_token_topk_idx = (token_idx + k) * num_topk + static_cast<uint32_t>(__ffs(slot_mask) - 1);
+                        found = true;
+                    }
+                    ++ num_seen;
+                }
+            }
+        }
+        return src_token_topk_idx;
+    }
+
+    // Prefix sums of the experts' M block counts, once per call instead of once per created task
+    // NOTES: must run after `fetch_expert_recv_count` and before the first `create_task`
+    CUTLASS_DEVICE void compute_pool_block_offsets() {
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        uint32_t block_offset = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t num_m_blocks = math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
+            stored_pool_block_offset[i] = block_offset + inclusive_num_m_blocks - num_m_blocks;
+            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+        }
+    }
+
     template <uint32_t kNumClusters>
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
                                            const uint32_t& linear_m_block,
@@ -435,20 +589,19 @@ struct MegaMoEScheduler {
 
         task_info_t result(block_phase, 0, 0, base_n_cluster, linear_m_block, 0, shape_n, shape_k, 1);
         uint32_t chunk_end_block = linear_m_block + 1u;
-        uint32_t block_offset = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             // Reduce whether task falls in this (optionally LPT-sorted) expert slot
             const uint32_t slot_idx = i * 32 + lane_idx;
             const uint32_t num_tokens = stored_num_tokens_per_expert[i];
             const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
-            const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
-            const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
+            const uint32_t lane_pool_block_offset = stored_pool_block_offset[i];
             const bool is_owner = slot_idx < kNumExpertsPerRank and
                 linear_m_block >= lane_pool_block_offset and linear_m_block < lane_pool_block_offset + num_m_blocks;
             const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
 
             // Exchange expert info (with locality-domain-preserving N-outer swizzle across up to `kSwizzleGroupM` M-blocks)
+            // NOTES: a block has exactly one owner, but leaving the loop early here makes the generated code slower
             if (owner_mask) {
                 const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
                 uint32_t owner_m_block_idx = linear_m_block - lane_pool_block_offset;
@@ -476,7 +629,6 @@ struct MegaMoEScheduler {
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
                 chunk_end_block = ptx::exchange(owner_chunk_end, owner_lane_idx);
             }
-            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
         }
         if (out_chunk_end_block != nullptr)
             *out_chunk_end_block = chunk_end_block;
@@ -604,6 +756,7 @@ struct MegaMoEScheduler {
 
         // Wait dispatch's results
         fetch_expert_recv_count();
+        compute_pool_block_offsets();
 
         // Generate routed tasks. Keep the original wait -> claim -> publish ordering:
         // `get_next_task()` advances global task counters and must not run before the

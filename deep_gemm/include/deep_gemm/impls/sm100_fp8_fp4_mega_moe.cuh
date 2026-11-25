@@ -420,11 +420,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t L1_OUT_BLOCK_N_BYTES = L1_OUT_BLOCK_N * kNumElemBits / 8;
     constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M_L1 / 2; // float2
 
+    constexpr uint32_t kNumExpertCountWords =
+        math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment) / sizeof(uint32_t);
     struct SharedStorage {
+        // NOTES: the counts are only live before the pull and the send buffer only during it (the SIMT pull goes
+        // through registers, so it needs no send buffer). `count_words` makes the union's alignment padding
+        // addressable: the one-rank count paths keep their flags behind both members (`kOneRankFlagBaseWord`),
+        // where the pull cannot overwrite them
         union alignas(kSharedMemoryAlignment) {
             uint32_t expert_token_count[kNumExperts];
-            // NOTES: the SIMT pull goes through registers, so it needs no send buffer
             uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull];
+            uint32_t count_words[kNumExpertCountWords];
         };
         union {
             alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES];
@@ -563,6 +569,51 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_infos
     );
 
+    // One-rank groups: expert token counts without the global count protocol (see the scheduler)
+    //   - token masks: calls of at most `kOneRankMaskMaxTokens` tokens; the dispatch warps build per-expert token
+    //     bitmasks in `smem_d`, which the epilogue does not use before the CTA's pulls are done
+    //   - scan: calls with `num_tokens * ceil(num_experts / 32) <= kOneRankScanBudget`, when the masks do not fit
+    //     (4 tokens at 448 experts, 16 at 112)
+    //   - send counts: every larger call
+    // The flags are the words of the count union behind the experts' counts and the dispatch send buffer, zeroed
+    // with the counts in the prologue
+    constexpr uint32_t kOneRankScanBudget = 64;
+    constexpr uint32_t kOneRankMaskMaxTokens = 128;
+    constexpr uint32_t kOneRankFlagBaseWord = cute::max<uint32_t>(
+        kNumExperts, math::constexpr_ceil_div<uint32_t>(sizeof(SharedStorage::dispatch_send_buffer), sizeof(uint32_t)));
+    constexpr uint32_t kNumSpareCountWords =
+        kNumExpertCountWords > kOneRankFlagBaseWord ? kNumExpertCountWords - kOneRankFlagBaseWord : 0u;
+    constexpr uint32_t kSendCountsReadyWord = kOneRankFlagBaseWord, kTokenMasksReadyWord = kOneRankFlagBaseWord + 1,
+                       kPullsDoneWord = kOneRankFlagBaseWord + 2;
+    // Mask words per expert: 4 (128 tokens) if the staging buffer holds them, else 2 or 1
+    constexpr uint32_t kNumTokenMaskWords = kNumExperts * 4 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 4 :
+                              kNumExperts * 2 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 2 : 1;
+    constexpr bool kTokenMasksFit = kUseSimtPull and not kHasShared and
+        kNumExperts * kNumTokenMaskWords * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) and
+        kNumSpareCountWords >= 4;
+    const bool use_token_masks = kTokenMasksFit and (kNumRanks == 1) and num_tokens <= kOneRankMaskMaxTokens and
+        num_tokens <= 32 * kNumTokenMaskWords and num_tokens * kNumTopk <= kNumDispatchThreads * 8;
+    uint32_t* token_masks = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+    // Set by this CTA's dispatch warps: the masks are complete / the pulls are done (`smem_d` is free again)
+    uint32_t* token_masks_ready = shared_storage.count_words + kTokenMasksReadyWord;
+    uint32_t* pulls_done = shared_storage.count_words + kPullsDoneWord;
+    scheduler.use_token_masks = use_token_masks;
+    scheduler.token_masks = token_masks;
+    scheduler.token_masks_ready = token_masks_ready;
+    scheduler.num_token_mask_words = kNumTokenMaskWords;
+    const bool use_local_counts = use_token_masks or (kNumRanks == 1) and
+        num_tokens * math::constexpr_ceil_div(kNumExpertsPerRank, 32u) <= kOneRankScanBudget;
+    scheduler.use_local_counts = use_local_counts;
+    scheduler.topk_idx = buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>();
+    scheduler.num_call_tokens = num_tokens;
+    scheduler.num_topk = kNumTopk;
+    constexpr bool kSendCountsFlagFits = kNumSpareCountWords >= 1;
+    const bool use_send_counts = kSendCountsFlagFits and (kNumRanks == 1) and not use_local_counts;
+    // Set by this CTA's dispatch warps after the dispatch grid sync: every SM's send count is in
+    uint32_t* send_counts_ready = shared_storage.count_words + kSendCountsReadyWord;
+    scheduler.use_send_counts = use_send_counts;
+    scheduler.send_counts_ready = send_counts_ready;
+
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -645,6 +696,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             nvl_barrier_counter = *workspace.get_nvl_barrier_counter_ptr();
 
         // Count experts' tokens
+        // NOTES: with local counts (one-rank groups), nothing below up to the grid sync is needed:
+        // no count is published and no source index is pushed
+        if (not use_local_counts)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
         });
@@ -660,17 +714,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     process(j, i);
             }
         };
+        if (not use_local_counts)
         for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
             if (const uint64_t num_tokens_to_expert = shared_storage.expert_token_count[i]; num_tokens_to_expert != 0)
                 expert_send_status[j] = static_cast<uint32_t>(
                     ptx::atomic_add(workspace.get_expert_send_count_ptr(i), num_tokens_to_expert));
         });
+        if (not use_local_counts)
         for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
             shared_storage.expert_token_count[i] = expert_send_status[j];
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
+        if (not use_local_counts)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -680,10 +737,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         });
 
         // Grid sync
+        if (not use_local_counts)
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        if (use_send_counts and thread_idx == 0)
+            ptx::st_shared(send_counts_ready, 1u);
 
         // Write expert count
         if (sm_idx == 0) {
@@ -699,9 +759,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
+            // NOTES: the one-rank count paths do not read the relayed sums
+            if (not use_local_counts and not use_send_counts)
             for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 expert_send_status[j] = static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i));
             });
+            if (not use_local_counts and not use_send_counts)
             for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
@@ -752,6 +815,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
+
+        // One-rank token masks: every thread reads up to 8 ids at once and sets their tokens' bits
+        if (use_token_masks) {
+            for (uint32_t i = thread_idx; i < kNumExperts * kNumTokenMaskWords; i += kNumDispatchThreads)
+                ptx::st_shared(token_masks + i, 0u);
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            const uint32_t num_ids = num_tokens * kNumTopk;
+            int expert_ids[8];
+            #pragma unroll
+            for (uint32_t b = 0; b < 8; ++ b) {
+                const uint32_t id_idx = thread_idx + b * kNumDispatchThreads;
+                expert_ids[b] = id_idx < num_ids ?
+                    static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[id_idx]) : -1;
+            }
+            #pragma unroll
+            for (uint32_t b = 0; b < 8; ++ b) {
+                if (expert_ids[b] >= 0) {
+                    const uint32_t token_idx = (thread_idx + b * kNumDispatchThreads) / kNumTopk;
+                    atomicOr_block(token_masks + static_cast<uint32_t>(expert_ids[b]) * kNumTokenMaskWords + token_idx / 32, 1u << (token_idx % 32));
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::st_shared(token_masks_ready, 1u);
+        }
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
@@ -861,8 +949,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     remaining[i] -= cute::min(remaining[i], length);
             }
 
-            // Read source token-topk index (written by remote dispatch via NVLink)
-            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+            // Read source token-topk index (written by remote dispatch via NVLink, or found locally in a one-rank group)
+            const uint32_t src_token_topk_idx = use_local_counts ?
+                scheduler.find_src_token_topk_idx(phys_expert_idx, token_idx_in_expert) :
+                *workspace.get_src_token_topk_idx_ptr(
                 phys_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
@@ -1074,6 +1164,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             __syncwarp();
+        }
+
+        // One-rank token masks: the epilogue may use `smem_d` from here on
+        if (use_token_masks) {
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::st_shared(pulls_done, 1u);
         }
 
         // Clean workspace for the next usage, and also do cumulative stats
@@ -1898,6 +1995,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
+        // The one-rank count paths wait for this CTA's dispatch warps here
+        scheduler.is_scheduler_warp = true;
         // Do mainloop by the leader CTA
         if (is_leader_cta)
             scheduler.mainloop(num_tokens, sm_locality_domains);
@@ -1945,6 +2044,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Now we can release the task
             scheduler.release_task_info();
+            // NOTES: the one-rank token masks live in `smem_d` until this CTA's pulls are done
+            if (use_token_masks)
+                while (ptx::ld_volatile_shared(pulls_done) == 0u) {}
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen

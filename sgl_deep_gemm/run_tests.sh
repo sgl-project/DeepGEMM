@@ -240,7 +240,9 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_trtllm_numerics.py
   test_mega_moe_pull_lookup.py
   test_mega_moe_one_rank_barrier.py
+  test_mega_moe_one_rank_local_counts.py
   test_mega_moe_one_rank_peer_sync.py
+  test_mega_moe_scheduler_counts.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_nvfp4_alphas.py
@@ -292,7 +294,10 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
   [ -f "${TESTS_DIR}/test_mega_moe_pull_lookup.py" ] && run_test test_mega_moe_pull_lookup.py --num-processes 1
   [ -f "${TESTS_DIR}/test_mega_moe_pull_lookup.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_pull_lookup.py --num-processes 2
   [ -f "${TESTS_DIR}/test_mega_moe_one_rank_barrier.py" ] && run_test test_mega_moe_one_rank_barrier.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_one_rank_local_counts.py" ] && run_test test_mega_moe_one_rank_local_counts.py --num-processes 1
   [ -f "${TESTS_DIR}/test_mega_moe_one_rank_peer_sync.py" ] && run_test test_mega_moe_one_rank_peer_sync.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_counts.py" ] && run_test test_mega_moe_scheduler_counts.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_scheduler_counts.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_scheduler_counts.py --num-processes 2
   # Temporarily skip the CPU-only SiTU identity check while its FP32 numerical
   # discrepancy on CI is investigated. The test remains runnable directly.
   [ -f "${TESTS_DIR}/test_mega_moe_situ_equal_transform.py" ] && skip_test test_mega_moe_situ_equal_transform.py \
