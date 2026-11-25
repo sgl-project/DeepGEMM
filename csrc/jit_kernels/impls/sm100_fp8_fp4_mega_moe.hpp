@@ -295,6 +295,18 @@ static void sm100_fp8_fp4_mega_moe(
                                                            num_experts_per_rank, 0, 0, false,
                                                            sf_smem_outer_dim, static_cast<int>(l2_weights_sf.stride(-1)));
 
+    // 8-row activation boxes over the routed pools: with a 16-row MMA each CTA of the cluster owns 8 rows,
+    // and the full `load_block_m` box would fetch rows nobody reads
+    const auto tensor_map_l1_acts_m8 = make_tma_2d_desc(l1_acts,
+                                                        to_inner(hidden), config.num_ring_tokens,
+                                                        block_k_inner, 8,
+                                                        static_cast<int>(l1_acts.stride(-2)),
+                                                        config.swizzle_acts_mode);
+    const auto tensor_map_l2_acts_m8 = make_tma_2d_desc(l2_acts,
+                                                        to_inner(intermediate_hidden), config.num_ring_tokens,
+                                                        block_k_inner, 8,
+                                                        static_cast<int>(l2_acts.stride(-2)),
+                                                        config.swizzle_acts_mode);
     const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l1_acts,
         to_inner(hidden), num_max_tokens_per_rank,
@@ -448,6 +460,8 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
+        tensor_map_l1_acts_m8,
+        tensor_map_l2_acts_m8,
         sm_locality_domains.data_ptr<uint8_t>());
 }
 

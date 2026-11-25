@@ -187,6 +187,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_m8,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_m8,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
@@ -1283,6 +1285,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
+            // A 16-row MMA tile: each CTA reads its 8 rows, so copy an 8-row box instead of `LOAD_BLOCK_M` rows
+            // NOTES: only validated for kernels without shared experts
+            const bool use_m8_acts = not kHasShared and not task_info.is_shared() and LOAD_BLOCK_M > 8 and
+                task_info.get_umma_aligned_valid_m() == 16;
+            const auto tensor_map_a_m8_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts_m8 : &tensor_map_l2_acts_m8;
+
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 if (task_info.block_phase == sched::BlockPhase::Linear2 and not deps_checked) {
@@ -1322,6 +1330,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (is_split_k) {
                         tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_M, kSwizzleK64Mode, a_dtype_t, false, kActsCacheHint>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    } else if (use_m8_acts) {
+                        tma::copy<BLOCK_K_BYTES, 8, kSwizzleAMode, a_dtype_t, false, kActsCacheHint>(
+                            tensor_map_a_m8_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
                     } else {
                         tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false, kActsCacheHint>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
@@ -1331,7 +1342,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     }
                     if (is_leader_cta) {
-                        const uint32_t num_a_bytes = is_split_k ? LOAD_BLOCK_M * SHARED_BLOCK_K : sizeof(SharedStorage::smem_a[0]);
+                        const uint32_t num_a_bytes = is_split_k ? LOAD_BLOCK_M * SHARED_BLOCK_K :
+                            use_m8_acts ? 8u * BLOCK_K_BYTES : sizeof(SharedStorage::smem_a[0]);
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                             num_a_bytes * 2 + (load_sfa ? sizeof(SharedStorage::smem_sfa[0]) * 2 : 0));
                     } else {
