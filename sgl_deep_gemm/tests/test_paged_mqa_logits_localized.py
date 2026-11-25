@@ -8,7 +8,7 @@ from deep_gemm.testing import assert_bitwise_equal
 
 NUM_HEADS, HEAD_DIM, PAGE_KV, SPLIT_KV = 32, 128, 64, 256
 PAGE_SHAPE = (PAGE_KV, 1, HEAD_DIM + 4)
-NUM_PAGES = 32768
+NUM_PAGES = 65536
 # Slot (start, end) pairs, tail sentinel, claim counter, number of domain-0 slots, flags, request domain bits
 STATIC_FLAG, SLOT_STATIC, SLOT_DOMAIN, SLOT_ALL_DOMAINS = 1, 1 << 31, 1 << 30, 1 << 29
 
@@ -155,14 +155,19 @@ def test_paged_mqa_logits_localized() -> None:
         # Pages from an allocator that ignores the domains
         run_case(caches, 'mixed pages', next_n, [6000] * 10, [None] * 10, 0, False)
         run_case(caches, 'many requests', next_n, [200 + 37 * i for i in range(130)], alt(130), 0, False)
-        # Guard: little work keeps the stock partition, much work claims
+        # Guard: little work or few requests keep the stock partition
         run_case(caches, 'guard, small', next_n, [4096] * 32, alt(32), None, True)
-        run_case(caches, 'guard, at the threshold', next_n, [SPLIT_KV * 64] * 64, alt(64), None, False)
-        run_case(caches, 'guard, below the threshold', next_n, [SPLIT_KV * 64] * 63 + [SPLIT_KV * 63], alt(64), None, True)
-        # Guard: pages spread over both domains keep the stock partition
-        run_case(caches, 'guard, mixed pages', next_n, [SPLIT_KV * 64] * 64, [None] * 64, None, True)
-        run_case(caches, 'guard, mixed pages, small threshold', next_n, [6000] * 10, [None] * 10, 1, True)
-        run_case(caches, 'guard, homed pages, small threshold', next_n, [6000] * 10, alt(10), 1, False)
+        run_case(caches, 'guard, at the threshold', next_n, [SPLIT_KV * 128] * 64, alt(64), None, False)
+        run_case(caches, 'guard, below the threshold', next_n, [SPLIT_KV * 128] * 63 + [SPLIT_KV * 127], alt(64), None, True)
+        run_case(caches, 'guard, 16 requests', next_n, [SPLIT_KV * 640] * 16, alt(16), None, False)
+        run_case(caches, 'guard, 15 requests', next_n, [SPLIT_KV * 640] * 15, alt(15), None, True)
+        # Guard: pages spread over both domains, or nearly all in one, keep the stock partition
+        run_case(caches, 'guard, mixed pages', next_n, [SPLIT_KV * 128] * 64, [None] * 64, None, True)
+        run_case(caches, 'guard, mixed pages, small threshold', next_n, [6000] * 20, [None] * 20, 1, True)
+        run_case(caches, 'guard, homed pages, small threshold', next_n, [6000] * 20, alt(20), 1, False)
+        run_case(caches, 'guard, one domain, small threshold', next_n, [6000] * 20, [0] * 20, 1, True)
+        run_case(caches, 'guard, 5 of 20 in domain 1, small threshold', next_n, [6000] * 20, [1] * 5 + [0] * 15, 1, False)
+        run_case(caches, 'guard, 4 of 20 in domain 1, small threshold', next_n, [6000] * 20, [1] * 4 + [0] * 16, 1, True)
         run_case(caches, 'static forced', next_n, [9000] * 20, alt(20), 2 ** 31 - 1, True)
     print()
 

@@ -227,13 +227,15 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_requests,
 // Localized schedule for a KV cache whose pages `[0, num_local_pages)` are homed in locality domain 0 and the rest in domain 1.
 // A request belongs to the domain that holds most of its pages (of up to `kNumMaxPageSamples` evenly spaced ones), and each
 // domain's work is balanced across its share of the slots. The schedule is static, i.e. the stock partition with slot `i`
-// for CTA `i`, where claims would not pay off: below `min_num_localized_splits` KV splits, or when less than
-// `kMinHomedWorkNum / kMinHomedWorkDen` of the work reads pages of its request's domain (pages from an allocator that
-// ignores the domains). `min_num_localized_splits == 0` always claims.
+// for CTA `i`, where claims do not pay off (measured on SM107): below `min_num_localized_splits` KV splits or
+// `min_num_localized_requests` requests, when less than `kMinHomedWorkNum / kMinHomedWorkDen` of the work reads pages of
+// its request's domain (pages from an allocator that ignores the domains), or when one domain holds less than
+// `1 / kMaxDomainWorkRatio` of the work. `min_num_localized_splits == 0` always claims.
 template <uint32_t kNextN, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kNumSlots>
 CUTLASS_GLOBAL __launch_bounds__(kNumMetadataThreads, 1)
 void sm100_paged_mqa_logits_localized_metadata(const uint32_t num_requests,
                                                const uint32_t min_num_localized_splits,
+                                               const uint32_t min_num_localized_requests,
                                                const uint32_t num_local_pages,
                                                const uint32_t block_table_stride,
                                                const uint32_t* context_lens,
@@ -242,6 +244,7 @@ void sm100_paged_mqa_logits_localized_metadata(const uint32_t num_requests,
     using Layout = layout::PagedMQALogitsLocalizedSchedule;
     constexpr uint32_t kNumMaxPageSamples = 32;
     constexpr uint32_t kMinHomedWorkNum = 7, kMinHomedWorkDen = 8;
+    constexpr uint32_t kMaxDomainWorkRatio = 4;
     const uint32_t thread_idx = threadIdx.x;
     DG_DEVICE_ASSERT(blockDim.x == kNumMetadataThreads);
     cudaGridDependencySynchronize();
@@ -276,17 +279,23 @@ void sm100_paged_mqa_logits_localized_metadata(const uint32_t num_requests,
         const uint32_t num_homed_samples = domain_idx == 1 ? num_remote_samples : num_samples - num_remote_samples;
         homed_work_prefix[request_idx] = num_samples == 0 ? work :
             static_cast<uint32_t>(static_cast<uint64_t>(work) * num_homed_samples / num_samples);
+        // Domain 1's work, for the balance check
+        work_prefix[num_requests + request_idx] = domain_idx == 1 ? work : 0u;
     }
     __syncthreads();
     if (num_requests > 0) {
         metadata_prefix_scan(thread_idx, num_requests, work_prefix, warp_sums);
         metadata_prefix_scan(thread_idx, num_requests, homed_work_prefix, warp_sums);
+        metadata_prefix_scan(thread_idx, num_requests, work_prefix + num_requests, warp_sums);
     }
     const uint32_t num_total_work = num_requests > 0 ? work_prefix[num_requests - 1] : 0u;
     const uint32_t num_homed_work = num_requests > 0 ? homed_work_prefix[num_requests - 1] : 0u;
+    const uint32_t num_remote_work = num_requests > 0 ? work_prefix[2 * num_requests - 1] : 0u;
+    const uint32_t num_min_domain_work = cute::min(num_remote_work, num_total_work - num_remote_work);
     const bool is_static = min_num_localized_splits > 0 and
-        (num_total_work / kNextN < min_num_localized_splits or
-         static_cast<uint64_t>(num_homed_work) * kMinHomedWorkDen < static_cast<uint64_t>(num_total_work) * kMinHomedWorkNum);
+        (num_total_work / kNextN < min_num_localized_splits or num_requests < min_num_localized_requests or
+         static_cast<uint64_t>(num_homed_work) * kMinHomedWorkDen < static_cast<uint64_t>(num_total_work) * kMinHomedWorkNum or
+         static_cast<uint64_t>(num_min_domain_work) * kMaxDomainWorkRatio < num_total_work);
     __syncthreads();
 
     // Per-domain work; a static schedule has all of it in domain 0

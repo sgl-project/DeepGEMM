@@ -60,7 +60,8 @@ static void sm100_paged_mqa_logits_localized_metadata(const torch::Tensor& conte
                                                       const torch::Tensor& schedule_meta,
                                                       const int& num_requests, const int& next_n,
                                                       const int& page_kv, const int& num_local_pages,
-                                                      const int& num_sms, const int& min_num_localized_splits) {
+                                                      const int& num_sms, const int& min_num_localized_splits,
+                                                      const int& min_num_localized_requests) {
     constexpr int split_kv = 256;
     constexpr int num_threads = 1024;
     // Work prefix of both domains, request domains, homed work prefix, and warp sums
@@ -87,7 +88,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(1, 1, 1),
             .block_dim = dim3(num_threads, 1, 1),
         },
-        num_requests, min_num_localized_splits, num_local_pages,
+        num_requests, min_num_localized_splits, min_num_localized_requests, num_local_pages,
         static_cast<int>(block_table.stride(0)),
         context_lens.data_ptr<int>(), block_table.data_ptr<int>(), schedule_meta.data_ptr<int>()
     );

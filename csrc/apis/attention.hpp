@@ -699,10 +699,12 @@ static torch::Tensor get_paged_mqa_logits_metadata_legacy(const torch::Tensor& c
     return schedule_metadata;
 }
 
-// KV splits (256 tokens each, summed over the requests) from which a localized schedule claims its slots. Below that,
-// a claim costs more than the remote reads it saves, and the schedule is the stock partition (measured on SM107).
-// 0 claims for any amount of work and any page placement.
-static constexpr int kMinNumPagedMQALogitsLocalizedSplits = 4096;
+// KV splits (256 tokens each, summed over the requests) and requests from which a localized schedule claims its slots.
+// Below either, claims cost more than the remote reads they save, and the schedule is the stock partition. Measured on
+// SM107: every cell at or above both is 3.6 to 11.0 % faster than the stock schedule on the same pages, and the cells
+// that lost were at 4,096 to 5,504 splits or had 8 requests. 0 splits claims for any work and any page placement.
+static constexpr int kMinNumPagedMQALogitsLocalizedSplits = 8192;
+static constexpr int kMinNumPagedMQALogitsLocalizedRequests = 16;
 
 // Whether the pages of a fused paged KV cache are homed in the locality domains, first half in domain 0 and second half
 // in domain 1, as `locality_domain.empty_paged` allocates them
@@ -746,7 +748,8 @@ static torch::Tensor get_paged_mqa_logits_localized_metadata(const torch::Tensor
                                           context_lens.options());
     legacy::sm100_paged_mqa_logits_localized_metadata(context_lens, block_table, schedule_metadata,
                                                       batch_size, next_n, block_kv,
-                                                      static_cast<int>(fused_kv_cache.size(0) / 2), num_sms, min_splits);
+                                                      static_cast<int>(fused_kv_cache.size(0) / 2), num_sms, min_splits,
+                                                      kMinNumPagedMQALogitsLocalizedRequests);
     return schedule_metadata;
 }
 
