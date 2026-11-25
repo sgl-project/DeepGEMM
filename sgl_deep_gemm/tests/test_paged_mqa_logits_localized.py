@@ -9,7 +9,6 @@ from deep_gemm.testing import assert_bitwise_equal
 NUM_HEADS, HEAD_DIM, PAGE_KV, SPLIT_KV = 32, 128, 64, 256
 PAGE_SHAPE = (PAGE_KV, 1, HEAD_DIM + 4)
 NUM_PAGES = 65536
-# Slot (start, end) pairs, tail sentinel, claim counter, number of domain-0 slots, flags, request domain bits
 STATIC_FLAG, SLOT_STATIC, SLOT_DOMAIN, SLOT_ALL_DOMAINS = 1, 1 << 31, 1 << 30, 1 << 29
 
 
@@ -89,7 +88,6 @@ def run_case(caches: tuple, name: str, next_n: int, context_lens: list, request_
     domains = [(domain_words[i // 32] >> (i % 32)) & 1 for i in range(batch_size)]
     if is_static:
         assert num_local_slots == num_sms and not any(domains)
-        # A static schedule is the stock partition
         stock = stock_meta.tolist()
         assert [[slot[0], slot[1] & (SLOT_ALL_DOMAINS - 1), slot[2], slot[3]] for slot in slots] == \
                [stock[i] + stock[i + 1] for i in range(num_sms)]
@@ -111,8 +109,7 @@ def run_case(caches: tuple, name: str, next_n: int, context_lens: list, request_
             split_idx += 1
     assert covered == splits, f'{name}: slots cover {covered} of {splits} splits'
 
-    # Bitwise against the stock schedule, repeatedly on one schedule: the last claim of a launch resets the counter.
-    # The static flag of a slot is a hint: with it flipped, the same slots are taken the other way, to the same logits
+    # The last claim of a launch resets the counter, and a slot's static flag is only a hint
     flipped = meta.clone()
     flipped.view(-1)[1:4 * num_sms:4] ^= -(1 << 31)
     for schedule in (meta, meta, meta, flipped, flipped, meta):
@@ -140,28 +137,23 @@ def test_paged_mqa_logits_localized() -> None:
     caches = make_caches()
     alt = lambda n: [i % 2 for i in range(n)]
     for next_n in (1, 2, 5, 6):
-        # Production-like, claims forced
         run_case(caches, 'even', next_n, [4096] * 16, alt(16), 0, False)
         run_case(caches, 'ragged', next_n, [1, 63, 64, 65, 255, 256, 257, 700, 4097, 12345, 31, 2049], alt(12), 0, False)
         run_case(caches, 'empty requests', next_n, [0, 513, 0, 0, 2048, 0, 77, 0], alt(8), 0, False)
         run_case(caches, 'single request', next_n, [20000], [1], 0, False)
         run_case(caches, 'tiny', next_n, [1], [0], 0, False)
         run_case(caches, 'fewer splits than SMs', next_n, [256] * 7, alt(7), 0, False)
-        # All of the work in one domain: the other domain's SMs claim it from the back
         run_case(caches, 'domain 0 only', next_n, [3000] * 9, [0] * 9, 0, False)
         run_case(caches, 'domain 1 only', next_n, [3000] * 9, [1] * 9, 0, False)
         run_case(caches, 'skewed', next_n, [300, 300, 300, 30000], [0, 0, 0, 1], 0, False)
         run_case(caches, 'grouped', next_n, [5000] * 12, [0] * 6 + [1] * 6, 0, False)
-        # Pages from an allocator that ignores the domains
         run_case(caches, 'mixed pages', next_n, [6000] * 10, [None] * 10, 0, False)
         run_case(caches, 'many requests', next_n, [200 + 37 * i for i in range(130)], alt(130), 0, False)
-        # Guard: little work or few requests keep the stock partition
         run_case(caches, 'guard, small', next_n, [4096] * 32, alt(32), None, True)
         run_case(caches, 'guard, at the threshold', next_n, [SPLIT_KV * 128] * 64, alt(64), None, False)
         run_case(caches, 'guard, below the threshold', next_n, [SPLIT_KV * 128] * 63 + [SPLIT_KV * 127], alt(64), None, True)
         run_case(caches, 'guard, 16 requests', next_n, [SPLIT_KV * 640] * 16, alt(16), None, False)
         run_case(caches, 'guard, 15 requests', next_n, [SPLIT_KV * 640] * 15, alt(15), None, True)
-        # Guard: pages spread over both domains, or nearly all in one, keep the stock partition
         run_case(caches, 'guard, mixed pages', next_n, [SPLIT_KV * 128] * 64, [None] * 64, None, True)
         run_case(caches, 'guard, mixed pages, small threshold', next_n, [6000] * 20, [None] * 20, 1, True)
         run_case(caches, 'guard, homed pages, small threshold', next_n, [6000] * 20, alt(20), 1, False)

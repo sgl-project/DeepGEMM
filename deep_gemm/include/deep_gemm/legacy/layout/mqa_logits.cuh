@@ -67,17 +67,13 @@ struct MQALogitsSharedStorage {
     uint32_t tmem_ptr_in_smem;
 };
 
-// Localized schedule of the paged kernel: each request belongs to one locality domain (the one that holds most of its
-// KV pages). Every domain's work is cut into slots of its own, and a CTA claims slots of its SM's domain first.
-// Words: [slot (start, end) pairs: 4 * kNumSlots][tail sentinel: 4][claim counter: 2][num domain-0 slots][flags]
-//        [request domain bits: ceil(num_requests / 32)]
-// A slot's start split also carries the slot's flags, so that a walk needs no load beyond the stock schedule's.
+// Localized paged schedule: [slot (start, end) pairs: 4 * kNumSlots][tail sentinel: 4][claim counter: 2]
+//                           [num domain-0 slots][flags][request domain bits: ceil(num_requests / 32)]
 struct PagedMQALogitsLocalizedSchedule {
-    // Too little work to pay for claims: the stock partition, with slot `i` for CTA `i`
+    // The schedule is the stock partition, with slot `i` for CTA `i`
     static constexpr uint32_t kFlagStatic = 1u;
-    // CTA `i` walks slot `i` and nothing is claimed. Only a hint: any slot can be walked either way
+    // Only a hint: any slot can be walked either way
     static constexpr uint32_t kSlotFlagStatic = 1u << 31;
-    // The slot's domain
     static constexpr uint32_t kSlotFlagDomain = 1u << 30;
     // The slot holds requests of both domains (stock partition)
     static constexpr uint32_t kSlotFlagAllDomains = 1u << 29;

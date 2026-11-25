@@ -224,13 +224,8 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_requests,
     }
 }
 
-// Localized schedule for a KV cache whose pages `[0, num_local_pages)` are homed in locality domain 0 and the rest in domain 1.
-// A request belongs to the domain that holds most of its pages (of up to `kNumMaxPageSamples` evenly spaced ones), and each
-// domain's work is balanced across its share of the slots. The schedule is static, i.e. the stock partition with slot `i`
-// for CTA `i`, where claims do not pay off (measured on SM107): below `min_num_localized_splits` KV splits or
-// `min_num_localized_requests` requests, when less than `kMinHomedWorkNum / kMinHomedWorkDen` of the work reads pages of
-// its request's domain (pages from an allocator that ignores the domains), or when one domain holds less than
-// `1 / kMaxDomainWorkRatio` of the work. `min_num_localized_splits == 0` always claims.
+// Localized schedule: pages `[0, num_local_pages)` are homed in domain 0 and the rest in domain 1
+// Static (the stock partition) below either minimum, or with too little homed work or work in one domain
 template <uint32_t kNextN, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kNumSlots>
 CUTLASS_GLOBAL __launch_bounds__(kNumMetadataThreads, 1)
 void sm100_paged_mqa_logits_localized_metadata(const uint32_t num_requests,
@@ -443,7 +438,6 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen>, SM100Reque
         auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
         const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
         if constexpr (kIsLocalized) {
-            // The start split of a localized slot carries the slot's flags
             // NOTES: the grid has one CTA per slot
             using Layout = layout::PagedMQALogitsLocalizedSchedule;
             this->request_domain_words = schedule_meta + Layout::get_request_domains_offset(gridDim.x);
@@ -564,11 +558,8 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen>, SM100Reque
     }
 };
 
-// Walks the slots that this CTA claims from a localized schedule. Slots `[0, num_local_slots)` hold domain 0's work and
-// the rest domain 1's; domain-0 CTAs claim from the front and domain-1 CTAs from the back of one counter, so a CTA
-// reads its own domain's pages while there are any and the other domain's after that. The KV loader warp claims,
-// since it runs ahead of the pipeline, and publishes the slot sequence in a shared ring for the other warps.
-// Every (request, KV split) is still computed exactly once, by the unchanged main loop.
+// Walks the slots this CTA claims: domain-0 CTAs claim from the front and domain-1 CTAs from the back of one counter
+// The KV loader warp claims, as it runs ahead of the pipeline, and publishes the slots in a ring for the other warps
 template <typename Inner, uint32_t kNumSlotsPerRing, uint32_t kClaimerWarpIdx>
 struct SM100PagedMQALogitsClaimingScheduler : Inner {
     using Layout = layout::PagedMQALogitsLocalizedSchedule;
@@ -581,7 +572,6 @@ struct SM100PagedMQALogitsClaimingScheduler : Inner {
     volatile int* ring;
     uint32_t num_acquired;
 
-    // The walk starts exhausted
     // NOTES: slot `i` owns the pair of metadata entries starting at `2 * i`; this CTA has read slot `cta_idx` already
     CUTLASS_DEVICE SM100PagedMQALogitsClaimingScheduler(const uint32_t& cta_idx,
                                                         const uint32_t* context_lens,
@@ -627,8 +617,7 @@ struct SM100PagedMQALogitsClaimingScheduler : Inner {
         ring[kNumSlotsPerRing] = static_cast<int>(idx + 1);
     }
 
-    // At kernel entry, before the first CTA-wide barrier: the first claim overlaps with the CTA's setup
-    // NOTES: only once the grid dependency, which may be the schedule's writer, has completed
+    // NOTES: call at kernel entry, once the grid dependency, which may be the schedule's writer, has completed
     CUTLASS_DEVICE static void init_ring(const uint32_t* schedule_meta, volatile int* ring,
                                          const uint32_t& sm_domain_idx, const uint32_t& num_q_tokens_total) {
         if (threadIdx.x == kClaimerWarpIdx * 32) {

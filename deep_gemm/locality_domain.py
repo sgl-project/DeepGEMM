@@ -103,11 +103,7 @@ def localize_rows(t: torch.Tensor) -> torch.Tensor:
 
 
 def empty_paged(num_pages: int, page_shape, dtype: torch.dtype) -> torch.Tensor:
-    """
-    `torch.empty((num_pages, *page_shape), dtype=dtype)` for a paged cache, with pages
-    `[d * num_pages / num_domains, (d + 1) * num_pages / num_domains)` in domain `d`.
-    Each domain's pages must be a whole number of `get_granularity()` bytes.
-    """
+    """`torch.empty((num_pages, *page_shape), dtype=dtype)`, with the pages' slice `d` in domain `d`"""
     num_page_bytes = math.prod(page_shape) * torch.empty((), dtype=dtype).element_size()
     return empty_split_rows((num_pages, num_page_bytes), torch.uint8).view(dtype).view(num_pages, *page_shape)
 

@@ -699,15 +699,11 @@ static torch::Tensor get_paged_mqa_logits_metadata_legacy(const torch::Tensor& c
     return schedule_metadata;
 }
 
-// KV splits (256 tokens each, summed over the requests) and requests from which a localized schedule claims its slots.
-// Below either, claims cost more than the remote reads they save, and the schedule is the stock partition. Measured on
-// SM107: every cell at or above both is 3.6 to 11.0 % faster than the stock schedule on the same pages, and the cells
-// that lost were at 4,096 to 5,504 splits or had 8 requests. 0 splits claims for any work and any page placement.
+// Minimum KV splits (256 tokens each, summed over the requests) and requests for a localized schedule to claim; 0 splits always claims
 static constexpr int kMinNumPagedMQALogitsLocalizedSplits = 8192;
 static constexpr int kMinNumPagedMQALogitsLocalizedRequests = 16;
 
-// Whether the pages of a fused paged KV cache are homed in the locality domains, first half in domain 0 and second half
-// in domain 1, as `locality_domain.empty_paged` allocates them
+// Whether the first half of the pages is homed in domain 0 and the second half in domain 1
 static bool is_paged_kv_cache_localized(const torch::Tensor& fused_kv_cache) {
     if (jit->device.get_arch_major() != 10 or locality_domain::get_num_locality_domains() != 2 or
         not locality_domain::is_localization_available())
@@ -720,9 +716,7 @@ static bool is_paged_kv_cache_localized(const torch::Tensor& fused_kv_cache) {
            locality_domain_allocator.get_locality_domain(ptr + num_half_bytes, num_half_bytes) == 1;
 }
 
-// Schedule of `fp8_fp4_paged_mqa_logits_legacy` for a KV cache homed in the device's locality domains: each domain's SMs
-// scan the requests whose pages are in their own domain first, and then help the other domain. Logits are bitwise those of
-// the stock schedule, which is also what this returns for any other KV cache, device, or SM count.
+// Localized schedule for a homed KV cache; the stock schedule for any other KV cache, device, or SM count
 static torch::Tensor get_paged_mqa_logits_localized_metadata(const torch::Tensor& context_lens,
                                                              const torch::Tensor& block_table,
                                                              const torch::Tensor& fused_kv_cache,

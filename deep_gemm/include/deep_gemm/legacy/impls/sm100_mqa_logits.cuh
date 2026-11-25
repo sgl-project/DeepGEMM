@@ -729,8 +729,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
         make_scheduler);
 }
 
-// Paged entry for a localized schedule (see `SM100PagedMQALogitsClaimingScheduler`).
-// A separate entry keeps the default paged kernel's symbol and code as they are.
+// Paged entry for a localized schedule; a separate entry preserves the default paged kernel's symbol and codegen
 template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t PAGE_KV,
           bool kIsMXSF, bool kIsContextLens2D,
@@ -759,13 +758,10 @@ void sm100_paged_mqa_logits_localized(const uint32_t num_q_tokens_total,
                                                       kNumHeads, SPLIT_KV, PAGE_KV, kSplitsPerChunk, true>;
     using Layout = layout::PagedMQALogitsLocalizedSchedule;
 
-    // Every slot of a schedule carries the flag, and this CTA's slot is what a static walk loads first anyway.
-    // NOTES: read before the grid dependency, which may be the schedule's writer, has completed: the flag only selects
-    // how the slots are taken, and both ways compute any schedule exactly once
+    // NOTES: read before the grid dependency, which may be the schedule's writer, has completed; the flag is only a hint
     const bool is_static = (schedule_meta[blockIdx.x * 4 + 1] & Layout::kSlotFlagStatic) != 0;
 
     if (is_static) {
-        // CTA `i` walks slot `i` with the stock walk, in a main loop of its own
         const auto make_scheduler = [&](const uint32_t& cta_idx) {
             return walk_t(cta_idx * 2, context_lens, schedule_meta, nullptr,
                           block_table, block_table_stride, num_q_tokens_total);

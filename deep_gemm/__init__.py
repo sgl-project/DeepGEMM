@@ -187,14 +187,6 @@ try:
         return _C.get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices)
 
     def get_paged_mqa_logits_localized_metadata(context_lens, block_table, kv_cache, num_sms, min_num_localized_splits=None):
-        """
-        `schedule_meta` of `fp8_paged_mqa_logits` / `fp8_fp4_paged_mqa_logits_legacy` for a `kv_cache` homed in the GPU's
-        locality domains (`locality_domain.empty_paged`): each domain's SMs scan the requests whose pages `block_table`
-        places in their own domain first. Logits are bitwise unchanged. The schedule is the stock partition for any
-        other `kv_cache` or device, below `min_num_localized_splits` 256-token KV splits of work (default 8,192) or 16
-        requests, and when requests' pages are spread over both domains or nearly all in one
-        (`min_num_localized_splits=0` claims regardless).
-        """
         return _C.get_paged_mqa_logits_localized_metadata(context_lens, block_table, kv_cache, num_sms, min_num_localized_splits)
 
     def get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
