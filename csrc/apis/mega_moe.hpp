@@ -70,8 +70,7 @@ get_symm_buffer_size_for_mega_moe(
     const int& max_block_m = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
-    // `max_block_m` > 0 sizes the rings for M tiles of at most that many rows (0: every candidate tile);
-    // calls on such a buffer must not pick a larger tile, which `fp8_fp4_mega_moe` checks
+    // `max_block_m` > 0 sizes the rings for M tiles of at most that many rows (0: every candidate tile)
     DG_HOST_ASSERT(max_block_m == 0 or std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
         [=](const auto& candidate) { return candidate == max_block_m; }));
@@ -395,7 +394,6 @@ static void fp8_fp4_mega_moe(
         hidden, intermediate_hidden,
         mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b, max_block_m
     );
-    // A buffer sized for tiles of at most `max_block_m` rows cannot take a call that picks a larger one
     DG_HOST_ASSERT(max_block_m == 0 or get_block_m_for_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type, global_num_tokens) <= max_block_m);
     if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))

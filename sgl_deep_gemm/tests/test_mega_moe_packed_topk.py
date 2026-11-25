@@ -1,15 +1,4 @@
 # FP8xFP4 MegaMoE, one-rank group: opt-in packed top-k input (`topk_format='packed'`, `topk_first_expert`).
-#
-# The packed call must be bitwise equal to the int64 call with the same routing:
-#   * for a group whose first expert is not expert 0 (ids in the words are global, counted from `topk_first_expert`);
-#   * with BF16 weights in the words and with FP32 weights selected by bit 30;
-#   * with slots that are not routed here (negative word; id of another group);
-#   * after an int64 call that filled the whole `topk_idx` array (nothing of the packed format lives in the buffer);
-#   * when captured in a CUDA graph and replayed with other inputs;
-# and the default format must be unchanged by the new arguments at their defaults.
-#
-# Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_packed_topk.py
 
 import os
 import socket

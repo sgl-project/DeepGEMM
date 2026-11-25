@@ -1,13 +1,4 @@
 # FP8xFP4 SiTU MegaMoE: symmetric buffer with an exact row count and a largest M tile.
-#
-# Covers `SymmBuffer(exact_num_max_tokens=True, max_block_m=N)`:
-#   * the buffer keeps the given row count and is smaller than the default one;
-#   * outputs are bitwise equal to the default buffer's at every call size whose tile fits;
-#   * a call that would pick a larger tile, a row count that is not a multiple of 128 and a `max_block_m`
-#     that is not a candidate tile are rejected.
-#
-# Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_compact_buffer.py
 
 import argparse
 import os

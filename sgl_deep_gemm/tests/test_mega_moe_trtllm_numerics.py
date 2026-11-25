@@ -1,14 +1,4 @@
 # FP8xFP4 SiTU MegaMoE: opt-in trtllm-gen numerics (`numerics='trtllm'`, `split4_combine_max_tokens`).
-#
-# Checks what can be checked without FlashInfer:
-#   * the default path is deterministic and the new arguments at their defaults change nothing;
-#   * `numerics='trtllm'` computes the same function (rounding-level difference from the default);
-#   * the split-4 combine is not taken above its token limit (bitwise equal to the chain there);
-#   * with top-k 1 the split-4 combine and the chain are the same arithmetic (bitwise equal).
-# Bitwise equality against FlashInfer's routed MoE itself needs FlashInfer and is tested by the caller.
-#
-# Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_trtllm_numerics.py
 
 import argparse
 import os

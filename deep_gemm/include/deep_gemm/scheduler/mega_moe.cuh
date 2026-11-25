@@ -254,20 +254,13 @@ struct MegaMoEScheduler {
     // Layout: `stored_pool_block_offset[i]` holds the pool block offset of slot (i * 32 + lane_idx)'s first block.
     uint32_t stored_pool_block_offset[kNumExpertsPerLane] = {};
 
-    // One-rank groups: where the expert token counts come from (set by the kernel, all off by default).
-    // The global count protocol makes every SM add its counts to the workspace, and SM 0 relay the sums after a
-    // grid sync. With one rank every routed id is local, so the counts are a function of `topk_idx` alone:
-    //   - `use_local_counts`: each scheduler and dispatch warp counts from `topk_idx` itself, either by scanning
-    //     it (few tokens), or from per-expert token bitmasks its CTA built in shared memory (`use_token_masks`);
-    //   - `use_send_counts`: larger calls keep the per-SM atomics and the grid sync, and read the send counts
-    //     directly instead of the sums SM 0 relays.
+    // One-rank groups: where the expert token counts come from (set by the kernel, all off by default)
     bool use_local_counts = false, use_token_masks = false, use_send_counts = false;
     // The scheduler warp must wait for its own CTA's dispatch warps; the dispatch warps are already ordered
     bool is_scheduler_warp = false;
     const int64_t* topk_idx = nullptr;
     uint32_t num_call_tokens = 0, num_topk = 0;
-    // Packed top-k words (see the kernel): `topk_idx` then points at int32 words with ids counted from
-    // `packed_topk_first_expert`
+    // Packed top-k words (see the kernel): int32 words with ids counted from `packed_topk_first_expert`
     bool packed_topk = false;
     int packed_topk_first_expert = 0;
     CUTLASS_DEVICE int read_topk_expert_idx(const uint32_t& i) const {
@@ -479,8 +472,7 @@ struct MegaMoEScheduler {
         // interleaved order. With a ring slot for every pool block, no L1 task waits for an L2 task to free a slot.
         constexpr uint32_t kMaxDecodeL1FirstExtraWaves = 4;
         constexpr uint32_t kMaxL1FirstExtraWaves = BLOCK_M <= 64 ? kMaxDecodeL1FirstExtraWaves : 1;
-        // `l1_first_whenever_fits` (opt-in per kernel) lifts the cap: with scheduler-side dependency checks the L2
-        // tasks are published as their inputs complete, and one-rank FP8xFP4 groups measure faster without it
+        // `l1_first_whenever_fits` (opt-in per kernel) lifts the cap
         const bool is_l1_first = num_total_m_blocks <= kNumRingBlocks and
             (l1_first_whenever_fits or num_total_l1_waves <= min_l1_warmup_waves + kMaxL1FirstExtraWaves);
         num_sched_l1_waves = is_l1_first ? num_total_l1_waves : cute::min(min_l1_warmup_waves, num_total_l1_waves);
@@ -532,8 +524,7 @@ struct MegaMoEScheduler {
         }
     }
 
-    // One-rank groups: the source `token * num_topk + slot` of pool slot `token_idx_in_expert` of an expert, i.e. the
-    // `token_idx_in_expert`-th token (ascending) whose top-k holds the expert. Replaces the index the dispatch pushes
+    // One-rank groups: source index of the `token_idx_in_expert`-th token (ascending) routed to the expert
     CUTLASS_DEVICE uint32_t find_src_token_topk_idx(const uint32_t& expert_idx, const uint32_t& token_idx_in_expert) const {
         const uint32_t lane_idx = ptx::get_lane_idx();
         if (use_token_masks) {
@@ -678,20 +669,12 @@ struct MegaMoEScheduler {
                get_next_task_idx<kNumClusters>(task_count_ptr, sm_locality_domain_idx ^ 1, num_m_blocks, m_block_idx, local_n_cluster_idx, domain_idx);
     }
 
-    // Scheduler-side dependency checks (opt-in per kernel through `check_deps`, decided per call in
-    // `fetch_expert_recv_count`). When every L1 task is issued before the first L2 task (`is_l1_first`), the
-    // scheduler checks a task's inputs itself before publishing it, so that the load warps start their TMA copies
-    // without polling: an L1 task waits for its block's tokens, an L2 task for every L1 N block of its block.
-    // A checked task carries `kDepsCheckedBit` in `m_block_idx`, which a kernel that opts in must test and must
-    // not use as a block index.
-    // NOTES: `is_l1_first` implies no ring reuse, so the ring block is the pool block and its counters are in
-    // their first generation; the L2 full mask is one 64-bit word. The full-mask wait is stricter than the load
-    // warps' per-K-block wait, which is why the interleaved order keeps the latter
+    // Scheduler-side dependency checks (`check_deps`): a checked task carries `kDepsCheckedBit` in `m_block_idx`
+    // NOTES: only with `is_l1_first`, which implies no ring reuse (the ring block is the pool block, first generation)
     static constexpr bool kCheckDepsInScheduler = kNumL1BlockNs <= 64;
     static constexpr uint16_t kDepsCheckedBit = 0x8000u;
     DG_STATIC_ASSERT(sizeof(task_info_t::m_block_idx) == sizeof(uint16_t), "`kDepsCheckedBit` is the top bit of `m_block_idx`");
     bool check_deps = false, checks_deps_in_call = false;
-    // Issue every L1 task first whenever the call's M blocks fit in the ring, past the extra-wave cap
     bool l1_first_whenever_fits = false;
 
     CUTLASS_DEVICE task_info_t get_next_task() {
@@ -710,7 +693,7 @@ struct MegaMoEScheduler {
                 // Create task
                 auto task_info = create_task<kNumL1Clusters>(BlockPhase::Linear1, m_block_idx, local_n_cluster_idx, domain_idx, L1_SHAPE_N, L1_SHAPE_K);
                 if (checks_deps_in_call) {
-                    // Wait for the block's tokens here, instead of in the load warps
+                    // Wait for the block's tokens
                     const auto ptr = workspace.get_l1_full_count_ptr(task_info.pool_block_idx);
                     while (ptx::ld_acq(ptr) != BLOCK_M) {}
                     task_info.m_block_idx |= kDepsCheckedBit;
@@ -730,9 +713,8 @@ struct MegaMoEScheduler {
                     BlockPhase::Linear2, m_block_idx, local_n_cluster_idx, domain_idx, L2_SHAPE_N, L2_SHAPE_K, &chunk_end_block);
 
                 if (checks_deps_in_call) {
-                    // Wait until every L1 N block of this task's pool block is done, instead of in the load warps.
-                    // Every L1 task was fetched before this L2 task (`is_l1_first`), and a fetched L1 task only
-                    // waits for the pull, so the mask fills without this scheduler
+                    // Wait until every L1 N block of this task's pool block is done
+                    // NOTES: every L1 task was fetched before this one (`is_l1_first`), so the mask fills without this scheduler
                     constexpr uint64_t kFullMask = kNumL1BlockNs == 64 ? ~0ull : (1ull << kNumL1BlockNs) - 1;
                     const auto ptr = workspace.get_l2_full_mask_ptr(task_info.pool_block_idx);
                     while (ptx::ld_acq_gpu(ptr) != kFullMask) {}

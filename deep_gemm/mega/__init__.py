@@ -68,13 +68,7 @@ class SymmBuffer:
                  gather_output: bool = False,
                  exact_num_max_tokens: bool = False,
                  max_block_m: Optional[int] = None):
-        """
-        `exact_num_max_tokens=True` keeps `num_max_tokens_per_rank` as given (a multiple of 128) instead of aligning
-        it up to `get_token_alignment_for_mega_moe()` rows. `max_block_m` sizes the rings for M tiles of at most that
-        many rows instead of every candidate tile; a call that would pick a larger tile is rejected. Together they
-        let a decode-only group allocate a small buffer (for example 256 rows with `max_block_m=64`).
-        Both are for the SM100 FP8 / FP4 kernels and are off by default.
-        """
+        # `exact_num_max_tokens`: keep the row count as given; `max_block_m`: largest M tile the rings are sized for
         if exact_num_max_tokens:
             assert num_max_tokens_per_rank > 0 and num_max_tokens_per_rank % 128 == 0, \
                 '`exact_num_max_tokens` needs a positive multiple of 128 rows'
@@ -332,18 +326,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      split4_combine_max_tokens: int = 0,
                      topk_format: str = 'int64',
                      topk_first_expert: int = 0):
-    """
-    `numerics='trtllm'` (FP8xFP4 SiTU, routed experts only) places the roundings where FlashInfer's trtllm-gen MoE
-    places them: top-k weight at the combine, SiTU on the FP32 accumulators, literal SiTU gate. The function is the
-    same; outputs differ from `'default'` by rounding only. With it, `split4_combine_max_tokens=N` sums a token's
-    top-k slots in four interleaved accumulators for calls of at most N tokens (0: one chain at every size).
-    NOTES: the small-call order is not batch-invariant across N; pass 0 for the pieces of a call the caller split.
-
-    `topk_format='packed'` (one-rank groups): the first `num_tokens * num_topk` int32 words of `sym_buffer.topk_idx`
-    hold `(expert id << 16) | bf16(weight)`, with expert ids counted from `topk_first_expert` (the id of the
-    group's first expert). A negative word, or an id outside the group, is not routed here;
-    bit 30 of a word selects the FP32 weight in `sym_buffer.topk_weights` instead of the word's BF16 bits.
-    """
+    # `numerics='trtllm'`: rounding placement of FlashInfer's trtllm-gen MoE; the split-4 combine is not batch-invariant
+    # `topk_format='packed'`: int32 words `(expert id << 16) | bf16(weight)`, ids counted from `topk_first_expert`
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     if broadcast_y:

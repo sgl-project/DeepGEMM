@@ -109,11 +109,7 @@ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
     return result;
 }
 
-// Row-shuffled (TRT) weights for FP8 x FP4 with the SM107 K=64 MMA: packed FP4 rows and their per-32 scales are read
-// from the caller's tensors as they are, one 128-row x 128-K tile and one 512-byte scale slab per load.
-//   - L1 weights: 2D `[E * N, K / 2]` bytes, rows in storage order (the kernel undoes L1's 16-channel order in its
-//     FP8 epilogue); L2 weights: 4D, which undoes the 32-row shuffle while loading
-//   - scales: one slab per (128 rows, 128 K); L2's is 4D for the same shuffle
+// Row-shuffled (TRT) FP8 x FP4 weights (SM107 K=64 MMA): one 128x128 tile and one 512-byte scale slab per load
 static CUtensorMap make_row_shuffled_fp8_fp4_tma_desc(
     const torch::Tensor& tensor, const int& n, const int& k, const bool& is_weight, const bool& is_l1) {
     DG_HOST_ASSERT(n % 128 == 0 and k % 128 == 0 and tensor.is_contiguous());
@@ -352,8 +348,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                            num_experts_per_rank, 0, 0, false,
                                                            sf_smem_outer_dim, static_cast<int>(l2_weights_sf.stride(-1)));
 
-    // 8-row activation boxes over the routed pools: with a 16-row MMA each CTA of the cluster owns 8 rows,
-    // and the full `load_block_m` box would fetch rows nobody reads
+    // 8-row activation boxes: with a 16-row MMA each CTA of the cluster owns 8 rows
     const auto tensor_map_l1_acts_m8 = make_tma_2d_desc(l1_acts,
                                                         to_inner(hidden), config.num_ring_tokens,
                                                         block_k_inner, 8,

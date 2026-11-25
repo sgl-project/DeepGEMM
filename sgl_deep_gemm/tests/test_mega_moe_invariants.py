@@ -1,18 +1,4 @@
 # FP8xFP4 SiTU MegaMoE: invariants of the one-rank and scheduler fast paths.
-#
-# One driver, one suite per change. A suite is a set of group shapes and call sizes chosen to reach the code it
-# names; there is no second code path to compare with, so every suite checks the same invariants:
-#   * every local expert receives exactly the tokens routed to it (`cumulative_local_expert_recv_stats`);
-#   * the same call twice is bitwise equal (nothing is left behind in the workspace);
-#   * a row's result does not depend on the other rows: a call on a prefix of the tokens and a call on a
-#     permutation of them reproduce the rows bitwise;
-#   * a call that routes nothing leaves the next call unchanged;
-#   * a captured CUDA graph replays correctly with other inputs.
-#
-# Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py --suite pull_lookup
-#   CUDA_VISIBLE_DEVICES=0,1 python3 sgl_deep_gemm/tests/test_mega_moe_invariants.py --num-processes 2
 
 import argparse
 import os
@@ -168,14 +154,12 @@ def _run_case(group, rank_idx: int, num_experts: int, num_topk: int, pattern: st
             assert torch.equal(ref[:half], prefix), f"rows depend on the call size: {num_tokens} vs {half} tokens, {tag}"
         barrier()
 
-    # A call that routes nothing, between two equal calls
     small = inputs(16, 7)
     ref = run(16, *small)
     nothing = torch.full((16, num_topk), -1, dtype=torch.int64, device="cuda")
     run(16, small[0], nothing, small[2], check_stats=False)
     assert int(stats.sum()) == 0 or num_ranks > 1, f"a call that routes nothing received tokens, {tag}"
     assert torch.equal(ref, run(16, *small)), f"a call that routes nothing changed the next call, {tag}"
-    # A full buffer, then the small call again
     run(NUM_MAX_TOKENS, *inputs(NUM_MAX_TOKENS, 8))
     assert torch.equal(ref, run(16, *small)), f"a full call changed the next call, {tag}"
     barrier()

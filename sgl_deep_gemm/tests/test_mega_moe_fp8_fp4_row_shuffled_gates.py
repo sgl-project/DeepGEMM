@@ -1,14 +1,4 @@
 # FP8xFP4 MegaMoE: which calls may use the row-shuffled (TRT) weight layout.
-#
-# Covers the structural gates of `weight_layout='row_shuffled'` / `'trtllm'` for FP8xFP4:
-#   * rejected without the SiTU activation and with shared experts;
-#   * with SiTU, accepted by the Python gate only (the kernel path needs the SM107 K=64 MMA; elsewhere the host
-#     rejects the call).
-# Bitwise equality with the `megamoe` layout needs weights packed in the row-shuffled order by the caller
-# (FlashInfer trtllm-gen tensors); it is checked from the caller's side, not here.
-#
-# Usage:
-#   CUDA_VISIBLE_DEVICES=0 python3 sgl_deep_gemm/tests/test_mega_moe_fp8_fp4_row_shuffled_gates.py
 
 import argparse
 import os
@@ -83,14 +73,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y = torch.empty((32, HIDDEN), dtype=torch.bfloat16, device="cuda")
 
     for layout in ("row_shuffled", "trtllm"):
-        # No SiTU: rejected by the Python gate
         try:
             deep_gemm.fp8_fp4_mega_moe(y, weights[0], weights[1], buffer, activation="swiglu", weight_layout=layout)
         except (ValueError, AssertionError):
             pass
         else:
             raise AssertionError(f"{layout} without SiTU must be rejected")
-        # Shared experts: rejected for every layout but the default one
         try:
             deep_gemm.fp8_fp4_mega_moe(y, weights[0], weights[1], buffer, activation="situ", weight_layout=layout,
                                        shared_l1_weights=weights[0], shared_l2_weights=weights[1])

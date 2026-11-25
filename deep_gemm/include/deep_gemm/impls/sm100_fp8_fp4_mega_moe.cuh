@@ -25,10 +25,7 @@ namespace deep_gemm {
 //   => 4 * tanh(g/4) * sigmoid(g) = 2T(1+T)^2 / (1 + T^2)
 // needs beta == 4, and the tanh-only up branch needs linear_beta == 25. Both helpers fall back to
 // the literal definition for any other pair, so a different config stays correct -- just slower.
-//
-// `kLiteralGate` selects the literal gate for the K3 pair as well. Both forms are the same function in exact
-// arithmetic; in FP32 they round differently, and the literal form is the one whose FC2 input codes match
-// FlashInfer's trtllm-gen MoE (`kUseTrtllmNumerics` below).
+// `kLiteralGate` forces the literal gate, whose FP32 rounding matches FlashInfer's trtllm-gen MoE
 template <bool kFastMath, float kSituBeta, float kSituLinearBeta, bool kLiteralGate = false>
 __forceinline__ __device__ float2 sm100_fp8_fp4_mega_moe_situ_gate(float2 gate) {
     if constexpr (not kLiteralGate and kSituBeta == 4.0f and kSituLinearBeta == 25.0f) {
@@ -135,17 +132,12 @@ template <
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kBroadcastY = false,
-    // FlashInfer trtllm-gen numerics (opt-in): the top-k weight is applied at the combine instead of the L1
-    // epilogue, SiTU reads the FP32 accumulators instead of their BF16 rounding, and the SiTU gate uses its
-    // literal definition. Same function up to rounding; only the placement of the roundings changes.
+    // FlashInfer trtllm-gen numerics: top-k weight at the combine, SiTU on the FP32 accumulators, literal SiTU gate
     bool kUseTrtllmNumerics = false,
-    // With `kUseTrtllmNumerics`: calls of at most this many tokens sum a token's top-k slots in four interleaved
-    // FP32 accumulators (slot `s` -> accumulator `s % 4`, then `((a0 + a1) + a2) + a3`), as trtllm-gen's finalize
-    // does for small calls; 0 keeps the single chain in slot order at every size.
+    // Token limit of trtllm-gen's small-call combine order (0: off)
     uint32_t kNumSplit4CombineMaxTokens = 0,
     // Top-k inputs as packed words `(expert id << 16) | bf16(weight)` in the `topk_idx` region (one-rank groups)
     bool kPackedTopk = false,
-    // With `kPackedTopk`: id of the group's first expert (a word's id minus this is the local expert index)
     uint32_t kPackedTopkFirstExpert = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -226,7 +218,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                       cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
                      "Gate/up interleaved weight layout requires routed NVFP4 or FP8xFP8 experts");
 
-    // trtllm-gen numerics switches
     // NOTES: the post-expert norm already applies the top-k weight in the combine
     constexpr bool kWeightAtCombine = kUseTrtllmNumerics and not kWithPostExpertNorm;
     constexpr bool kSituOnFp32 = kUseTrtllmNumerics and kUseSitu;
@@ -429,10 +420,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumExpertCountWords =
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment) / sizeof(uint32_t);
     struct SharedStorage {
-        // NOTES: the counts are only live before the pull and the send buffer only during it (the SIMT pull goes
-        // through registers, so it needs no send buffer). `count_words` makes the union's alignment padding
-        // addressable: the one-rank count paths keep their flags behind both members (`kOneRankFlagBaseWord`),
-        // where the pull cannot overwrite them
+        // NOTES: the SIMT pull goes through registers, so it needs no send buffer
+        // NOTES: `count_words` exposes the union's padding for the one-rank flags (`kOneRankFlagBaseWord`)
         union alignas(kSharedMemoryAlignment) {
             uint32_t expert_token_count[kNumExperts];
             uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull];
@@ -559,8 +548,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
     const uint32_t tmem_base = ptx::ld_shared(&shared_storage.tmem_ptr_in_smem);
 
-    // Top-k readers. Packed format: int32 words at the start of the `topk_idx` region, expert ids counted from
-    // `kPackedTopkFirstExpert`. Bit 30 of a word selects the FP32 weight of `topk_weights` instead of the word's BF16 bits
+    // Packed top-k words: bit 30 selects the FP32 weight of `topk_weights` instead of the word's BF16 bits
     DG_STATIC_ASSERT(not kPackedTopk or (kNumRanks == 1 and not kWithPostExpertNorm and kNumSharedExperts == 0),
                      "Packed top-k inputs are for one-rank groups of routed experts");
     const int* packed_topk_ptr = buffer.input_topk_idx_buffer.template get_base_ptr<int>();
@@ -598,17 +586,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     );
     // The load warps below honor `kDepsCheckedBit`
     scheduler.check_deps = true;
-    // One-rank groups: every L1 task first whenever the M blocks fit in the ring (measured on a 112-expert group)
     scheduler.l1_first_whenever_fits = (kNumRanks == 1);
 
-    // One-rank groups: expert token counts without the global count protocol (see the scheduler)
-    //   - token masks: calls of at most `kOneRankMaskMaxTokens` tokens; the dispatch warps build per-expert token
-    //     bitmasks in `smem_d`, which the epilogue does not use before the CTA's pulls are done
-    //   - scan: calls with `num_tokens * ceil(num_experts / 32) <= kOneRankScanBudget`, when the masks do not fit
-    //     (4 tokens at 448 experts, 16 at 112)
-    //   - send counts: every larger call
-    // The flags are the words of the count union behind the experts' counts and the dispatch send buffer, zeroed
-    // with the counts in the prologue
+    // One-rank groups: expert token counts from token masks, a `topk_idx` scan or the send counts (see the scheduler)
+    // NOTES: the flags live in the count union behind the counts and the send buffer, zeroed in the prologue
     constexpr uint32_t kOneRankScanBudget = 64;
     constexpr uint32_t kOneRankMaskMaxTokens = 128;
     constexpr uint32_t kOneRankFlagBaseWord = cute::max<uint32_t>(
@@ -617,7 +598,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumExpertCountWords > kOneRankFlagBaseWord ? kNumExpertCountWords - kOneRankFlagBaseWord : 0u;
     constexpr uint32_t kSendCountsReadyWord = kOneRankFlagBaseWord, kTokenMasksReadyWord = kOneRankFlagBaseWord + 1,
                        kPullsDoneWord = kOneRankFlagBaseWord + 2;
-    // Mask words per expert: 4 (128 tokens) if the staging buffer holds them, else 2 or 1
     constexpr uint32_t kNumTokenMaskWords = kNumExperts * 4 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 4 :
                               kNumExperts * 2 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 2 : 1;
     constexpr bool kTokenMasksFit = kUseSimtPull and not kHasShared and
@@ -729,8 +709,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             nvl_barrier_counter = *workspace.get_nvl_barrier_counter_ptr();
 
         // Count experts' tokens
-        // NOTES: with local counts (one-rank groups), nothing below up to the grid sync is needed:
-        // no count is published and no source index is pushed
+        // NOTES: local counts (one-rank groups) publish no count and push no source index
         if (not use_local_counts)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -823,7 +802,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
-        // NOTES: a one-rank group has no peer to wait for; its readers already spin on the tagged count sums
+        // NOTES: a one-rank group has no peer to wait for
         if constexpr (kNumRanks > 1)
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
@@ -849,7 +828,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
-        // One-rank token masks: every thread reads up to 8 ids at once and sets their tokens' bits
+        // One-rank token masks
         if (use_token_masks) {
             for (uint32_t i = thread_idx; i < kNumExperts * kNumTokenMaskWords; i += kNumDispatchThreads)
                 ptx::st_shared(token_masks + i, 0u);
@@ -881,9 +860,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
-            // NOTES: one prefix-sum pass over the per-lane counts plus a ballot, instead of walking the experts one
-            // by one (`get_num_tokens` costs `kNumExpertsPerLane` shuffles per expert, so the walk is
-            // O(E^2 / 32) shuffles for a token of a high-index expert, and every L1 task waits for its pulled rows)
+            // One prefix-sum pass over the per-lane counts plus a ballot
             if (token_idx >= expert_end_idx) {
                 constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
                 uint32_t num_prefix_tokens = 0, found_start_idx = 0, found_num_tokens = 0;
@@ -1312,7 +1289,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
-            // A 16-row MMA tile: each CTA reads its 8 rows, so copy an 8-row box instead of `LOAD_BLOCK_M` rows
+            // A 16-row MMA tile: each CTA reads only its 8 rows
             // NOTES: only validated for kernels without shared experts
             const bool use_m8_acts = not kHasShared and not task_info.is_shared() and LOAD_BLOCK_M > 8 and
                 task_info.get_umma_aligned_valid_m() == 16;
@@ -1424,9 +1401,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
-                    // Row-shuffled packed FP4 weights (K=64 MMA): one 128x128 weight tile and one 512-byte scale slab
-                    // per stage, read from the caller's tensors. SMEM holds the `megamoe` order except for L1's
-                    // 16-channel order, which the L1 epilogue undoes on its FP8 output
+                    // NOTES: SMEM holds the `megamoe` order except for L1's 16-channel order, which the L1 epilogue undoes
                     DG_STATIC_ASSERT(LOAD_BLOCK_N == 128 and BLOCK_N == 128 and BLOCK_K == 128 and
                                      kSFChunkK == 128 and kNumSFWordsPerStage == 1 and kNumSFStagesPerLoad == 1,
                                      "Row-shuffled FP8 x FP4 weights need 128x128 tiles with one SF word per stage");
@@ -2313,7 +2288,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto gate = __bfloat1622float2(bf16_gate);
                             auto up = __bfloat1622float2(bf16_up);
                             if constexpr (kSituOnFp32) {
-                                // trtllm-gen feeds the FP32 accumulators to SiTU (no clamp to skip: SiTU soft-clips)
+                                // trtllm-gen feeds the FP32 accumulators to SiTU
                                 gate = fp32_values[k * 2 + kGateSlot];
                                 up = fp32_values[k * 2 + kUpSlot];
                             }
@@ -2524,9 +2499,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                     if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
-                        // Row-shuffled L1 rows come as the 8 even channels of each 16-channel group followed by the
-                        // 8 odd ones. A 64B-swizzled FP8 bank group keeps its internal 16-byte order, so interleave
-                        // the two halves of every aligned 16-byte word of the staged output
+                        // Row-shuffled L1 rows hold 8 even then 8 odd channels per 16: interleave the halves of every 16-byte word
                         constexpr uint32_t kNumStagedUint4 = STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES / sizeof(uint4);
                         DG_STATIC_ASSERT(L1_OUT_BLOCK_N_BYTES % 16 == 0 and not kIsFP4Acts, "Invalid L1 output staging");
                         auto* staged = reinterpret_cast<uint4*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]);
@@ -2888,10 +2861,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         const auto grid_idx = ptx::get_grid_idx() + 1;
 
-        // trtllm-gen numerics, small calls: four interleaved FP32 accumulators per element.
-        // One warp per (token, 128-element sub-chunk): every lane issues its 8-byte loads of all selected slot rows
-        // at once (the rows were written before the grid sync above, or are waited for below), then accumulates
-        // slot `s` into accumulator `s % 4` and reduces `((a0 + a1) + a2) + a3`.
+        // trtllm-gen numerics, small calls: slot `s` goes to accumulator `s % 4`, reduced as `((a0 + a1) + a2) + a3`
         uint32_t num_combine_token_chunks = num_tokens * kNumChunks;
         if constexpr (kNumSplit4CombineMaxTokens > 0) {
             if (num_tokens <= kNumSplit4CombineMaxTokens) {
@@ -2904,7 +2874,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t token_idx = item_idx / kNumSubChunks;
                     const uint32_t sub_chunk_idx = item_idx % kNumSubChunks;
 
-                    // Each lane reads one slot's expert index and top-k weight
                     const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                         read_topk_expert_idx(token_idx * kNumTopk + lane_idx) : -1;
                     const float stored_topk_weight = lane_idx < kNumTopk ?
@@ -2921,7 +2890,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                                      [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
-                    // All slot loads in flight before the first use
                     // NOTES: not `__ldg`, peers write these rows over NVLink
                     uint2 slot_values[kNumTopk];
                     #pragma unroll
@@ -2932,7 +2900,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                         .get_base_ptr<uint2>()[sub_chunk_idx * 32 + lane_idx];
                     }
 
-                    // 4 BF16 elements per lane: two `float2` per accumulator
                     float2 split_acc_lo[4] = {}, split_acc_hi[4] = {};
                     #pragma unroll
                     for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
@@ -2968,7 +2935,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Ranks already seen ready by this warp (main combine)
         uint64_t known_ready_ranks = 0;
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_combine_token_chunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
