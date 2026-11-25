@@ -313,13 +313,20 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      post_expert_norm_weight_first: bool = False,
                      broadcast_y: bool = False,
                      numerics: str = 'default',
-                     split4_combine_max_tokens: int = 0):
+                     split4_combine_max_tokens: int = 0,
+                     topk_format: str = 'int64',
+                     topk_first_expert: int = 0):
     """
     `numerics='trtllm'` (FP8xFP4 SiTU, routed experts only) places the roundings where FlashInfer's trtllm-gen MoE
     places them: top-k weight at the combine, SiTU on the FP32 accumulators, literal SiTU gate. The function is the
     same; outputs differ from `'default'` by rounding only. With it, `split4_combine_max_tokens=N` sums a token's
     top-k slots in four interleaved accumulators for calls of at most N tokens (0: one chain at every size).
     NOTES: the small-call order is not batch-invariant across N; pass 0 for the pieces of a call the caller split.
+
+    `topk_format='packed'` (one-rank groups): the first `num_tokens * num_topk` int32 words of `sym_buffer.topk_idx`
+    hold `(expert id << 16) | bf16(weight)`, with expert ids counted from `topk_first_expert` (the id of the
+    group's first expert). A negative word, or an id outside the group, is not routed here;
+    bit 30 of a word selects the FP32 weight in `sym_buffer.topk_weights` instead of the word's BF16 bits.
     """
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
@@ -335,6 +342,15 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         raise ValueError(f"`numerics` must be 'default' or 'trtllm'; got {numerics!r}")
     if numerics == 'trtllm' and (sym_buffer.mma_type != 'fp8xfp4' or activation != 'situ'):
         raise ValueError("`numerics='trtllm'` is only supported for `fp8xfp4` with `activation='situ'`")
+    if topk_format not in ('int64', 'packed'):
+        raise ValueError(f"`topk_format` must be 'int64' or 'packed'; got {topk_format!r}")
+    if topk_format == 'packed' and (sym_buffer.group.size() != 1 or sym_buffer.mma_type != 'fp8xfp4'
+                                    or shared_l1_weights is not None or post_expert_norm):
+        raise ValueError("`topk_format='packed'` is only supported for one-rank `fp8xfp4` groups of routed experts")
+    if topk_first_expert != 0 and topk_format != 'packed':
+        raise ValueError("`topk_first_expert` requires `topk_format='packed'`")
+    if not 0 <= topk_first_expert < 16384:
+        raise ValueError(f'`topk_first_expert` must be in [0, 16384); got {topk_first_expert}')
     if split4_combine_max_tokens != 0 and numerics != 'trtllm':
         raise ValueError("`split4_combine_max_tokens` requires `numerics='trtllm'`")
     if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
@@ -379,7 +395,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
         weight_layout, global_num_tokens, broadcast_y,
-        numerics == 'trtllm', split4_combine_max_tokens
+        numerics == 'trtllm', split4_combine_max_tokens,
+        topk_format == 'packed', topk_first_expert
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,

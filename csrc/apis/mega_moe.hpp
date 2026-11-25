@@ -246,7 +246,9 @@ static void fp8_fp4_mega_moe(
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
     const bool& broadcast_y = false,
     const bool& trtllm_numerics = false,
-    const int& split4_combine_max_tokens = 0
+    const int& split4_combine_max_tokens = 0,
+    const bool& packed_topk = false,
+    const int& packed_topk_first_expert = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -436,6 +438,10 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(not blockwise_128 and not broadcast_y);
     }
     DG_HOST_ASSERT(split4_combine_max_tokens >= 0);
+    // Packed top-k words: one-rank groups of routed FP8xFP4 experts; ids are counted from `packed_topk_first_expert`
+    DG_HOST_ASSERT(packed_topk_first_expert >= 0 and (packed_topk or packed_topk_first_expert == 0));
+    DG_HOST_ASSERT(not packed_topk or (mma_kind == MmaKind::MXFP8FP4 and sym_buffer_ptrs.size() == 1 and
+                                       num_shared_experts == 0 and not post_expert_norm));
     DG_HOST_ASSERT(split4_combine_max_tokens == 0 or (trtllm_numerics and hidden % 128 == 0));
 
     // Dispatch into different architectures
@@ -473,7 +479,8 @@ static void fp8_fp4_mega_moe(
                                mma_kind,
                                use_fp8_combine, gran_k, weight_layout, global_num_tokens,
                                situ_beta, situ_linear_beta, broadcast_y,
-                               trtllm_numerics, split4_combine_max_tokens);
+                               trtllm_numerics, split4_combine_max_tokens, packed_topk,
+                               packed_topk_first_expert);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

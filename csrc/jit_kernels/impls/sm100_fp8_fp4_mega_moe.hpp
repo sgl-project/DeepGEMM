@@ -183,7 +183,9 @@ static void sm100_fp8_fp4_mega_moe(
     const float& situ_linear_beta = 25.0f,
     const bool& broadcast_y = false,
     const bool& trtllm_numerics = false,
-    const int& split4_combine_max_tokens = 0
+    const int& split4_combine_max_tokens = 0,
+    const bool& packed_topk = false,
+    const int& packed_topk_first_expert = 0
 ) {
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     const bool use_up_gate_block16 = weight_layout == MegaMoEWeightLayout::UpGateBlock16;
@@ -390,6 +392,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {}, {}, {}, {},
         {}, {}, {}, {}, {},
+        {}, {},
         {}, {}
     >);
 }};
@@ -427,7 +430,9 @@ static void __instantiate_kernel() {{
     config.gran_k,
     broadcast_y ? "true" : "false",
     trtllm_numerics ? "true" : "false",
-    split4_combine_max_tokens));
+    split4_combine_max_tokens,
+    packed_topk ? "true" : "false",
+    packed_topk_first_expert));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {

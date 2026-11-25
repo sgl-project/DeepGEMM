@@ -143,6 +143,10 @@ template <
     // FP32 accumulators (slot `s` -> accumulator `s % 4`, then `((a0 + a1) + a2) + a3`), as trtllm-gen's finalize
     // does for small calls; 0 keeps the single chain in slot order at every size.
     uint32_t kNumSplit4CombineMaxTokens = 0,
+    // Top-k inputs as packed words `(expert id << 16) | bf16(weight)` in the `topk_idx` region (one-rank groups)
+    bool kPackedTopk = false,
+    // With `kPackedTopk`: id of the group's first expert (a word's id minus this is the local expert index)
+    uint32_t kPackedTopkFirstExpert = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -555,6 +559,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
     const uint32_t tmem_base = ptx::ld_shared(&shared_storage.tmem_ptr_in_smem);
 
+    // Top-k readers. Packed format: int32 words at the start of the `topk_idx` region, expert ids counted from
+    // `kPackedTopkFirstExpert`. Bit 30 of a word selects the FP32 weight of `topk_weights` instead of the word's BF16 bits
+    DG_STATIC_ASSERT(not kPackedTopk or (kNumRanks == 1 and not kWithPostExpertNorm and kNumSharedExperts == 0),
+                     "Packed top-k inputs are for one-rank groups of routed experts");
+    const int* packed_topk_ptr = buffer.input_topk_idx_buffer.template get_base_ptr<int>();
+    const auto read_topk_expert_idx = [&](const uint32_t& i) -> int {
+        if constexpr (kPackedTopk) {
+            const int id = packed_topk_ptr[i] >> 16;
+            const int expert_idx = (id & 0x3fff) - static_cast<int>(kPackedTopkFirstExpert);
+            return (id >= 0 and expert_idx >= 0 and expert_idx < static_cast<int>(kNumExpertsPerRank)) ? expert_idx : -1;
+        } else {
+            return static_cast<int>(buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>()[i]);
+        }
+    };
+    const auto read_packed_topk_weight = [&](const uint32_t& i) -> float {
+        const int word = packed_topk_ptr[i];
+        if (word >= 0 and (word & 0x40000000))
+            return buffer.input_topk_weights_buffer.template get_base_ptr<float>()[i];
+        const uint16_t bits = static_cast<uint16_t>(word & 0xffff);
+        return __bfloat162float(*reinterpret_cast<const nv_bfloat16*>(&bits));
+    };
+
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
@@ -613,6 +639,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     scheduler.topk_idx = buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>();
     scheduler.num_call_tokens = num_tokens;
     scheduler.num_topk = kNumTopk;
+    scheduler.packed_topk = kPackedTopk;
+    scheduler.packed_topk_first_expert = static_cast<int>(kPackedTopkFirstExpert);
     constexpr bool kSendCountsFlagFits = kNumSpareCountWords >= 1;
     const bool use_send_counts = kSendCountsFlagFits and (kNumRanks == 1) and not use_local_counts;
     // Set by this CTA's dispatch warps after the dispatch grid sync: every SM's send count is in
@@ -679,8 +707,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-                    expert_idx = static_cast<int>(
-                        buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[i * kNumTopk + lane_idx]);
+                    expert_idx = read_topk_expert_idx(i * kNumTopk + lane_idx);
                     if (expert_idx >= 0)
                         process(i * kNumTopk + lane_idx, expert_idx);
                 }
@@ -833,7 +860,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t b = 0; b < 8; ++ b) {
                 const uint32_t id_idx = thread_idx + b * kNumDispatchThreads;
                 expert_ids[b] = id_idx < num_ids ?
-                    static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[id_idx]) : -1;
+                    read_topk_expert_idx(id_idx) : -1;
             }
             #pragma unroll
             for (uint32_t b = 0; b < 8; ++ b) {
@@ -1009,7 +1036,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t j = i * 32 + lane_idx;
                     pulled_sf[i] = j < kNumSFUint32 ? remote_sf_ptr[j] : 0;
                 }
-                const auto weight = *sym_buffer.map(
+                const float weight = kPackedTopk ? read_packed_topk_weight(src_token_topk_idx) : *sym_buffer.map(
                     buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 if constexpr (kUseXScales) {
@@ -1087,7 +1114,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight and x_scale first, so that their remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
+            const float weight = kPackedTopk ? read_packed_topk_weight(src_token_topk_idx) : *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
             if constexpr (kUseXScales) {
@@ -2833,9 +2860,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Each lane reads one slot's expert index and top-k weight
                     const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                        static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) : -1;
+                        read_topk_expert_idx(token_idx * kNumTopk + lane_idx) : -1;
                     const float stored_topk_weight = lane_idx < kNumTopk ?
-                        buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_idx * kNumTopk + lane_idx] : 0.0f;
+                        (kPackedTopk ? read_packed_topk_weight(token_idx * kNumTopk + lane_idx) :
+                         buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_idx * kNumTopk + lane_idx]) : 0.0f;
                     const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
                     // Wait for the ranks of the selected experts to finish their L2 writes
@@ -2903,7 +2931,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
+                read_topk_expert_idx(token_idx * kNumTopk + lane_idx) :
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
@@ -2957,7 +2985,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if constexpr (kWeightAtCombine) {
                 // trtllm numerics: lane `s` holds slot `s`'s top-k weight, the shared slot keeps 1
                 if (lane_idx < kNumTopk)
-                    slot_norm_scale = __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                    slot_norm_scale = kPackedTopk ? read_packed_topk_weight(token_idx * kNumTopk + lane_idx) :
+                                      __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
                                             token_idx * kNumTopk + lane_idx);
             }
             if constexpr (kFusedPostNormPartials) {

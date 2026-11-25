@@ -266,6 +266,17 @@ struct MegaMoEScheduler {
     bool is_scheduler_warp = false;
     const int64_t* topk_idx = nullptr;
     uint32_t num_call_tokens = 0, num_topk = 0;
+    // Packed top-k words (see the kernel): `topk_idx` then points at int32 words with ids counted from
+    // `packed_topk_first_expert`
+    bool packed_topk = false;
+    int packed_topk_first_expert = 0;
+    CUTLASS_DEVICE int read_topk_expert_idx(const uint32_t& i) const {
+        if (not packed_topk)
+            return static_cast<int>(topk_idx[i]);
+        const int id = reinterpret_cast<const int*>(topk_idx)[i] >> 16;
+        const int expert_idx = (id & 0x3fff) - packed_topk_first_expert;
+        return (id >= 0 and expert_idx >= 0 and expert_idx < static_cast<int>(kNumExpertsPerRank)) ? expert_idx : -1;
+    }
     // `token_masks[expert_idx * num_token_mask_words + w]`: bit `t % 32` of word `t / 32` is set if token `t` routes to the expert
     const uint32_t* token_masks = nullptr;
     uint32_t num_token_mask_words = 4;
@@ -508,7 +519,7 @@ struct MegaMoEScheduler {
             #pragma unroll
             for (uint32_t k = 0; k < 8; ++ k)
                 expert_ids[k] = (token_idx + k < num_call_tokens and lane_idx < num_topk) ?
-                    static_cast<int>(topk_idx[(token_idx + k) * num_topk + lane_idx]) : -1;
+                    read_topk_expert_idx((token_idx + k) * num_topk + lane_idx) : -1;
             #pragma unroll
             for (uint32_t k = 0; k < 8; ++ k) {
                 #pragma unroll
@@ -536,7 +547,7 @@ struct MegaMoEScheduler {
                     found_token_idx = w * 32 + __fns(mask, 0, token_idx_in_expert - num_seen + 1);
                 num_seen += count;
             }
-            const int slot_expert_idx = lane_idx < num_topk ? static_cast<int>(topk_idx[found_token_idx * num_topk + lane_idx]) : -1;
+            const int slot_expert_idx = lane_idx < num_topk ? read_topk_expert_idx(found_token_idx * num_topk + lane_idx) : -1;
             const uint32_t slot_mask = __ballot_sync(0xffffffff, slot_expert_idx == static_cast<int>(expert_idx));
             return found_token_idx * num_topk + static_cast<uint32_t>(__ffs(slot_mask) - 1);
         }
@@ -548,7 +559,7 @@ struct MegaMoEScheduler {
             #pragma unroll
             for (uint32_t k = 0; k < 8; ++ k)
                 expert_ids[k] = (token_idx + k < num_call_tokens and lane_idx < num_topk) ?
-                    static_cast<int>(topk_idx[(token_idx + k) * num_topk + lane_idx]) : -1;
+                    read_topk_expert_idx((token_idx + k) * num_topk + lane_idx) : -1;
             #pragma unroll
             for (uint32_t k = 0; k < 8; ++ k) {
                 const uint32_t slot_mask = __ballot_sync(0xffffffff, expert_ids[k] == static_cast<int>(expert_idx));

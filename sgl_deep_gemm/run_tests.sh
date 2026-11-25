@@ -237,6 +237,7 @@ MEGA_MOE_BLACKWELL=(
   test_mega_moe_sgl.py
   test_mega_moe_situ.py
   test_mega_moe_situ_equal_transform.py
+  test_mega_moe_packed_topk.py
   test_mega_moe_trtllm_numerics.py
   test_mega_moe_pull_lookup.py
   test_mega_moe_one_rank_barrier.py
@@ -291,6 +292,7 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
     run_test test_mega_moe_sgl.py --num-processes "${NPROC}"
   fi
   [ -f "${TESTS_DIR}/test_mega_moe_situ.py" ] && run_test test_mega_moe_situ.py --num-processes 1
+  [ -f "${TESTS_DIR}/test_mega_moe_packed_topk.py" ] && run_test test_mega_moe_packed_topk.py
   [ -f "${TESTS_DIR}/test_mega_moe_trtllm_numerics.py" ] && run_test test_mega_moe_trtllm_numerics.py --num-processes 1
   [ -f "${TESTS_DIR}/test_mega_moe_trtllm_numerics.py" ] && [ "${NPROC}" -ge 2 ] && run_test test_mega_moe_trtllm_numerics.py --num-processes 2
   [ -f "${TESTS_DIR}/test_mega_moe_pull_lookup.py" ] && run_test test_mega_moe_pull_lookup.py --num-processes 1
