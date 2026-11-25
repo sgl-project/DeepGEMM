@@ -208,7 +208,7 @@ for t in "${SINGLE_GPU_TESTS[@]}"; do
   fi
 done
 
-for t in test_mega_gate.py test_mega_mhc.py test_locality_domain.py; do
+for t in test_mega_gate.py test_mega_mhc.py test_locality_domain.py test_paged_mqa_logits_localized.py; do
   if [ "${ARCH_MAJOR}" -eq 10 ]; then
     SINGLE_GPU_JOBS+=("${t}")
   else
