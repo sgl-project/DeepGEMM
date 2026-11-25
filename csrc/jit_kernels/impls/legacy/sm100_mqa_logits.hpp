@@ -49,6 +49,50 @@ static void __instantiate_kernel() {{
     );
 }
 
+// Rows of the `(n, 2)` localized schedule; never those of the stock one (`num_sms + 1`)
+static int get_paged_mqa_logits_localized_metadata_num_rows(const int& num_sms, const int& num_requests) {
+    return static_cast<int>(layout::PagedMQALogitsLocalizedSchedule::get_num_rows(num_sms, num_requests));
+}
+
+// SM100 localized paged metadata: one slot per SM, each domain's work in its own slots
+static void sm100_paged_mqa_logits_localized_metadata(const torch::Tensor& context_lens,
+                                                      const torch::Tensor& block_table,
+                                                      const torch::Tensor& schedule_meta,
+                                                      const int& num_requests, const int& next_n,
+                                                      const int& page_kv, const int& num_local_pages,
+                                                      const int& num_sms, const int& min_num_localized_splits) {
+    constexpr int split_kv = 256;
+    constexpr int num_threads = 1024;
+    // Work prefix of both domains, request domains, homed work prefix, and warp sums
+    const int smem_size = (4 * num_requests + num_threads / 32) * static_cast<int>(sizeof(int));
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+
+    // Compile
+    const auto kernel = jit->compile("legacy_sm100_paged_mqa_logits_localized_metadata", std::format(R"(
+#include <deep_gemm/legacy/scheduler/sm100_paged_mqa_logits.cuh>
+
+using namespace deep_gemm::legacy;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sched::sm100_paged_mqa_logits_localized_metadata<
+        {}, {}, {}, {}
+    >);
+}};
+)", next_n, split_kv, page_kv, num_sms));
+
+    // Launch
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = smem_size,
+            .grid_dim = dim3(1, 1, 1),
+            .block_dim = dim3(num_threads, 1, 1),
+        },
+        num_requests, min_num_localized_splits, num_local_pages,
+        static_cast<int>(block_table.stride(0)),
+        context_lens.data_ptr<int>(), block_table.data_ptr<int>(), schedule_meta.data_ptr<int>()
+    );
+}
+
 // Costs in units of one K split of main-loop work
 static constexpr int kMQALogitsSplitCost = 1;
 static constexpr int kMQALogitsSegmentCost = 1;
@@ -320,8 +364,12 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
                                    const int& split_kv,
                                    const int& splits_per_chunk,
                                    const bool& is_mx_sf,
-                                   const at::ScalarType& qk_dtype) {
+                                   const at::ScalarType& qk_dtype,
+                                   const std::optional<torch::Tensor>& sm_locality_domains = std::nullopt) {
     const bool is_fp4 = qk_dtype == kPackedFP4;
+    // With the SM domains, `schedule_meta` is a localized schedule
+    const bool is_localized = sm_locality_domains.has_value();
+    DG_HOST_ASSERT(not is_localized or (not is_varlen and num_sms == jit->device.get_num_sms()));
 
     const int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
@@ -371,10 +419,47 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
     const int smem_size = get_mqa_logits_smem_size(
         num_heads, head_dim, is_mx_sf, qk_dtype, weights.scalar_type(),
         block_q, split_kv, num_q_stages, num_kv_stages, 3);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    // NOTES: the localized entry keeps its slot ring in static shared memory
+    DG_HOST_ASSERT(smem_size + (is_localized ? 256 : 0) <= SM100ArchSpec::smem_capacity);
 
     // Compile
-    const auto kernel = jit->compile("legacy_sm100_paged_mqa_logits", std::format(R"(
+    const auto kernel = is_localized ? jit->compile("legacy_sm100_paged_mqa_logits_localized", std::format(R"(
+#include <deep_gemm/legacy/impls/sm100_mqa_logits.cuh>
+
+using namespace deep_gemm::legacy;
+
+static_assert(sizeof(layout::MQALogitsSharedStorage<
+    {}, {}, {}, {}, {}, {}, {}, 3, {}, {}
+>) == {}, "Incorrect MQA logits shared-memory size");
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits_localized<
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {}, {}
+    >);
+}};
+)",
+    num_heads, head_dim, is_mx_sf ? "true" : "false",
+    block_q, split_kv, num_q_stages, num_kv_stages,
+    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+    smem_size,
+    tokens_per_request, num_heads,
+    head_dim, page_kv,
+    is_mx_sf ? "true" : "false",
+    is_context_lens_2d,
+    num_q_stages, num_kv_stages,
+    split_kv, splits_per_chunk,
+    num_specialized_threads, num_math_threads,
+    qk_dtype == kPackedFP4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t",
+    to_string(logits_dtype),
+    weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float")) :
+        jit->compile("legacy_sm100_paged_mqa_logits", std::format(R"(
 #include <deep_gemm/legacy/impls/sm100_mqa_logits.cuh>
 
 using namespace deep_gemm::legacy;
@@ -412,12 +497,27 @@ static void __instantiate_kernel() {{
     weights.scalar_type() == torch::kBFloat16 ? "__nv_bfloat16" : "float"));
 
     // Launch
+    const deep_jit::cuda::LaunchOptions launch_options = {
+        .num_smem_bytes = smem_size,
+        .grid_dim = dim3(num_sms, 1, 1),
+        .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
+    };
+    if (is_localized) {
+        jit->launch(
+            kernel, launch_options,
+            num_q_tokens_total,
+            logits_stride, block_table_stride,
+            context_lens.data_ptr<int>(), logits.data_ptr(),
+            block_table.data_ptr<int>(), schedule_meta.data_ptr<int>(),
+            sm_locality_domains.value().data_ptr<uint8_t>(),
+            tensor_map_q, tensor_map_sf_q,
+            tensor_map_kv, tensor_map_sf_kv,
+            tensor_map_weights
+        );
+        return;
+    }
     jit->launch(
-        kernel, {
-            .num_smem_bytes = smem_size,
-            .grid_dim = dim3(num_sms, 1, 1),
-            .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
-        },
+        kernel, launch_options,
         num_q_tokens_total,
         logits_stride, block_table_stride,
         context_lens.data_ptr<int>(), logits.data_ptr(),

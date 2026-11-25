@@ -444,6 +444,13 @@ Tensor dg_get_paged_mqa_logits_metadata_legacy(const Tensor& context_lens, int64
                                                            static_cast<int>(num_sms), indices);
 }
 
+Tensor dg_get_paged_mqa_logits_localized_metadata(const Tensor& context_lens, const Tensor& block_table,
+                                                  const Tensor& fused_kv_cache, int64_t num_sms,
+                                                  std::optional<int64_t> min_num_localized_splits) {
+    return attention::get_paged_mqa_logits_localized_metadata(context_lens, block_table, fused_kv_cache,
+                                                              static_cast<int>(num_sms), to_optional_int(min_num_localized_splits));
+}
+
 Tensor dg_fp8_fp4_mqa_logits_legacy(const Tensor& q, const OptTensor& q_sf, const Tensor& kv_data, const Tensor& kv_sf,
                                     const Tensor& weights, const Tensor& cu_seq_len_k_start,
                                     const Tensor& cu_seq_len_k_end, bool clean_logits, int64_t max_seqlen_k,
@@ -850,6 +857,8 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("get_mqa_logits_metadata(Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, int num_kv_tokens, "
           "int num_heads) -> Tensor");
     m.def("get_paged_mqa_logits_metadata_legacy(Tensor context_lens, int block_kv, int num_sms, Tensor? indices) -> Tensor");
+    m.def("get_paged_mqa_logits_localized_metadata(Tensor context_lens, Tensor block_table, Tensor fused_kv_cache, int num_sms, "
+          "int? min_num_localized_splits) -> Tensor");
     m.def("fp8_fp4_mqa_logits_legacy(Tensor q, Tensor? q_sf, Tensor kv_data, Tensor kv_sf, Tensor weights, "
           "Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, bool clean_logits, int max_seqlen_k, "
           "ScalarType logits_dtype, Tensor? schedule_meta) -> Tensor");
@@ -956,6 +965,7 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("fp8_fp4_paged_mqa_logits", &dg_fp8_fp4_paged_mqa_logits);
     m.impl("get_mqa_logits_metadata", &dg_get_mqa_logits_metadata);
     m.impl("get_paged_mqa_logits_metadata_legacy", &dg_get_paged_mqa_logits_metadata_legacy);
+    m.impl("get_paged_mqa_logits_localized_metadata", &dg_get_paged_mqa_logits_localized_metadata);
     m.impl("fp8_fp4_mqa_logits_legacy", &dg_fp8_fp4_mqa_logits_legacy);
     m.impl("fp8_fp4_paged_mqa_logits_legacy", &dg_fp8_fp4_paged_mqa_logits_legacy);
     m.impl("get_mqa_logits_metadata_legacy", &dg_get_mqa_logits_metadata_legacy);

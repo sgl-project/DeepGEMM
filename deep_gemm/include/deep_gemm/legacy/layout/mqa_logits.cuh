@@ -67,4 +67,31 @@ struct MQALogitsSharedStorage {
     uint32_t tmem_ptr_in_smem;
 };
 
+// Localized schedule of the paged kernel: each request belongs to one locality domain (the one that holds most of its
+// KV pages). Every domain's work is cut into slots of its own, and a CTA claims slots of its SM's domain first.
+// Words: [slot (start, end) pairs: 4 * kNumSlots][tail sentinel: 4][claim counter: 2][num domain-0 slots][flags]
+//        [request domain bits: ceil(num_requests / 32)]
+// A slot's start split also carries the slot's flags, so that a walk needs no load beyond the stock schedule's.
+struct PagedMQALogitsLocalizedSchedule {
+    // Too little work to pay for claims: the stock partition, with slot `i` for CTA `i`
+    static constexpr uint32_t kFlagStatic = 1u;
+    // CTA `i` walks slot `i` and nothing is claimed. Only a hint: any slot can be walked either way
+    static constexpr uint32_t kSlotFlagStatic = 1u << 31;
+    // The slot's domain
+    static constexpr uint32_t kSlotFlagDomain = 1u << 30;
+    // The slot holds requests of both domains (stock partition)
+    static constexpr uint32_t kSlotFlagAllDomains = 1u << 29;
+    static constexpr uint32_t kSlotSplitMask = kSlotFlagAllDomains - 1;
+
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_sentinel_offset(const uint32_t& num_slots) { return 4 * num_slots; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_counter_offset(const uint32_t& num_slots) { return 4 * num_slots + 4; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_num_local_slots_offset(const uint32_t& num_slots) { return 4 * num_slots + 6; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_flags_offset(const uint32_t& num_slots) { return 4 * num_slots + 7; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_request_domains_offset(const uint32_t& num_slots) { return 4 * num_slots + 8; }
+    // The buffer is an `(n, 2)` tensor of words, like the stock one
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_num_rows(const uint32_t& num_slots, const uint32_t& num_requests) {
+        return (get_request_domains_offset(num_slots) + (num_requests + 31) / 32 + 1) / 2;
+    }
+};
+
 } // namespace deep_gemm::legacy::layout

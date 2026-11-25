@@ -2,6 +2,8 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/legacy/layout/mqa_logits.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 // SM100 paged scheduler: metadata emits per-SM (q_token_idx, kv_split_idx) starts
@@ -222,14 +224,163 @@ void sm100_paged_mqa_logits_metadata(const uint32_t num_requests,
     }
 }
 
+// Localized schedule for a KV cache whose pages `[0, num_local_pages)` are homed in locality domain 0 and the rest in domain 1.
+// A request belongs to the domain that holds most of its pages (of up to `kNumMaxPageSamples` evenly spaced ones), and each
+// domain's work is balanced across its share of the slots. The schedule is static, i.e. the stock partition with slot `i`
+// for CTA `i`, where claims would not pay off: below `min_num_localized_splits` KV splits, or when less than
+// `kMinHomedWorkNum / kMinHomedWorkDen` of the work reads pages of its request's domain (pages from an allocator that
+// ignores the domains). `min_num_localized_splits == 0` always claims.
+template <uint32_t kNextN, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kNumSlots>
+CUTLASS_GLOBAL __launch_bounds__(kNumMetadataThreads, 1)
+void sm100_paged_mqa_logits_localized_metadata(const uint32_t num_requests,
+                                               const uint32_t min_num_localized_splits,
+                                               const uint32_t num_local_pages,
+                                               const uint32_t block_table_stride,
+                                               const uint32_t* context_lens,
+                                               const uint32_t* block_table,
+                                               uint32_t* schedule_meta) {
+    using Layout = layout::PagedMQALogitsLocalizedSchedule;
+    constexpr uint32_t kNumMaxPageSamples = 32;
+    constexpr uint32_t kMinHomedWorkNum = 7, kMinHomedWorkDen = 8;
+    const uint32_t thread_idx = threadIdx.x;
+    DG_DEVICE_ASSERT(blockDim.x == kNumMetadataThreads);
+    cudaGridDependencySynchronize();
+
+    extern __shared__ uint32_t smem[];
+    const auto work_prefix = smem;                                  // [2][num_requests], per domain
+    const auto request_domains = work_prefix + 2 * num_requests;    // [num_requests]
+    const auto homed_work_prefix = request_domains + num_requests;  // [num_requests]
+    const auto warp_sums = homed_work_prefix + num_requests;        // [kNumMetadataWarps]
+    const uint32_t num_q_tokens_total = num_requests * kNextN;
+
+    const auto get_context_len = [&](const uint32_t& request_idx) {
+        return context_lens[request_idx * kNextN + kNextN - 1];
+    };
+    const auto get_work = [&](const uint32_t& request_idx) {
+        return math::ceil_div(get_context_len(request_idx), SPLIT_KV) * kNextN;
+    };
+
+    // Total work decides whether claiming pays off; requests vote for their domain
+    for (uint32_t request_idx = thread_idx; request_idx < num_requests; request_idx += kNumMetadataThreads) {
+        const uint32_t work = get_work(request_idx);
+        work_prefix[request_idx] = work;
+        const uint32_t num_pages = math::ceil_div(get_context_len(request_idx), PAGE_KV);
+        const uint32_t num_samples = cute::min(num_pages, kNumMaxPageSamples);
+        const auto pages = block_table + request_idx * static_cast<uint64_t>(block_table_stride);
+        uint32_t num_remote_samples = 0;
+        for (uint32_t i = 0; i < num_samples; ++ i)
+            num_remote_samples += pages[static_cast<uint64_t>(i) * num_pages / num_samples] >= num_local_pages;
+        const uint32_t domain_idx = num_remote_samples * 2 > num_samples ? 1u : 0u;
+        request_domains[request_idx] = domain_idx;
+        // The share of the request's work that reads its domain's pages
+        const uint32_t num_homed_samples = domain_idx == 1 ? num_remote_samples : num_samples - num_remote_samples;
+        homed_work_prefix[request_idx] = num_samples == 0 ? work :
+            static_cast<uint32_t>(static_cast<uint64_t>(work) * num_homed_samples / num_samples);
+    }
+    __syncthreads();
+    if (num_requests > 0) {
+        metadata_prefix_scan(thread_idx, num_requests, work_prefix, warp_sums);
+        metadata_prefix_scan(thread_idx, num_requests, homed_work_prefix, warp_sums);
+    }
+    const uint32_t num_total_work = num_requests > 0 ? work_prefix[num_requests - 1] : 0u;
+    const uint32_t num_homed_work = num_requests > 0 ? homed_work_prefix[num_requests - 1] : 0u;
+    const bool is_static = min_num_localized_splits > 0 and
+        (num_total_work / kNextN < min_num_localized_splits or
+         static_cast<uint64_t>(num_homed_work) * kMinHomedWorkDen < static_cast<uint64_t>(num_total_work) * kMinHomedWorkNum);
+    __syncthreads();
+
+    // Per-domain work; a static schedule has all of it in domain 0
+    for (uint32_t request_idx = thread_idx; request_idx < num_requests; request_idx += kNumMetadataThreads) {
+        const uint32_t domain_idx = is_static ? 0u : request_domains[request_idx];
+        const uint32_t work = get_work(request_idx);
+        work_prefix[request_idx] = domain_idx == 0 ? work : 0u;
+        work_prefix[num_requests + request_idx] = domain_idx == 1 ? work : 0u;
+    }
+    __syncthreads();
+    uint32_t num_domain_work[2] = {0u, 0u};
+    if (num_requests > 0) {
+        metadata_prefix_scan(thread_idx, num_requests, work_prefix, warp_sums);
+        metadata_prefix_scan(thread_idx, num_requests, work_prefix + num_requests, warp_sums);
+        num_domain_work[0] = work_prefix[num_requests - 1];
+        num_domain_work[1] = work_prefix[2 * num_requests - 1];
+    }
+
+    // Slots in proportion to the work, at least one for a domain with any
+    uint32_t num_local_slots = kNumSlots;
+    if (num_domain_work[1] > 0) {
+        const uint64_t rounded = (static_cast<uint64_t>(num_domain_work[0]) * kNumSlots + num_total_work / 2) / num_total_work;
+        num_local_slots = cute::min(cute::max(static_cast<uint32_t>(rounded), num_domain_work[0] > 0 ? 1u : 0u), kNumSlots - 1);
+    }
+
+    // (q_token_idx, kv_split_idx) of work unit `w` of a domain, as in the stock schedule
+    const auto get_start = [&](const uint32_t* prefix, const uint32_t& w, uint32_t& q_token_idx, uint32_t& kv_split_idx) {
+        uint32_t lo = 0, hi = num_requests;
+        while (lo < hi) {
+            const uint32_t mid = (lo + hi) / 2;
+            if (prefix[mid] <= w)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < num_requests) {
+            q_token_idx = lo * kNextN;
+            kv_split_idx = (w - (lo == 0 ? 0u : prefix[lo - 1])) / kNextN;
+        } else {
+            // Tail sentinel: one-past-the-end
+            q_token_idx = num_q_tokens_total;
+            kv_split_idx = 0;
+        }
+    };
+    for (uint32_t slot_idx = thread_idx; slot_idx <= kNumSlots; slot_idx += kNumMetadataThreads) {
+        uint32_t words[4] = {num_q_tokens_total, 0u, num_q_tokens_total, 0u};
+        if (slot_idx < kNumSlots) {
+            const uint32_t domain_idx = slot_idx < num_local_slots ? 0u : 1u;
+            const uint32_t num_slots = domain_idx == 0 ? num_local_slots : kNumSlots - num_local_slots;
+            const uint32_t i = domain_idx == 0 ? slot_idx : slot_idx - num_local_slots;
+            const uint32_t q = num_domain_work[domain_idx] / num_slots, rem = num_domain_work[domain_idx] % num_slots;
+            const auto prefix = work_prefix + domain_idx * num_requests;
+            get_start(prefix, i * q + cute::min(i, rem), words[0], words[1]);
+            get_start(prefix, (i + 1) * q + cute::min(i + 1, rem), words[2], words[3]);
+            DG_DEVICE_ASSERT(words[1] <= Layout::kSlotSplitMask);
+            words[1] |= (is_static ? Layout::kSlotFlagStatic | Layout::kSlotFlagAllDomains : 0u) |
+                        (domain_idx != 0 ? Layout::kSlotFlagDomain : 0u);
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < 4; ++ i)
+            schedule_meta[slot_idx * 4 + i] = words[i];
+    }
+    const auto request_domain_words = schedule_meta + Layout::get_request_domains_offset(kNumSlots);
+    for (uint32_t word_idx = thread_idx; word_idx * 32 < num_requests; word_idx += kNumMetadataThreads) {
+        uint32_t word = 0;
+        for (uint32_t i = 0; i < 32 and word_idx * 32 + i < num_requests; ++ i)
+            word |= (is_static ? 0u : request_domains[word_idx * 32 + i]) << i;
+        request_domain_words[word_idx] = word;
+    }
+    if (thread_idx == 0) {
+        schedule_meta[Layout::get_counter_offset(kNumSlots)] = 0;
+        schedule_meta[Layout::get_counter_offset(kNumSlots) + 1] = 0;
+        schedule_meta[Layout::get_num_local_slots_offset(kNumSlots)] = num_local_slots;
+        schedule_meta[Layout::get_flags_offset(kNumSlots)] = is_static ? Layout::kFlagStatic : 0u;
+    }
+}
+
 // Device scheduler walks this SM's schedule range and implements SchedulerConcept
 // All specialized warps instantiate it and advance through the same task sequence
 template <bool kHasIndices> struct SM100IndicesStorage { const uint32_t* indices; };
 template <> struct SM100IndicesStorage<false> {};
 
+// A localized walk only visits the requests of its slot's locality domain, or all of them in a static schedule
+template <bool kIsLocalized> struct SM100RequestDomainStorage {
+    static constexpr uint32_t kAllDomains = 2;
+    const uint32_t* request_domain_words;
+    uint32_t domain_idx;
+};
+template <> struct SM100RequestDomainStorage<false> {};
+
 template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
-          uint32_t kNumHeads, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk>
-struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
+          uint32_t kNumHeads, uint32_t SPLIT_KV, uint32_t PAGE_KV, uint32_t kSplitsPerChunk,
+          bool kIsLocalized = false>
+struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen>, SM100RequestDomainStorage<kIsLocalized> {
     // SchedulerConcept descriptors
     static constexpr bool kIsPaged = true;
     static constexpr bool kIsVarlenLayout = kIsVarlen;
@@ -280,8 +431,17 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         if constexpr (kIsVarlen)
             this->indices = indices;
 
-        const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
+        auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
         const auto end = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx + 1];
+        if constexpr (kIsLocalized) {
+            // The start split of a localized slot carries the slot's flags
+            // NOTES: the grid has one CTA per slot
+            using Layout = layout::PagedMQALogitsLocalizedSchedule;
+            this->request_domain_words = schedule_meta + Layout::get_request_domains_offset(gridDim.x);
+            this->domain_idx = (start.y & Layout::kSlotFlagAllDomains) != 0 ? this->kAllDomains :
+                               ((start.y & Layout::kSlotFlagDomain) != 0 ? 1u : 0u);
+            start.y &= Layout::kSlotSplitMask;
+        }
         end_q_token_idx = end.x;
         end_kv_split_idx = end.y;
 
@@ -296,6 +456,20 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
         cur_q_block_token_base = 0;
         cur_num_block_tokens = 1;
         cur_request_num_kv_pages = 0;
+    }
+
+    // First request at or after `q_token_idx` that this walk visits
+    CUTLASS_DEVICE uint32_t get_next_request_q_token(uint32_t q_token_idx) const {
+        if constexpr (kIsLocalized) {
+            DG_STATIC_ASSERT(not kIsVarlen, "Localized schedules have a regular request grid");
+            while (this->domain_idx != this->kAllDomains and q_token_idx < num_q_tokens_total) {
+                const uint32_t request_idx = q_token_idx / kNextN;
+                if (((this->request_domain_words[request_idx / 32] >> (request_idx % 32)) & 1u) == this->domain_idx)
+                    break;
+                q_token_idx += kNextN;
+            }
+        }
+        return q_token_idx;
     }
 
     // Exclusive split bound for the current request, clamped at the next SM start
@@ -335,7 +509,7 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
                     done = true;
                 } else {
                     // Move to next request owned from split 0
-                    const uint32_t next_q_token = cur.q_token_start + cur.num_q_tokens;
+                    const uint32_t next_q_token = get_next_request_q_token(cur.q_token_start + cur.num_q_tokens);
                     cur_kv_split_base = 0;
                     if (next_q_token >= num_q_tokens_total)
                         done = true;
@@ -378,6 +552,111 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
                                            const uint32_t& kv_split_idx,
                                            const uint32_t& math_thread_idx) const {
         return (kv_split_base + kv_split_idx) * SPLIT_KV + math_thread_idx;
+    }
+};
+
+// Walks the slots that this CTA claims from a localized schedule. Slots `[0, num_local_slots)` hold domain 0's work and
+// the rest domain 1's; domain-0 CTAs claim from the front and domain-1 CTAs from the back of one counter, so a CTA
+// reads its own domain's pages while there are any and the other domain's after that. The KV loader warp claims,
+// since it runs ahead of the pipeline, and publishes the slot sequence in a shared ring for the other warps.
+// Every (request, KV split) is still computed exactly once, by the unchanged main loop.
+template <typename Inner, uint32_t kNumSlotsPerRing, uint32_t kClaimerWarpIdx>
+struct SM100PagedMQALogitsClaimingScheduler : Inner {
+    using Layout = layout::PagedMQALogitsLocalizedSchedule;
+    // Shared words: [kNumSlotsPerRing] slots (-1 when none is left), the number published, the SM's domain
+    static constexpr uint32_t kNumRingWords = kNumSlotsPerRing + 2;
+    // `domain_idx` of a walk that claims nothing more
+    static constexpr uint32_t kEnded = Inner::kAllDomains + 1;
+
+    const uint32_t* schedule_meta;
+    volatile int* ring;
+    uint32_t num_acquired;
+
+    // The walk starts exhausted
+    // NOTES: slot `i` owns the pair of metadata entries starting at `2 * i`; this CTA has read slot `cta_idx` already
+    CUTLASS_DEVICE SM100PagedMQALogitsClaimingScheduler(const uint32_t& cta_idx,
+                                                        const uint32_t* context_lens,
+                                                        const uint32_t* schedule_meta,
+                                                        const uint32_t* block_table,
+                                                        const uint32_t& block_table_stride,
+                                                        const uint32_t& num_q_tokens_total,
+                                                        volatile int* ring)
+        : Inner(cta_idx * 2, context_lens, schedule_meta, nullptr,
+                block_table, block_table_stride, num_q_tokens_total),
+          schedule_meta(schedule_meta), ring(ring), num_acquired(0) {
+        this->done = true;
+    }
+
+    // One claim on the two-ended counter (low word: domain 0's claims, high word: domain 1's)
+    CUTLASS_DEVICE static int claim(const uint32_t* schedule_meta, const uint32_t& sm_domain_idx) {
+        const uint32_t num_slots = gridDim.x, num_ctas = gridDim.x;
+        const auto counter = reinterpret_cast<const uint64_t*>(schedule_meta + Layout::get_counter_offset(num_slots));
+        const uint64_t count = ptx::atomic_add(counter, sm_domain_idx == 0 ? 1ull : (1ull << 32));
+        const uint32_t num_front = static_cast<uint32_t>(count), num_back = static_cast<uint32_t>(count >> 32);
+        // Every CTA fails exactly once, so the last claim of a launch leaves the counter ready for the next one
+        if (num_front + num_back == num_slots + num_ctas - 1)
+            *const_cast<uint64_t*>(counter) = 0;
+        if (num_front + num_back >= num_slots)
+            return -1;
+        return static_cast<int>(sm_domain_idx == 0 ? num_front : num_slots - 1 - num_back);
+    }
+
+    // Claim the next slot with any work and publish it as slot `idx` of this CTA's sequence (-1 when none is left)
+    CUTLASS_DEVICE static void claim_and_publish(const uint32_t* schedule_meta, volatile int* ring,
+                                                 const uint32_t& idx, const uint32_t& num_q_tokens_total) {
+        const uint32_t sm_domain_idx = static_cast<uint32_t>(ring[kNumSlotsPerRing + 1]);
+        int slot_idx;
+        while ((slot_idx = claim(schedule_meta, sm_domain_idx)) >= 0) {
+            const auto start = reinterpret_cast<const uint2*>(schedule_meta)[slot_idx * 2];
+            const auto end = reinterpret_cast<const uint2*>(schedule_meta)[slot_idx * 2 + 1];
+            const bool empty = start.x >= num_q_tokens_total or
+                               (start.x == end.x and (start.y & Layout::kSlotSplitMask) >= end.y);
+            if (not empty)
+                break;
+        }
+        ring[idx % kNumSlotsPerRing] = slot_idx;
+        ring[kNumSlotsPerRing] = static_cast<int>(idx + 1);
+    }
+
+    // At kernel entry, before the first CTA-wide barrier: the first claim overlaps with the CTA's setup
+    // NOTES: only once the grid dependency, which may be the schedule's writer, has completed
+    CUTLASS_DEVICE static void init_ring(const uint32_t* schedule_meta, volatile int* ring,
+                                         const uint32_t& sm_domain_idx, const uint32_t& num_q_tokens_total) {
+        if (threadIdx.x == kClaimerWarpIdx * 32) {
+            ring[kNumSlotsPerRing + 1] = static_cast<int>(sm_domain_idx);
+            claim_and_publish(schedule_meta, ring, 0, num_q_tokens_total);
+        }
+    }
+
+    // Slot `idx` of this CTA's sequence, or -1
+    CUTLASS_DEVICE static int acquire(const uint32_t* schedule_meta, volatile int* ring,
+                                      const uint32_t& idx, const uint32_t& num_q_tokens_total) {
+        if (idx > 0 and threadIdx.x / 32 == kClaimerWarpIdx) {
+            if (ptx::get_lane_idx() == 0)
+                claim_and_publish(schedule_meta, ring, idx, num_q_tokens_total);
+            __syncwarp();
+        } else {
+            while (ring[kNumSlotsPerRing] <= static_cast<int>(idx)) {}
+        }
+        return ring[idx % kNumSlotsPerRing];
+    }
+
+    template <bool kIsCompressedLogits = false>
+    CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_split_base, uint32_t& num_kv_splits,
+                                     uint32_t* seq_k_start = nullptr, uint32_t* seq_k_end = nullptr) {
+        while (true) {
+            if (Inner::template next_q_block<kIsCompressedLogits>(q_block_idx, kv_split_base, num_kv_splits, seq_k_start, seq_k_end))
+                return true;
+            if (this->domain_idx == kEnded)
+                return false;
+            const int slot_idx = acquire(schedule_meta, ring, num_acquired ++, this->num_q_tokens_total);
+            if (slot_idx < 0) {
+                this->domain_idx = kEnded;
+                return false;
+            }
+            static_cast<Inner&>(*this) = Inner(static_cast<uint32_t>(slot_idx) * 2, this->context_lens, schedule_meta, nullptr,
+                                               this->block_table, this->block_table_stride, this->num_q_tokens_total);
+        }
     }
 };
 
