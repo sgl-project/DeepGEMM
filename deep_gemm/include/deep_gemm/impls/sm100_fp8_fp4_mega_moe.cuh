@@ -583,10 +583,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+    // Combine: a token row is reduced in 1 or 2 chunks; 3 chunk slots per warp (2 load stages and 1 store)
+    // NOTES: restrict on both smem and register
+    constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
+    constexpr uint32_t kNumChunkSlots = 3;
+    constexpr uint32_t kNumMaxRegistersForBuffer = 128;
+    constexpr uint32_t kNumCombineChunks =
+        kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
+
+    // A one-chunk BF16 combine computes each slot's post-expert norm from the row it loads into shared memory
+    constexpr bool kPostNormInCombine = kWithPostExpertNorm and not kUseFp8Combine and kNumCombineChunks == 1;
+
     // Weight-first folds the producing rank's `post_expert_norm_weight` into the sum of
     // squares, so that weight must be identical on every rank.
     // ponytail: BF16 combine only; the FP8 combine would have to fold in its per-tile SF
-    constexpr bool kFusedPostNormPartials = kWithPostExpertNorm and not kUseFp8Combine;
+    constexpr bool kFusedPostNormPartials = kWithPostExpertNorm and not kUseFp8Combine and not kPostNormInCombine;
 
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
@@ -2560,17 +2571,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers
-        constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
-        // 3 slots of chunk is needed: 2 load stages and 1 store
-        constexpr uint32_t kNumChunkSlots = 3;
-        constexpr uint32_t kNumMaxRegistersForBuffer = 128;
-
         // NOTES: either 1 or 2 chunks for simplicity
-        // NOTES: Restrict on both smem and register
-        constexpr uint32_t kNumChunks =
-            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= kNumReusableSmemBytes and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
+        constexpr uint32_t kNumChunks = kNumCombineChunks;
         constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
@@ -2605,6 +2609,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
 
+        // Post norm: results reuse a load buffer, and w goes to the reusable shared memory
+        constexpr uint32_t kNumCombineBuffersPerWarp = kPostNormInCombine ? 2 : 3;
+        // NOTES: the dispatch warps may still use the dispatch union at the start until the barrier below
+        DG_STATIC_ASSERT(not kPostNormInCombine or
+                         (kNumEpilogueWarps * 2 * kNumChunkBytes >= offsetof(SharedStorage, smem_d) and
+                          kNumEpilogueWarps * 2 * kNumChunkBytes + kHidden * sizeof(float) <= kNumReusableSmemBytes),
+                         "No shared memory for the post-norm weight");
+        const auto smem_norm_w = math::advance_ptr<float4>(smem_buffer, kNumEpilogueWarps * kNumCombineBuffersPerWarp * kNumChunkBytes);
+        const auto load_norm_w = [&](const uint32_t& j, const uint32_t& h) -> float4 {
+            return smem_norm_w[(j * 2 + h) * 32 + lane_idx];
+        };
+        // A CTA without combine tokens (`sm_idx >= num_tokens`, one chunk) skips the copies
+        if constexpr (kPostNormInCombine and kPostNormHasWeight) {
+            for (uint32_t i = epilogue_thread_idx; sm_idx < num_tokens and i < kHidden / 4; i += kNumEpilogueThreads) {
+                const uint32_t j = i / 64, h = (i / 32) % 2, l = i % 32;
+                ptx::cp_async_cg<256>(reinterpret_cast<const uint4*>(post_expert_norm_weight + (j * 32 + l) * 8 + h * 4),
+                                      reinterpret_cast<uint4*>(smem_norm_w + i));
+            }
+        }
+
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
         uint64_t peer_grid_idx = 0;
@@ -2620,6 +2644,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+
+        // Post norm: wait for this thread's weight copies; the barrier below makes them visible to the other warps
+        if constexpr (kPostNormInCombine and kPostNormHasWeight)
+            asm volatile("cp.async.wait_all;" ::: "memory");
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -2643,7 +2671,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint64_t peer_rank_bit = (kNumRanks <= 64 and is_routed) ? (1ull << peer_rank) : 0ull;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(peer_rank);
             // Without the post-expert norm, each slot waits for its own rank right before its load
-            constexpr bool kWaitPerSlot = not kWithPostExpertNorm;
+            constexpr bool kWaitPerSlot = not kWithPostExpertNorm or kPostNormInCombine;
             const auto print_peers_timeout = [&]() {
                 printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx);
             };
@@ -2696,6 +2724,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const float inv_rms = rsqrtf(sum_sq / static_cast<float>(kHidden) + kPostNormEps);
                 slot_norm_scale = my_topk_weight * inv_rms;
                 __syncwarp();
+            } else if constexpr (kPostNormInCombine) {
+                // Lane `s` keeps slot `s`'s top-k weight; the slot's inv_rms is applied once its row is loaded
+                const float my_topk_weight = lane_idx < kNumTopk ?
+                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                          token_idx * kNumTopk + lane_idx) : 0.0f;
+                slot_norm_scale = my_topk_weight;
             } else if constexpr (kWithPostExpertNorm) {
                 const float my_topk_weight = lane_idx < kNumTopk ?
                     __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
@@ -2795,6 +2829,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 buffer.combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
                                 chunk_byte_offset);
+                            // Post norm: the previous result is stored from a load buffer, so its store must finish reading first
+                            if constexpr (kPostNormInCombine)
+                                ptx::tma_store_wait<0>();
                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumLoadBytesPerChunk);
                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumLoadBytesPerChunk);
                         }
@@ -2820,6 +2857,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if constexpr (kWithPostExpertNorm)
                         slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
                                                  static_cast<uint32_t>(active_slot));
+                    if constexpr (kPostNormInCombine) {
+                        // Row sum of squares (weight-first: of `w * x`)
+                        float2 sum_sq2[2] = {};
+                        #pragma unroll 2
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                            const auto words = reinterpret_cast<const uint32_t*>(&uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                                float2 v = make_float2(__uint_as_float(words[l] << 16), __uint_as_float(words[l] & 0xffff0000u));
+                                if constexpr (kPostNormHasWeight and kPostNormWeightFirst) {
+                                    const float4 w4 = load_norm_w(j, l / 2);
+                                    v = __fmul2_rn(v, l % 2 == 0 ? make_float2(w4.x, w4.y) : make_float2(w4.z, w4.w));
+                                }
+                                sum_sq2[l % 2] = __ffma2_rn(v, v, sum_sq2[l % 2]);
+                            }
+                        }
+                        float sum_sq = (sum_sq2[0].x + sum_sq2[0].y) + (sum_sq2[1].x + sum_sq2[1].y);
+                        #pragma unroll
+                        for (uint32_t d = 16; d > 0; d >>= 1)
+                            sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, d);
+                        slot_scale *= rsqrtf(sum_sq / static_cast<float>(kHidden) + kPostNormEps);
+                    }
 
                     if constexpr (kUseFp8Combine) {
                         // Per-slot SF base for this token.
@@ -2868,9 +2928,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
                                 auto& acc = reduced[j * kNumElemsPerUint4 + l];
                                 if constexpr (kWithPostExpertNorm) {
-                                    const float2 pair = __bfloat1622float2(bf16_values[l]);
-                                    acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
-                                    acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
+                                    const uint32_t word = reinterpret_cast<const uint32_t*>(&uint4_values)[l];
+                                    const float2 pair = make_float2(__uint_as_float(word << 16), __uint_as_float(word & 0xffff0000u));
+                                    acc = __ffma2_rn(pair, make_float2(slot_scale, slot_scale), acc);
                                 } else {
                                     ptx::accumulate(acc, bf16_values[l]);
                                 }
@@ -2884,7 +2944,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 
                 // Both norm forms reduce to `w * sum_k(inv_rms_k * topk_weight_k * x_k)`.
-                if constexpr (kPostNormHasWeight) {
+                if constexpr (kPostNormHasWeight and kPostNormInCombine) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
+                        #pragma unroll
+                        for (uint32_t h = 0; h < 2; ++ h) {
+                            const float4 w4 = load_norm_w(j, h);
+                            auto& acc = reduced[j * kNumF32PairsPerLoadUint4 + h * 2];
+                            acc = __fmul2_rn(acc, make_float2(w4.x, w4.y));
+                            (&acc)[1] = __fmul2_rn((&acc)[1], make_float2(w4.z, w4.w));
+                        }
+                    }
+                } else if constexpr (kPostNormHasWeight) {
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
                         const uint32_t base_elem_idx = chunk * kNumLoadElemsPerChunk +
@@ -2897,6 +2968,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                 }
+
+                // Post norm: the last consumed load buffer (no load in flight after the final slot) holds the result
+                const auto result_buffer = kPostNormInCombine ? combine_load_buffer[load_stage_idx ^ 1] : combine_store_buffer;
 
                 // Cast & write to smem store-buffer.
                 // BF16 path: kNumUint4PerLane stores, mapping accumulator[j*4+l] → store-uint4 j.
@@ -2919,9 +2993,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                         // Layout: each input uint4 j (16 elements) → 2 BF16 uint4 at
                         //   indices (j * 32 + lane_idx) * 2 + {0, 1}.
-                        ptx::st_shared(combine_store_buffer + (j * 32 + lane_idx) * 2 + 0,
+                        ptx::st_shared(result_buffer + (j * 32 + lane_idx) * 2 + 0,
                                        lo.x, lo.y, lo.z, lo.w);
-                        ptx::st_shared(combine_store_buffer + (j * 32 + lane_idx) * 2 + 1,
+                        ptx::st_shared(result_buffer + (j * 32 + lane_idx) * 2 + 1,
                                        hi.x, hi.y, hi.z, hi.w);
                     }
                 } else {
@@ -2936,7 +3010,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             ptx::tma_store_wait<0>();
                             __syncwarp();
                         }
-                        ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
+                        ptx::st_shared(result_buffer + j * 32 + lane_idx,
                                        casted.x, casted.y, casted.z, casted.w);
                     }
                 }
@@ -2949,7 +3023,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         y, (static_cast<uint64_t>(sym_buffer.rank_idx) * num_tokens + token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes);
                     #pragma unroll
                     for (uint32_t j = lane_idx; j < kNumChunkUint4; j += 32) {
-                        const auto value = ptx::ld_shared(combine_store_buffer + j);
+                        const auto value = ptx::ld_shared(result_buffer + j);
                         #pragma unroll
                         for (uint32_t r = 0; r < kNumRanks; ++ r)
                             *sym_buffer.map(dst_ptr + j, (sym_buffer.rank_idx + r) % kNumRanks) = value;
@@ -2959,7 +3033,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
                         math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk * kNumChunkBytes),
-                        combine_store_buffer, kNumChunkBytes);
+                        result_buffer, kNumChunkBytes);
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
