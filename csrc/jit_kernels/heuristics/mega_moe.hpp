@@ -204,8 +204,9 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const float num_covered_tokens = num_expected_tokens + sigma_mult * std::sqrt(num_expected_tokens);
 
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
-    // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
-    // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
+    // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows
+    // (NVFP4 caps them at 192 rows). A single 240-row block per expert only pays off with many local experts
+    // (about 14 or more blocks per rank).
     // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
     // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
     int block_m = num_expected_tokens <= 2 ? 16 : 64;
@@ -218,6 +219,10 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
             if (num_blocks * candidate >= num_covered_tokens)
                 break;
         }
+        // NVFP4: 192-row tiles measured faster than 240-row tiles at uniform and skewed routing,
+        // including loads where they need more M blocks
+        if (mma_kind == MmaKind::NVFP4)
+            block_m = std::min(block_m, 192);
     }
 
     // Must divide `WG_BLOCK_M` (= block_m / 2), which pins each arm: 240 -> 120 and
