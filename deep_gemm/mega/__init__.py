@@ -311,7 +311,16 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      post_expert_norm_weight: Optional[torch.Tensor] = None,
                      post_expert_norm_eps: float = 1e-6,
                      post_expert_norm_weight_first: bool = False,
-                     broadcast_y: bool = False):
+                     broadcast_y: bool = False,
+                     numerics: str = 'default',
+                     split4_combine_max_tokens: int = 0):
+    """
+    `numerics='trtllm'` (FP8xFP4 SiTU, routed experts only) places the roundings where FlashInfer's trtllm-gen MoE
+    places them: top-k weight at the combine, SiTU on the FP32 accumulators, literal SiTU gate. The function is the
+    same; outputs differ from `'default'` by rounding only. With it, `split4_combine_max_tokens=N` sums a token's
+    top-k slots in four interleaved accumulators for calls of at most N tokens (0: one chain at every size).
+    NOTES: the small-call order is not batch-invariant across N; pass 0 for the pieces of a call the caller split.
+    """
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     if broadcast_y:
@@ -322,6 +331,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             y.storage_offset() == gathered_y.storage_offset(), \
             '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+    if numerics not in ('default', 'trtllm'):
+        raise ValueError(f"`numerics` must be 'default' or 'trtllm'; got {numerics!r}")
+    if numerics == 'trtllm' and (sym_buffer.mma_type != 'fp8xfp4' or activation != 'situ'):
+        raise ValueError("`numerics='trtllm'` is only supported for `fp8xfp4` with `activation='situ'`")
+    if split4_combine_max_tokens != 0 and numerics != 'trtllm':
+        raise ValueError("`split4_combine_max_tokens` requires `numerics='trtllm'`")
     if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
         raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA')
     if weight_layout in ('gate_up_interleaved', 'up_gate_block16') and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
@@ -363,7 +378,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
-        weight_layout, global_num_tokens, broadcast_y
+        weight_layout, global_num_tokens, broadcast_y,
+        numerics == 'trtllm', split4_combine_max_tokens
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,

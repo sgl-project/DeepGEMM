@@ -244,7 +244,9 @@ static void fp8_fp4_mega_moe(
     const bool& post_expert_norm_weight_first = false,
     const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const bool& trtllm_numerics = false,
+    const int& split4_combine_max_tokens = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -426,6 +428,16 @@ static void fp8_fp4_mega_moe(
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales] = slice(sym_buffer);
     const bool use_fp8_combine = deep_jit::get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
+    // trtllm-gen numerics: defined for routed FP8xFP4 SiTU experts reduced by the BF16 combine
+    if (trtllm_numerics) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::MXFP8FP4 and activation_kind == MegaMoEActivation::SiTU);
+        DG_HOST_ASSERT(num_shared_experts == 0 and not post_expert_norm and not use_fp8_combine);
+        // Not validated against trtllm-gen: blockwise-128 FP8 SFs, the broadcast output
+        DG_HOST_ASSERT(not blockwise_128 and not broadcast_y);
+    }
+    DG_HOST_ASSERT(split4_combine_max_tokens >= 0);
+    DG_HOST_ASSERT(split4_combine_max_tokens == 0 or (trtllm_numerics and hidden % 128 == 0));
+
     // Dispatch into different architectures
     if (arch_major == 10) {
         sm100_fp8_fp4_mega_moe(y,
@@ -460,7 +472,8 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_eps,
                                mma_kind,
                                use_fp8_combine, gran_k, weight_layout, global_num_tokens,
-                               situ_beta, situ_linear_beta, broadcast_y);
+                               situ_beta, situ_linear_beta, broadcast_y,
+                               trtllm_numerics, split4_combine_max_tokens);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

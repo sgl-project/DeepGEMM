@@ -25,9 +25,13 @@ namespace deep_gemm {
 //   => 4 * tanh(g/4) * sigmoid(g) = 2T(1+T)^2 / (1 + T^2)
 // needs beta == 4, and the tanh-only up branch needs linear_beta == 25. Both helpers fall back to
 // the literal definition for any other pair, so a different config stays correct -- just slower.
-template <bool kFastMath, float kSituBeta, float kSituLinearBeta>
+//
+// `kLiteralGate` selects the literal gate for the K3 pair as well. Both forms are the same function in exact
+// arithmetic; in FP32 they round differently, and the literal form is the one whose FC2 input codes match
+// FlashInfer's trtllm-gen MoE (`kUseTrtllmNumerics` below).
+template <bool kFastMath, float kSituBeta, float kSituLinearBeta, bool kLiteralGate = false>
 __forceinline__ __device__ float2 sm100_fp8_fp4_mega_moe_situ_gate(float2 gate) {
-    if constexpr (kSituBeta == 4.0f and kSituLinearBeta == 25.0f) {
+    if constexpr (not kLiteralGate and kSituBeta == 4.0f and kSituLinearBeta == 25.0f) {
         const float2 one = {1.0f, 1.0f};
         const float2 q = __fmul2_rn(gate, make_float2(0.25f, 0.25f));
         float2 t;
@@ -131,6 +135,14 @@ template <
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kBroadcastY = false,
+    // FlashInfer trtllm-gen numerics (opt-in): the top-k weight is applied at the combine instead of the L1
+    // epilogue, SiTU reads the FP32 accumulators instead of their BF16 rounding, and the SiTU gate uses its
+    // literal definition. Same function up to rounding; only the placement of the roundings changes.
+    bool kUseTrtllmNumerics = false,
+    // With `kUseTrtllmNumerics`: calls of at most this many tokens sum a token's top-k slots in four interleaved
+    // FP32 accumulators (slot `s` -> accumulator `s % 4`, then `((a0 + a1) + a2) + a3`), as trtllm-gen's finalize
+    // does for small calls; 0 keeps the single chain in slot order at every size.
+    uint32_t kNumSplit4CombineMaxTokens = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -207,6 +219,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                       (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
                                                       cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
                      "Gate/up interleaved weight layout requires routed NVFP4 or FP8xFP8 experts");
+
+    // trtllm-gen numerics switches
+    // NOTES: the post-expert norm already applies the top-k weight in the combine
+    constexpr bool kWeightAtCombine = kUseTrtllmNumerics and not kWithPostExpertNorm;
+    constexpr bool kSituOnFp32 = kUseTrtllmNumerics and kUseSitu;
+    DG_STATIC_ASSERT(kNumSplit4CombineMaxTokens == 0 or
+                     (kWeightAtCombine and not kUseFp8Combine and kNumSharedExperts == 0 and kHidden % 128 == 0 and
+                      not kBroadcastY),
+                     "Split-4 combine needs trtllm numerics, the BF16 combine, no shared experts and a local output");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -2018,9 +2039,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
                         // Load weights from global into register cache per 32 tokens
-                        // NOTES: the post-expert norm applies the top-k weight in the combine
+                        // NOTES: the post-expert norm and the trtllm numerics apply the top-k weight in the combine
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not kWithPostExpertNorm and not task_info.is_shared() and
+                        if (not kWithPostExpertNorm and not kWeightAtCombine and not task_info.is_shared() and
                             (j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
@@ -2051,7 +2072,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from register cache
                         float2 weights = {1.0f, 1.0f};
-                        if constexpr (not kWithPostExpertNorm) {
+                        if constexpr (not kWithPostExpertNorm and not kWeightAtCombine) {
                             weights = {
                                 ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                                 ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
@@ -2087,9 +2108,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             constexpr bool kIsOAISwiGLU = kSwiGLUAlpha != 0.0f;
                             auto gate = __bfloat1622float2(bf16_gate);
                             auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kSituOnFp32) {
+                                // trtllm-gen feeds the FP32 accumulators to SiTU (no clamp to skip: SiTU soft-clips)
+                                gate = fp32_values[k * 2 + kGateSlot];
+                                up = fp32_values[k * 2 + kUpSlot];
+                            }
                             if constexpr (kUseSitu) {
                                 // Tanh-bounded gate and soft-clipped up branch.
-                                gate = sm100_fp8_fp4_mega_moe_situ_gate<kFastMath, kSituBeta, kSituLinearBeta>(gate);
+                                gate = sm100_fp8_fp4_mega_moe_situ_gate<kFastMath, kSituBeta, kSituLinearBeta, kUseTrtllmNumerics>(gate);
                                 up = sm100_fp8_fp4_mega_moe_situ_up<kFastMath, kSituBeta, kSituLinearBeta>(up);
                             } else {
                                 // SwiGLU: silu(gate) * up
@@ -2638,10 +2664,89 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
+
+        // trtllm-gen numerics, small calls: four interleaved FP32 accumulators per element.
+        // One warp per (token, 128-element sub-chunk): every lane issues its 8-byte loads of all selected slot rows
+        // at once (the rows were written before the grid sync above, or are waited for below), then accumulates
+        // slot `s` into accumulator `s % 4` and reduces `((a0 + a1) + a2) + a3`.
+        uint32_t num_combine_token_chunks = num_tokens * kNumChunks;
+        if constexpr (kNumSplit4CombineMaxTokens > 0) {
+            if (num_tokens <= kNumSplit4CombineMaxTokens) {
+                // The main combine below is skipped
+                num_combine_token_chunks = 0;
+
+                constexpr uint32_t kNumSubChunkElems = 128;
+                constexpr uint32_t kNumSubChunks = kHidden / kNumSubChunkElems;
+                for (uint32_t item_idx = epilogue_warp_idx * kNumSMs + sm_idx; item_idx < num_tokens * kNumSubChunks; item_idx += kNumSMs * kNumEpilogueWarps) {
+                    const uint32_t token_idx = item_idx / kNumSubChunks;
+                    const uint32_t sub_chunk_idx = item_idx % kNumSubChunks;
+
+                    // Each lane reads one slot's expert index and top-k weight
+                    const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+                        static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) : -1;
+                    const float stored_topk_weight = lane_idx < kNumTopk ?
+                        buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_idx * kNumTopk + lane_idx] : 0.0f;
+                    const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+
+                    // Wait for the ranks of the selected experts to finish their L2 writes
+                    const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+                    const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                        is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+                    comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                                     [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
+                    // All slot loads in flight before the first use
+                    // NOTES: not `__ldg`, peers write these rows over NVLink
+                    uint2 slot_values[kNumTopk];
+                    #pragma unroll
+                    for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                        slot_values[slot_idx] = make_uint2(0u, 0u);
+                        if (total_mask >> slot_idx & 1)
+                            slot_values[slot_idx] = buffer.combine_token_buffer.get_rank_buffer(slot_idx).get_data_buffer(token_idx)
+                                                        .get_base_ptr<uint2>()[sub_chunk_idx * 32 + lane_idx];
+                    }
+
+                    // 4 BF16 elements per lane: two `float2` per accumulator
+                    float2 split_acc_lo[4] = {}, split_acc_hi[4] = {};
+                    #pragma unroll
+                    for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                        // Warp-uniform: `total_mask` is a ballot result
+                        if (total_mask >> slot_idx & 1) {
+                            const float slot_weight = __shfl_sync(0xffffffff, stored_topk_weight, slot_idx);
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&slot_values[slot_idx]);
+                            const float2 pair_lo = __bfloat1622float2(bf16_values[0]);
+                            const float2 pair_hi = __bfloat1622float2(bf16_values[1]);
+                            auto& acc_lo = split_acc_lo[slot_idx & 3];
+                            auto& acc_hi = split_acc_hi[slot_idx & 3];
+                            acc_lo.x = __fmaf_rn(pair_lo.x, slot_weight, acc_lo.x);
+                            acc_lo.y = __fmaf_rn(pair_lo.y, slot_weight, acc_lo.y);
+                            acc_hi.x = __fmaf_rn(pair_hi.x, slot_weight, acc_hi.x);
+                            acc_hi.y = __fmaf_rn(pair_hi.y, slot_weight, acc_hi.y);
+                        }
+                    }
+                    float2 sum_lo = split_acc_lo[0], sum_hi = split_acc_hi[0];
+                    #pragma unroll
+                    for (uint32_t i = 1; i < 4; ++ i) {
+                        sum_lo.x = __fadd_rn(sum_lo.x, split_acc_lo[i].x);
+                        sum_lo.y = __fadd_rn(sum_lo.y, split_acc_lo[i].y);
+                        sum_hi.x = __fadd_rn(sum_hi.x, split_acc_hi[i].x);
+                        sum_hi.y = __fadd_rn(sum_hi.y, split_acc_hi[i].y);
+                    }
+
+                    uint2 casted;
+                    auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                    casted_bf16[0] = __float22bfloat162_rn(sum_lo);
+                    casted_bf16[1] = __float22bfloat162_rn(sum_hi);
+                    reinterpret_cast<uint2*>(math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes))[sub_chunk_idx * 32 + lane_idx] = casted;
+                }
+            }
+        }
+
+        // Ranks already seen ready by this warp (main combine)
         uint64_t known_ready_ranks = 0;
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
+        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_combine_token_chunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
@@ -2698,6 +2803,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
             // scale-invariant norm would otherwise erase.
             float slot_norm_scale = 1.0f;
+            if constexpr (kWeightAtCombine) {
+                // trtllm numerics: lane `s` holds slot `s`'s top-k weight, the shared slot keeps 1
+                if (lane_idx < kNumTopk)
+                    slot_norm_scale = __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                                            token_idx * kNumTopk + lane_idx);
+            }
             if constexpr (kFusedPostNormPartials) {
                 // Lane `s` reads slot `s`'s total, already accumulated by the L2 tiles.
                 const float my_topk_weight = lane_idx < kNumTopk ?
@@ -2831,7 +2942,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
 
                     float slot_scale = 1.0f;
-                    if constexpr (kWithPostExpertNorm)
+                    if constexpr (kWithPostExpertNorm or kWeightAtCombine)
                         slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
                                                  static_cast<uint32_t>(active_slot));
 
@@ -2849,7 +2960,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 (chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 16) / kCombineGranK;
                             const uint8_t sf_byte = __ldg(sf_token_ptr + sf_idx);
                             float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
-                            if constexpr (kWithPostExpertNorm)
+                            if constexpr (kWithPostExpertNorm or kWeightAtCombine)
                                 sf *= slot_scale;
                             const uint32_t* w = reinterpret_cast<const uint32_t*>(&uint4_values);
                             #pragma unroll
@@ -2881,7 +2992,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
                                 auto& acc = reduced[j * kNumElemsPerUint4 + l];
-                                if constexpr (kWithPostExpertNorm) {
+                                if constexpr (kWithPostExpertNorm or kWeightAtCombine) {
                                     const float2 pair = __bfloat1622float2(bf16_values[l]);
                                     acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
                                     acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
