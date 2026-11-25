@@ -568,6 +568,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_info_empty_barriers,
             shared_storage.task_infos
     );
+    // The load warps below honor `kDepsCheckedBit`
+    scheduler.check_deps = true;
+    // One-rank groups: every L1 task first whenever the M blocks fit in the ring (measured on a 112-expert group)
+    scheduler.l1_first_whenever_fits = (kNumRanks == 1);
 
     // One-rank groups: expert token counts without the global count protocol (see the scheduler)
     //   - token masks: calls of at most `kOneRankMaskMaxTokens` tokens; the dispatch warps build per-expert token
@@ -1267,7 +1271,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the entire token arrival
-            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+            // NOTES: the scheduler has already checked the inputs of a task that carries `kDepsCheckedBit`
+            const bool deps_checked = (task_info.m_block_idx & scheduler.kDepsCheckedBit) != 0;
+            if (task_info.block_phase == sched::BlockPhase::Linear1 and not deps_checked) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
@@ -1279,7 +1285,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                if (task_info.block_phase == sched::BlockPhase::Linear2) {
+                if (task_info.block_phase == sched::BlockPhase::Linear2 and not deps_checked) {
                     l2_k_block_dependency.wait(k_block_idx);
                     // Blockwise-128 reuses one SF word across `kNumSFStagesPerLoad` K blocks, but its later
                     // bytes are produced by those blocks' L1 epilogue: wait for all of them or they are stale.
