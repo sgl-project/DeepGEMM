@@ -109,6 +109,46 @@ static CUtensorMap make_trtllm_fp4_l2_tma_desc(
     return result;
 }
 
+// Row-shuffled (TRT) weights for FP8 x FP4 with the SM107 K=64 MMA: packed FP4 rows and their per-32 scales are read
+// from the caller's tensors as they are, one 128-row x 128-K tile and one 512-byte scale slab per load.
+//   - L1 weights: 2D `[E * N, K / 2]` bytes, rows in storage order (the kernel undoes L1's 16-channel order in its
+//     FP8 epilogue); L2 weights: 4D, which undoes the 32-row shuffle while loading
+//   - scales: one slab per (128 rows, 128 K); L2's is 4D for the same shuffle
+static CUtensorMap make_row_shuffled_fp8_fp4_tma_desc(
+    const torch::Tensor& tensor, const int& n, const int& k, const bool& is_weight, const bool& is_l1) {
+    DG_HOST_ASSERT(n % 128 == 0 and k % 128 == 0 and tensor.is_contiguous());
+    const uint64_t width = is_weight ? k / 2 : k / 32;
+    const uint64_t rows = n;
+    DG_HOST_ASSERT(tensor.nbytes() >= rows * width);
+    const uint64_t slabs = rows * width / 512;
+    std::array<cuuint64_t, 5> dims{}, strides{};
+    std::array<cuuint32_t, 5> box{}, steps{1, 1, 1, 1, 1};
+    if (is_weight and is_l1) {
+        dims = {width * 2, rows};
+        strides = {width};
+        box = {128, 128};
+    } else if (is_weight) {
+        dims = {width * 2, 4, 8, rows / 32};
+        strides = {8 * width, width, 32 * width};
+        box = {128, 4, 8, 4};
+    } else if (is_l1) {
+        dims = {128, slabs};
+        strides = {512};
+        box = {128, 1};
+    } else {
+        dims = {4, 4, 8, slabs};
+        strides = {128, 16, 512};
+        box = {4, 4, 8, 1};
+    }
+    CUtensorMap result;
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &result, is_weight ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B : CU_TENSOR_MAP_DATA_TYPE_UINT32,
+        is_l1 ? 2 : 4, tensor.data_ptr(), dims.data(), strides.data(), box.data(), steps.data(),
+        CU_TENSOR_MAP_INTERLEAVE_NONE, is_weight ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return result;
+}
+
 // TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
 static CUtensorMap make_trtllm_fp4_sf_tma_desc(
     const torch::Tensor& sf, const bool& is_l1,
@@ -209,8 +249,14 @@ static void sm100_fp8_fp4_mega_moe(
         DG_HOST_ASSERT(num_shared_experts == 0);
         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
     }
-    if (use_shuffled_weights)
+    // Row-shuffled weights: NVFP4, or packed FP4 under FP8 activations through the SM107 K=64 MMA
+    const bool use_shuffled_fp8_fp4 = use_shuffled_weights and mma_kind == MmaKind::MXFP8FP4;
+    if (use_shuffled_fp8_fp4) {
+        DG_HOST_ASSERT(config.use_sm107_k64 and config.block_n == 128 and config.block_k == 128);
+        DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    } else if (use_shuffled_weights) {
         DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
+    }
 
     // Make tensormap
     const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
@@ -225,7 +271,8 @@ static void sm100_fp8_fp4_mega_moe(
     // SM107 K=64 MMA: routed FP4 weights are loaded packed with 64B swizzle, and the shared expert's activations
     // and FP8 weights are loaded in 64-wide K halves with 64B swizzle
     const bool use_k64 = config.use_sm107_k64;
-    DG_HOST_ASSERT(not use_k64 or (not use_shuffled_weights and config.block_k == 128 and to_inner(config.block_k) == 128));
+    DG_HOST_ASSERT(not use_k64 or ((not use_shuffled_weights or use_shuffled_fp8_fp4) and
+                                   config.block_k == 128 and to_inner(config.block_k) == 128));
     const int routed_weights_swizzle_mode = use_k64 ? 64 : config.swizzle_weights_mode;
     const int shared_block_k_inner = use_k64 ? block_k_inner / 2 : block_k_inner;
     const int shared_acts_swizzle_mode = use_k64 ? 64 : config.swizzle_acts_mode;
@@ -245,6 +292,8 @@ static void sm100_fp8_fp4_mega_moe(
         make_interleaved_l1_tma_desc(l1_weights, weight_inner(hidden),
                                      num_experts_per_rank * intermediate_hidden * 2,
                                      config.load_block_n, is_packed_fp4, use_up_gate_block16) :
+        use_shuffled_fp8_fp4 ?
+        make_row_shuffled_fp8_fp4_tma_desc(l1_weights, num_experts_per_rank * intermediate_hidden * 2, hidden, true, true) :
         use_shuffled_weights ?
         make_tma_2d_desc(weight_tensor(l1_weights),
                          weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
@@ -255,6 +304,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l1_weights_sf = use_interleaved_weights ? make_interleaved_l1_sf_tma_desc(
         l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (kGranK * 4), sf_smem_outer_dim, is_packed_fp4, use_up_gate_block16) :
+        use_shuffled_fp8_fp4 ?
+        make_row_shuffled_fp8_fp4_tma_desc(l1_weights_sf, num_experts_per_rank * intermediate_hidden * 2, hidden, false, true) :
         use_shuffled_weights ? make_trtllm_fp4_sf_tma_desc(
         l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
         hidden / (config.gran_k * 4), sf_smem_outer_dim, config.block_n / 128) :
@@ -282,12 +333,16 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = use_shuffled_weights ? make_trtllm_fp4_l2_tma_desc(
+    const auto tensor_map_l2_weights = use_shuffled_fp8_fp4 ?
+        make_row_shuffled_fp8_fp4_tma_desc(l2_weights, num_experts_per_rank * hidden, intermediate_hidden, true, false) :
+        use_shuffled_weights ? make_trtllm_fp4_l2_tma_desc(
         l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
         make_tma_weights_3d_desc(weight_tensor(l2_weights), block_k_inner, config.load_block_n, routed_weights_swizzle_mode, not use_k64);
     const auto tensor_map_l2_weights_sf = use_interleaved_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, true, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+        use_shuffled_fp8_fp4 ?
+        make_row_shuffled_fp8_fp4_tma_desc(l2_weights_sf, num_experts_per_rank * hidden, intermediate_hidden, false, false) :
         use_shuffled_weights ? make_trtllm_fp4_sf_tma_desc(
         l2_weights_sf, false, num_experts_per_rank * hidden / 128,
         intermediate_hidden / (config.gran_k * 4), sf_smem_outer_dim, config.block_n / 128) :

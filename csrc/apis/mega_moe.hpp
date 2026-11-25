@@ -298,8 +298,11 @@ static void fp8_fp4_mega_moe(
                             " does not match `" + mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ", or 128 for blockwise-128 FP8 SFs)");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(not use_shuffled_weights or mma_kind == MmaKind::NVFP4);
     const auto activation_kind = parse_activation(activation);
+    // Row-shuffled (TRT) weights: NVFP4, or routed FP8 x FP4 SiTU experts (packed FP4 weights, SM107 K=64 MMA)
+    DG_HOST_ASSERT(not use_shuffled_weights or mma_kind == MmaKind::NVFP4 or
+                   (mma_kind == MmaKind::MXFP8FP4 and activation_kind == MegaMoEActivation::SiTU and
+                    not shared_l1_weights_tuple_opt.has_value() and not shared_l2_weights_tuple_opt.has_value()));
     DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or
                    mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or not activation_clamp_opt.has_value());

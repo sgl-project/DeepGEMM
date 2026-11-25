@@ -218,8 +218,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
                      "Post-expert norm weight without the post-expert norm");
     DG_STATIC_ASSERT(not kUseShuffledWeights or
-                     (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
-                     "TRT weight layout requires routed NVFP4 experts");
+                     ((kMmaKind == MmaKind::NVFP4 or kUseSM107K64) and kNumSharedExperts == 0),
+                     "TRT weight layout requires routed NVFP4 experts, or routed FP8 x FP4 experts with the K=64 MMA");
     DG_STATIC_ASSERT(not kUseInterleavedWeights or
                      (kNumSharedExperts == 0 and
                       (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
@@ -370,7 +370,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kPackedFP4Weights = kUseSM107K64;
     DG_STATIC_ASSERT(not kPackedFP4Weights or
                      (kMmaKind == MmaKind::MXFP8FP4 and not kIsWeightFP8 and kGranK == 32 and
-                      BLOCK_K == 128 and not kUseShuffledWeights),
+                      BLOCK_K == 128),
                      "The K=64 MMA only applies to FP8 x FP4 with per-32 SFs and 128-wide K blocks");
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
@@ -1423,7 +1423,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     task_info.local_expert_idx * shape_sfb_k + (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage;
 
                 // TMA copy weights with SF
-                if constexpr (kUseShuffledWeights) {
+                if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
+                    // Row-shuffled packed FP4 weights (K=64 MMA): one 128x128 weight tile and one 512-byte scale slab
+                    // per stage, read from the caller's tensors. SMEM holds the `megamoe` order except for L1's
+                    // 16-channel order, which the L1 epilogue undoes on its FP8 output
+                    DG_STATIC_ASSERT(LOAD_BLOCK_N == 128 and BLOCK_N == 128 and BLOCK_K == 128 and
+                                     kSFChunkK == 128 and kNumSFWordsPerStage == 1 and kNumSFStagesPerLoad == 1,
+                                     "Row-shuffled FP8 x FP4 weights need 128x128 tiles with one SF word per stage");
+                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                    const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
+                    const uint32_t sf_slab_idx = (expert_n_idx / 128) * (shape_k / 128) + k_block_idx;
+                    auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                    auto* weight_tile = reinterpret_cast<uint8_t*>(shared_storage.smem_b[stage_idx]);
+                    auto* sf_tile = reinterpret_cast<uint8_t*>(shared_storage.smem_sfb[stage_idx]);
+                    if (cute::elect_one_sync()) {
+                        if (is_l1) {
+                            cute::SM100_TMA_2SM_LOAD_2D::copy(
+                                tensor_map_b_ptr, full, weight_cache_hint, weight_tile, k_block_idx * 128, expert_n_idx);
+                            cute::SM100_TMA_2SM_LOAD_2D::copy(
+                                tensor_map_sfb_ptr, full, weight_cache_hint, sf_tile, 0, sf_slab_idx);
+                        } else {
+                            cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                tensor_map_b_ptr, full, weight_cache_hint, weight_tile, k_block_idx * 128, 0, 0, expert_n_idx / 32);
+                            cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                tensor_map_sfb_ptr, full, weight_cache_hint, sf_tile, 0, 0, 0, sf_slab_idx);
+                        }
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
+                } else if constexpr (kUseShuffledWeights) {
                     // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
@@ -1704,7 +1735,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                             auto smem_ptr = shared_storage.smem_sfb[stg] +
-                                ((kUseShuffledWeights or kUseInterleavedWeights)
+                                (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                     ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk * kNumUTCCPAlignedElems
                                     : sf_chunk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                             mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1826,7 +1857,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stg] +
-                                    ((kUseShuffledWeights or kUseInterleavedWeights)
+                                    (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                         ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk * kNumUTCCPAlignedElems
                                         : sf_chunk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1948,7 +1979,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                     auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                        ((kUseShuffledWeights or kUseInterleavedWeights)
+                                        (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                             ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                             : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                     mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -2491,6 +2522,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         __syncwarp();
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
+                        // Row-shuffled L1 rows come as the 8 even channels of each 16-channel group followed by the
+                        // 8 odd ones. A 64B-swizzled FP8 bank group keeps its internal 16-byte order, so interleave
+                        // the two halves of every aligned 16-byte word of the staged output
+                        constexpr uint32_t kNumStagedUint4 = STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES / sizeof(uint4);
+                        DG_STATIC_ASSERT(L1_OUT_BLOCK_N_BYTES % 16 == 0 and not kIsFP4Acts, "Invalid L1 output staging");
+                        auto* staged = reinterpret_cast<uint4*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]);
+                        for (uint32_t j = warp_idx_in_wg * 32 + lane_idx; j < kNumStagedUint4; j += 128) {
+                            const uint4 x = staged[j];
+                            staged[j] = make_uint4(__byte_perm(x.x, x.z, 0x5140), __byte_perm(x.x, x.z, 0x7362),
+                                                   __byte_perm(x.y, x.w, 0x5140), __byte_perm(x.y, x.w, 0x7362));
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    }
 
                     if constexpr (kIsNVFP4) {
                         if (warp_idx_in_wg == 0u) {

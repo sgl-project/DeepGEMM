@@ -369,8 +369,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         raise ValueError(f'`topk_first_expert` must be in [0, 16384); got {topk_first_expert}')
     if split4_combine_max_tokens != 0 and numerics != 'trtllm':
         raise ValueError("`split4_combine_max_tokens` requires `numerics='trtllm'`")
-    if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
-        raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA')
+    if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4' and not (
+            sym_buffer.mma_type == 'fp8xfp4' and activation == 'situ'):
+        raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA, or FP8xFP4 with the SiTU activation')
     if weight_layout in ('gate_up_interleaved', 'up_gate_block16') and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
         raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
