@@ -240,6 +240,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kMmaKind == MmaKind::NVFP4 or kMmaKind == MmaKind::MXFP4 or kMmaKind == MmaKind::MXFP8FP4,
                      "Invalid MMA kind");
     constexpr bool kIsNVFP4 = kMmaKind == MmaKind::NVFP4;
+    constexpr bool kUseNVFP4SFInvLut = math::use_nvfp4_sf_inv_lut(kIsNVFP4, BLOCK_M);
     constexpr bool kIsMXFP4 = kMmaKind == MmaKind::MXFP4;
     constexpr bool kIsFP4Acts = kIsNVFP4 or kIsMXFP4;
 
@@ -424,6 +425,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier task_info_full_barriers[kNumScheduleStages];
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
+        float nvfp4_sf_inv_lut[kUseNVFP4SFInvLut ? math::kNumNVFP4SFInvLutEntries : 1];
         // Cross-CTA amax exchange for blockwise-128 L2 activations: the peer stores its 64-column max into
         // our slots. Two barriers ping-pong with the two buffers so the peer never double-fills one phase.
         Barrier amax_exchange_barriers[kAmaxExchangeWGs][2];
@@ -519,6 +521,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == 3) {
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, &shared_storage.tmem_ptr_in_smem);
+    } else if (warp_idx == 4) {
+        if constexpr (kUseNVFP4SFInvLut)
+            math::init_nvfp4_sf_inv_lut(shared_storage.nvfp4_sf_inv_lut, lane_idx);
     }
     cute::cluster_sync();
 
@@ -2184,7 +2189,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Calculate SF
                         float2 sf, sf_inv;
                         uint2 sf_bits;
-                        if constexpr (kIsNVFP4) {
+                        if constexpr (kUseNVFP4SFInvLut) {
+                            math::get_nvfp4_sf_inv_from_lut(amax_values[i], shared_storage.nvfp4_sf_inv_lut,
+                                                            sf_inv, sf_bits);
+                        } else if constexpr (kIsNVFP4) {
                             math::get_nvfp4_sf_and_sf_inv(amax_values[i], sf, sf_inv, sf_bits);
                         } else {
                             // Reduce amax (warp-pair-level)
@@ -2208,40 +2216,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             + i * ATOM_M * L1_OUT_BLOCK_N_BYTES;
                         if constexpr (kIsFP4Acts) {
                             const uint32_t packed = math::cast_into_e2m1x2_pairs(first, second);
-                            if constexpr (L1_OUT_BLOCK_N_BYTES == 32u) {
-                                // Bank-conflict-free STS.32: pack 4 consecutive bytes per row across the warp
-                                // via shuffle so lanes 0..15 write to 16 distinct SMEM banks.
-                                const uint32_t out_row = lane_idx & 7u;
-                                const uint32_t out_word = (lane_idx >> 3u) & 1u;
-                                const uint32_t src_base = (out_word * 16u) + (out_row >> 1u);
-                                const uint32_t p0 = __shfl_sync(0xffffffffu, packed, src_base + 0u);
-                                const uint32_t p1 = __shfl_sync(0xffffffffu, packed, src_base + 4u);
-                                const uint32_t p2 = __shfl_sync(0xffffffffu, packed, src_base + 8u);
-                                const uint32_t p3 = __shfl_sync(0xffffffffu, packed, src_base + 12u);
-                                if (lane_idx < 16u) {
-                                    const uint32_t shift = (out_row & 1u) * 8u;
-                                    const uint32_t w32 =
-                                        ((p0 >> shift) & 0xFFu) |
-                                        (((p1 >> shift) & 0xFFu) << 8u) |
-                                        (((p2 >> shift) & 0xFFu) << 16u) |
-                                        (((p3 >> shift) & 0xFFu) << 24u);
-                                    const uint32_t bg =
-                                        ((warp_idx_in_wg >> 1u) ^ ((out_row >> 2u) & 1u)) * kNumBankGroupBytes;
-                                    const uint32_t swizzled_off = bg + (warp_idx_in_wg & 1u) * 8u + out_word * 4u;
-                                    *reinterpret_cast<uint32_t*>(
-                                        smem_base + out_row * L1_OUT_BLOCK_N_BYTES + swizzled_off) = w32;
-                                }
-                            } else {
-                                const uint32_t byte_in_row = warp_idx_in_wg * (L1_OUT_BLOCK_N_BYTES / 4) + lane_idx / 4;
-                                #pragma unroll
-                                for (uint32_t t = 0; t < 2; ++ t) {
-                                    const uint32_t row = (lane_idx % 4) * 2 + t;
-                                    const uint32_t swizzled_byte =
-                                        ((byte_in_row / kNumBankGroupBytes) ^ ((row / 4) & 1)) * kNumBankGroupBytes +
-                                        byte_in_row % kNumBankGroupBytes;
-                                    smem_base[row * L1_OUT_BLOCK_N_BYTES + swizzled_byte] =
-                                        static_cast<uint8_t>(packed >> (t * 8));
-                                }
+                            // Per-lane byte stores: a shuffle-packed STS.32 can save the bank conflicts, but its 4 shuffles
+                            // per atom cost more in this epilogue than the conflicts do
+                            const uint32_t byte_in_row = warp_idx_in_wg * (L1_OUT_BLOCK_N_BYTES / 4) + lane_idx / 4;
+                            #pragma unroll
+                            for (uint32_t t = 0; t < 2; ++ t) {
+                                const uint32_t row = (lane_idx % 4) * 2 + t;
+                                // 32B swizzle: 2 bank groups, XOR-ed by `row / 4`
+                                const uint32_t swizzled_byte =
+                                    ((byte_in_row / kNumBankGroupBytes) ^ ((row / 4) & 1)) * kNumBankGroupBytes +
+                                    byte_in_row % kNumBankGroupBytes;
+                                smem_base[row * L1_OUT_BLOCK_N_BYTES + swizzled_byte] =
+                                    static_cast<uint8_t>(packed >> (t * 8));
                             }
                         } else {
                             const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(first.x, first.y, second.x, second.y));

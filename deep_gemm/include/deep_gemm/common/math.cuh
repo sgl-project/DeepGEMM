@@ -47,6 +47,14 @@ CUTLASS_HOST_DEVICE constexpr T constexpr_min(T a, T b) {
     return a < b ? a : b;
 }
 
+// NVFP4 SF reciprocal LUT (one entry per E4M3 code), shared by the host shared memory budget and the kernel.
+// Decode-sized tiles quantize few rows, where filling the LUT costs more than it saves.
+constexpr uint32_t kNumNVFP4SFInvLutEntries = 256;
+
+CUTLASS_HOST_DEVICE constexpr bool use_nvfp4_sf_inv_lut(const bool& is_nvfp4, const int& block_m) {
+    return is_nvfp4 and block_m > 64;
+}
+
 template <typename T>
 CUTLASS_DEVICE void swap(T& a, T& b) {
     T temp = a;
@@ -206,6 +214,27 @@ CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, floa
     ry = __fmaf_rn(__fmaf_rn(-sy, ry, 1.0f), ry, ry);
     sf_inv.x = sf.x > 0.0f ? rx : 0.0f;
     sf_inv.y = sf.y > 0.0f ? ry : 0.0f;
+}
+
+// Built with `__frcp_rn`, so a lookup is bit-identical to the reciprocal above. In the L1 epilogue of multi-row
+// tiles, two shared memory loads are cheaper than the FP8 -> FP32 conversions and the refined `rcp.approx`.
+CUTLASS_DEVICE void init_nvfp4_sf_inv_lut(float* lut, const uint32_t& lane_idx) {
+    #pragma unroll
+    for (uint32_t b = lane_idx; b < kNumNVFP4SFInvLutEntries; b += 32) {
+        __nv_fp8_e4m3 q;
+        q.__x = static_cast<__nv_fp8_storage_t>(b);
+        const float sf = static_cast<float>(q);
+        lut[b] = sf > 0.0f ? __frcp_rn(sf) : 0.0f;
+    }
+}
+
+CUTLASS_DEVICE void get_nvfp4_sf_inv_from_lut(const float2& amax, const float* lut,
+                                              float2& sf_inv, uint2& sf_bits) {
+    constexpr float kInvMax = 1.0f / 6.0f;
+    const float2 scaled = __fmul2_rn(amax, {kInvMax, kInvMax});
+    const __nv_fp8_e4m3 qx(scaled.x), qy(scaled.y);
+    sf_bits = {qx.__x, qy.__x};
+    sf_inv = {lut[qx.__x], lut[qy.__x]};
 }
 
 CUTLASS_DEVICE uint32_t cast_into_e2m1x2_pairs(const float2& lower, const float2& upper) {

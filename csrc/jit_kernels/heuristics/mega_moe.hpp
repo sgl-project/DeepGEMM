@@ -305,6 +305,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
 
+    const int smem_sf_inv_lut = math::use_nvfp4_sf_inv_lut(mma_kind == MmaKind::NVFP4, block_m) ?
+        static_cast<int>(math::kNumNVFP4SFInvLutEntries * sizeof(float)) : 0;
+
     // One SF word packs 4 UE8M0 bytes, so a stage holds `ceil(block_k / (gran_k * 4))` words per row
     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ?
         sf_block_m * ceil_div(block_k, gran_k * 4) * 4 : 0;
@@ -323,7 +326,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_amax_exchange + smem_barriers +
-        smem_task_info + smem_tmem_ptr;
+        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;

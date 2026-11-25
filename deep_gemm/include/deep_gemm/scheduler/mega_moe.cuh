@@ -337,7 +337,7 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void fetch_expert_recv_count() {
         const uint32_t lane_idx = ptx::get_lane_idx();
         uint32_t raw_tokens[kNumExpertsPerLane] = {};
-        uint32_t raw_keys[kNumExpertsPerLane] = {};
+        uint32_t num_m_blocks[kNumExpertsPerLane] = {};
         uint32_t lane_max_nb = 0u;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
@@ -352,50 +352,65 @@ struct MegaMoEScheduler {
             stored_num_tokens_per_expert[i] = raw_tokens[i];
             stored_expert_id[i] = expert_idx;
             if constexpr (kEnableLPTSwizzle and not kHasShared and kNumExpertsPerRank <= 64u and kNumExpertsPerRank > 1u) {
-                const uint32_t nb = (expert_idx < kNumExpertsPerRank) ? math::ceil_div(raw_tokens[i], BLOCK_M) : 0u;
-                lane_max_nb = cute::max(lane_max_nb, nb);
-                // Unique descending key: (num_m_blocks << 20) | (tokens << 6) | (63 - expert_idx)
-                raw_keys[i] = (expert_idx < kNumExpertsPerRank)
-                    ? ((nb << 20u) | (cute::min(raw_tokens[i], 16383u) << 6u) | (63u - expert_idx))
-                    : 0u;
+                num_m_blocks[i] = math::ceil_div(raw_tokens[i], BLOCK_M);
+                lane_max_nb = cute::max(lane_max_nb, num_m_blocks[i]);
             }
         }
         __syncwarp();
 
-        // Dynamic LPT expert ordering: sort slots descending by `num_m_blocks` in registers only when
-        // multi-block routing skew is present (`max_m_blocks >= 3`), incurring zero overhead on decode
-        // or balanced loads.
+        // Dynamic LPT expert ordering: order slots by descending `num_m_blocks` (expert index within a bucket) only
+        // when multi-block routing skew is present (`max_m_blocks >= 3`), incurring zero overhead on decode or
+        // balanced loads. One ballot per occupied bucket and register half: each slot takes the k-th set bit of the
+        // ballot that covers it, which keeps the code small (all dispatch warps inline it).
         if constexpr (kEnableLPTSwizzle and not kHasShared and kNumExpertsPerRank <= 64u and kNumExpertsPerRank > 1u) {
             const uint32_t max_m_blocks = __reduce_max_sync(0xffffffffu, lane_max_nb);
             if (max_m_blocks >= 3u) {
-                uint32_t my_rank[kNumExpertsPerLane] = {};
-                #pragma unroll
-                for (uint32_t s = 0; s < kNumExpertsPerRank; ++ s) {
-                    const uint32_t other_key = __shfl_sync(0xffffffffu, raw_keys[s >> 5u], s & 31u);
+                // Position of the k-th (0-based) set bit: binary search on the popcount of the mask's low bits
+                const auto get_kth_set_bit = [](const uint32_t& mask, const uint32_t& k) {
+                    uint32_t pos = 0;
+                    #pragma unroll
+                    for (uint32_t step = 16; step > 0; step /= 2)
+                        pos += __popc(mask & ((1u << (pos + step)) - 1u)) <= k ? step : 0u;
+                    return pos;
+                };
+                uint32_t src_lane[kNumExpertsPerLane] = {}, src_half[kNumExpertsPerLane] = {};
+                uint32_t num_slotted = 0;
+                // Visit only occupied buckets, so the loop is bounded by the local expert count, not by `max_m_blocks`
+                for (uint32_t b = max_m_blocks, has_bucket = 1u; has_bucket; ) {
+                    uint32_t lane_next = 0u;
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-                        const uint32_t expert_idx = i * 32u + lane_idx;
-                        if (expert_idx < kNumExpertsPerRank and other_key > raw_keys[i])
-                            ++ my_rank[i];
+                        const bool is_valid = i * 32u + lane_idx < kNumExpertsPerRank;
+                        const uint32_t mask = __ballot_sync(0xffffffffu, is_valid and num_m_blocks[i] == b);
+                        const uint32_t num_in_mask = __popc(mask);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumExpertsPerLane; ++ j) {
+                            const uint32_t slot = j * 32u + lane_idx;
+                            if (slot >= num_slotted and slot < num_slotted + num_in_mask) {
+                                src_lane[j] = get_kth_set_bit(mask, slot - num_slotted);
+                                src_half[j] = i;
+                            }
+                        }
+                        num_slotted += num_in_mask;
+                        // Next bucket: the largest block count below `b`, offset by one so that 0 means none
+                        if (is_valid and num_m_blocks[i] < b)
+                            lane_next = cute::max(lane_next, num_m_blocks[i] + 1u);
                     }
+                    const uint32_t next = __reduce_max_sync(0xffffffffu, lane_next);
+                    has_bucket = next > 0u;
+                    b = next - 1u;
                 }
                 #pragma unroll
-                for (uint32_t slot = 0; slot < kNumExpertsPerRank; ++ slot) {
-                    uint32_t found_e = 0u, found_t = 0u;
+                for (uint32_t j = 0; j < kNumExpertsPerLane; ++ j) {
+                    uint32_t num_tokens = 0;
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-                        const uint32_t expert_idx = i * 32u + lane_idx;
-                        const uint32_t mask = __ballot_sync(
-                            0xffffffffu, expert_idx < kNumExpertsPerRank and my_rank[i] == slot);
-                        if (mask) {
-                            const uint32_t owner_lane = static_cast<uint32_t>(__ffs(mask) - 1);
-                            found_e = ptx::exchange(expert_idx, owner_lane);
-                            found_t = ptx::exchange(raw_tokens[i], owner_lane);
-                        }
+                        const uint32_t value = __shfl_sync(0xffffffffu, raw_tokens[i], src_lane[j]);
+                        num_tokens = src_half[j] == i ? value : num_tokens;
                     }
-                    if (lane_idx == (slot & 31u)) {
-                        stored_expert_id[slot >> 5u] = found_e;
-                        stored_num_tokens_per_expert[slot >> 5u] = found_t;
+                    if (j * 32u + lane_idx < kNumExpertsPerRank) {
+                        stored_expert_id[j] = src_half[j] * 32u + src_lane[j];
+                        stored_num_tokens_per_expert[j] = num_tokens;
                     }
                 }
                 __syncwarp();
