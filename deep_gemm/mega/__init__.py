@@ -65,8 +65,24 @@ class SymmBuffer:
                  recipe_a: Optional[Tuple[int, int]] = None,
                  recipe_b: Optional[Tuple[int, int]] = None,
                  base: Optional['SymmBuffer'] = None,
-                 gather_output: bool = False):
-        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+                 gather_output: bool = False,
+                 exact_num_max_tokens: bool = False,
+                 max_block_m: Optional[int] = None):
+        """
+        `exact_num_max_tokens=True` keeps `num_max_tokens_per_rank` as given (a multiple of 128) instead of aligning
+        it up to `get_token_alignment_for_mega_moe()` rows. `max_block_m` sizes the rings for M tiles of at most that
+        many rows instead of every candidate tile; a call that would pick a larger tile is rejected. Together they
+        let a decode-only group allocate a small buffer (for example 256 rows with `max_block_m=64`).
+        Both are for the SM100 FP8 / FP4 kernels and are off by default.
+        """
+        if exact_num_max_tokens:
+            assert num_max_tokens_per_rank > 0 and num_max_tokens_per_rank % 128 == 0, \
+                '`exact_num_max_tokens` needs a positive multiple of 128 rows'
+        else:
+            num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+        assert not (exact_num_max_tokens or max_block_m) or mma_type != 'bf16xbf16', \
+            '`exact_num_max_tokens` and `max_block_m` are not supported by the BF16 kernel'
+        self.max_block_m = int(max_block_m or 0)
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
         assert activation != 'situ' or mma_type in ('fp8xfp4', 'fp8xfp8', 'nvfp4xnvfp4'), \
             '`situ` activation is supported only for `fp8xfp4`, `fp8xfp8` and `nvfp4xnvfp4` MegaMoE'
@@ -86,7 +102,7 @@ class SymmBuffer:
                        num_max_tokens_per_rank, num_topk,
                        hidden, intermediate_hidden,
                        mma_type, activation,
-                       num_shared_experts, recipe, recipe_a, recipe_b)
+                       num_shared_experts, recipe, recipe_a, recipe_b, self.max_block_m)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
         num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
@@ -396,7 +412,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         post_expert_norm_eps, post_expert_norm_weight_first,
         weight_layout, global_num_tokens, broadcast_y,
         numerics == 'trtllm', split4_combine_max_tokens,
-        topk_format == 'packed', topk_first_expert
+        topk_format == 'packed', topk_first_expert,
+        sym_buffer.max_block_m
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,

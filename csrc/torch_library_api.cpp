@@ -533,13 +533,15 @@ auto symm_buffer_layout_for_mega_moe(int64_t num_ranks, int64_t num_experts,
                                             int64_t num_shared_experts,
                                             const at::OptionalIntArrayRef& recipe,
                                             const at::OptionalIntArrayRef& recipe_a,
-                                            const at::OptionalIntArrayRef& recipe_b) {
+                                            const at::OptionalIntArrayRef& recipe_b,
+                                            int64_t max_block_m) {
     return mega::get_symm_buffer_size_for_mega_moe(
         static_cast<int>(num_ranks), static_cast<int>(num_experts),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_topk),
         static_cast<int>(hidden), static_cast<int>(intermediate_hidden),
         mma_type, activation, static_cast<int>(num_shared_experts),
-        to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b));
+        to_optional_tuple3(recipe), to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b),
+        static_cast<int>(max_block_m));
 }
 
 int64_t dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts,
@@ -549,11 +551,12 @@ int64_t dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_expe
                                              int64_t num_shared_experts,
                                              const at::OptionalIntArrayRef& recipe,
                                              const at::OptionalIntArrayRef& recipe_a,
-                                             const at::OptionalIntArrayRef& recipe_b) {
+                                             const at::OptionalIntArrayRef& recipe_b,
+                                             int64_t max_block_m) {
     return std::get<0>(symm_buffer_layout_for_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden, mma_type, activation, num_shared_experts,
-        recipe, recipe_a, recipe_b));
+        recipe, recipe_a, recipe_b, max_block_m));
 }
 
 std::vector<Tensor> dg_slice_symm_buffer_for_mega_moe(const Tensor& buffer,
@@ -564,11 +567,12 @@ std::vector<Tensor> dg_slice_symm_buffer_for_mega_moe(const Tensor& buffer,
                                                       int64_t num_shared_experts,
                                                       const at::OptionalIntArrayRef& recipe,
                                                       const at::OptionalIntArrayRef& recipe_a,
-                                                      const at::OptionalIntArrayRef& recipe_b) {
+                                                      const at::OptionalIntArrayRef& recipe_b,
+                                                      int64_t max_block_m) {
     const auto [num_bytes, slice] = symm_buffer_layout_for_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden, mma_type, activation, num_shared_experts,
-        recipe, recipe_a, recipe_b);
+        recipe, recipe_a, recipe_b, max_block_m);
     DG_HOST_ASSERT(buffer.nbytes() >= static_cast<size_t>(num_bytes));
     const auto views = slice(buffer);
     // Absent views (BF16 SFs, no shared experts) are returned as empty byte tensors.
@@ -620,7 +624,7 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
                          const std::string& weight_layout,
                          std::optional<int64_t> global_num_tokens, bool broadcast_y,
                          bool trtllm_numerics, int64_t split4_combine_max_tokens, bool packed_topk,
-                         int64_t packed_topk_first_expert) {
+                         int64_t packed_topk_first_expert, int64_t max_block_m) {
     DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l1_weights_sf.has_value());
     DG_HOST_ASSERT(0 <= split4_combine_max_tokens and split4_combine_max_tokens <= std::numeric_limits<int>::max());
     DG_HOST_ASSERT(shared_l2_weights.has_value() == shared_l2_weights_sf.has_value());
@@ -639,7 +643,7 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
         post_expert_norm, post_expert_norm_weight, static_cast<float>(post_expert_norm_eps),
         post_expert_norm_weight_first, weight_layout, global_num_tokens, broadcast_y,
         trtllm_numerics, static_cast<int>(split4_combine_max_tokens), packed_topk,
-        static_cast<int>(packed_topk_first_expert));
+        static_cast<int>(packed_topk_first_expert), static_cast<int>(max_block_m));
 }
 
 void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l2_weights,
@@ -748,7 +752,7 @@ std::tuple<Tensor, Tensor> dg_bf16_mega_gate(const Tensor& x, const Tensor& weig
 #define DG_BF16_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c, str compiled_dims, float? alpha, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
 #define DG_CUBLASLT_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c) -> ()"
 #define DG_K_GROUPED_FP8_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, int[]? ks, Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, bool use_padded_sf_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
-#define DG_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts=0, int[]? recipe=None, int[]? recipe_a=None, int[]? recipe_b=None"
+#define DG_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts=0, int[]? recipe=None, int[]? recipe_a=None, int[]? recipe_b=None, int max_block_m=0"
 #define DG_SM90_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, bool use_fp8_dispatch, str activation"
 
 TORCH_LIBRARY(deep_gemm, m) {
@@ -886,7 +890,7 @@ TORCH_LIBRARY(deep_gemm, m) {
           "bool post_expert_norm_weight_first, str weight_layout, "
           "int? global_num_tokens, bool broadcast_y, "
           "bool trtllm_numerics=False, int split4_combine_max_tokens=0, "
-          "bool packed_topk=False, int packed_topk_first_expert=0) -> ()");
+          "bool packed_topk=False, int packed_topk_first_expert=0, int max_block_m=0) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights, "
           "Tensor? shared_l2_weights, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "

@@ -66,9 +66,16 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
     const std::optional<std::tuple<int, int>>& recipe_a = std::nullopt,
-    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt) {
+    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt,
+    const int& max_block_m = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
+    // `max_block_m` > 0 sizes the rings for M tiles of at most that many rows (0: every candidate tile);
+    // calls on such a buffer must not pick a larger tile, which `fp8_fp4_mega_moe` checks
+    DG_HOST_ASSERT(max_block_m == 0 or std::any_of(
+        layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
+        [=](const auto& candidate) { return candidate == max_block_m; }));
+    const int largest_block_m = max_block_m > 0 ? max_block_m : layout::kMaxCandidateBlockM;
 
     // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
@@ -89,6 +96,8 @@ get_symm_buffer_size_for_mega_moe(
     // Iterate all block candidates to get the maximum ring size
     int num_ring_tokens = 0;
     for (const auto& block_m: layout::kCandidateBlockM) {
+        if (block_m > largest_block_m)
+            continue;
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden);
@@ -112,6 +121,8 @@ get_symm_buffer_size_for_mega_moe(
     int num_sf_ring_tokens = 0;
     if (with_sf) {
         for (auto block_m: layout::kCandidateBlockM) {
+            if (block_m > largest_block_m)
+                continue;
             num_sf_ring_tokens = std::max(
                 num_sf_ring_tokens,
                 layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
@@ -248,7 +259,8 @@ static void fp8_fp4_mega_moe(
     const bool& trtllm_numerics = false,
     const int& split4_combine_max_tokens = 0,
     const bool& packed_topk = false,
-    const int& packed_topk_first_expert = 0
+    const int& packed_topk_first_expert = 0,
+    const int& max_block_m = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -378,8 +390,11 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b
+        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b, max_block_m
     );
+    // A buffer sized for tiles of at most `max_block_m` rows cannot take a call that picks a larger one
+    DG_HOST_ASSERT(max_block_m == 0 or get_block_m_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type, global_num_tokens) <= max_block_m);
     if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))
         DG_HOST_UNREACHABLE("symmetric buffer is " + std::to_string(sym_buffer.nbytes()) +
                             " bytes but `" + mma_type + "`/`" + activation + "` with " +
