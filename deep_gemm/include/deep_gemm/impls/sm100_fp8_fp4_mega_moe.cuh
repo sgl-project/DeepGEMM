@@ -758,16 +758,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
-            while (token_idx >= expert_end_idx) {
-                if (++ current_expert_idx >= kNumExpertsPerRank)
-                    break;
-
-                // Update pool block offset for the new expert
-                expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-
-                // Move start and end to the next expert
-                expert_start_idx = expert_end_idx;
-                expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+            // NOTES: one prefix-sum pass over the per-lane counts plus a ballot, instead of walking the experts one
+            // by one (`get_num_tokens` costs `kNumExpertsPerLane` shuffles per expert, so the walk is
+            // O(E^2 / 32) shuffles for a token of a high-index expert, and every L1 task waits for its pulled rows)
+            if (token_idx >= expert_end_idx) {
+                constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+                uint32_t num_prefix_tokens = 0, found_start_idx = 0, found_num_tokens = 0;
+                int found_expert_idx = -1;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                    const uint32_t count = (i * 32 + lane_idx < kNumExpertsPerRank) ? scheduler.stored_num_tokens_per_expert[i] : 0u;
+                    const uint32_t inclusive = math::warp_inclusive_sum(count, lane_idx) + num_prefix_tokens;
+                    const uint32_t exclusive = inclusive - count;
+                    const uint32_t mask = __ballot_sync(0xffffffff, count > 0 and token_idx >= exclusive and token_idx < inclusive);
+                    if (mask != 0 and found_expert_idx < 0) {
+                        const uint32_t found_lane_idx = static_cast<uint32_t>(__ffs(mask) - 1);
+                        found_expert_idx = static_cast<int>(i * 32 + found_lane_idx);
+                        found_start_idx = ptx::exchange(exclusive, found_lane_idx);
+                        found_num_tokens = ptx::exchange(count, found_lane_idx);
+                    }
+                    num_prefix_tokens = ptx::exchange(inclusive, 31);
+                }
+                if (found_expert_idx < 0) {
+                    // Finish all tokens
+                    current_expert_idx = kNumExpertsPerRank;
+                } else {
+                    current_expert_idx = found_expert_idx;
+                    expert_start_idx = found_start_idx;
+                    expert_end_idx = found_start_idx + found_num_tokens;
+                    expert_pool_block_offset = scheduler.get_pool_block_offset(static_cast<uint32_t>(found_expert_idx));
+                }
             }
 
             // Finish all tokens
