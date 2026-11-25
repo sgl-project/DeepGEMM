@@ -72,6 +72,13 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                                    const uint32_t* known_counter = nullptr) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
 
+    // A one-rank group has no peer to signal: the barrier is its grid sync (same ordering among the local SMs)
+    if constexpr (kNumRanks == 1) {
+        if (sync_prologue or sync_epilogue)
+            grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+        return;
+    }
+
     // Grid sync before NVLink signaling
     if (sync_prologue)
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);

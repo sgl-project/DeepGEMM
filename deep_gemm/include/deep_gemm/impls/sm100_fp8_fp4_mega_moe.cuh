@@ -727,6 +727,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+        // NOTES: a one-rank group has no peer to wait for; its readers already spin on the tagged count sums
+        if constexpr (kNumRanks > 1)
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -802,8 +804,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
+                    // NOTES: with one rank, the rank's count is the expert's count this warp already holds
                     stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, phys_expert_idx)) : 0;
+                        (kNumRanks == 1 ? (expert_end_idx - expert_start_idx) :
+                         static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, phys_expert_idx))) : 0;
                 }
             }
 
@@ -1133,6 +1137,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
+        // NOTES: skipped for a one-rank group, whose next call has no pull barrier to pair with it
+        if constexpr (kNumRanks > 1)
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -2667,7 +2673,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
+        // NOTES: a one-rank group has no peer to tag, only the broadcast output still reads its own index
         uint64_t peer_grid_idx = 0;
+        if constexpr (kNumRanks > 1 or kBroadcastY)
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
@@ -2678,6 +2686,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
+        if constexpr (kNumRanks > 1)
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
 
@@ -2713,6 +2722,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
                     const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                         is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+                    // NOTES: a one-rank group publishes no readiness word, its rows were written before the grid sync above
+                    if constexpr (kNumRanks > 1)
                     comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                                      [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 
@@ -2786,7 +2797,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto print_peers_timeout = [&]() {
                 printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx);
             };
-            bool is_lane_ready = not is_routed or ((known_ready_ranks & peer_rank_bit) != 0ull);
+            bool is_lane_ready = not is_routed or kNumRanks == 1 or ((known_ready_ranks & peer_rank_bit) != 0ull);
             const auto record_ready_ranks = [&]() {
                 if constexpr (kNumRanks <= 32) {
                     known_ready_ranks |= __reduce_or_sync(
