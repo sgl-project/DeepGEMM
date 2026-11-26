@@ -119,6 +119,51 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts, num_max_tokens_per_rank, num_topk, hidden, inter, mma_type=mma_type)
+    tight_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+        group, num_experts, num_max_tokens_per_rank, num_topk, hidden, inter, mma_type=mma_type,
+        use_global_token_hint=True)
+
+    # Verify SF ring sizing invariants (default 8x SM100 vs legacy 16x vs tile-aware tight bound).
+    num_ring_tokens = buffer.l1_acts.size(0)
+    assert buffer.use_global_token_hint is False and tight_buffer.use_global_token_hint is True
+    assert buffer.l1_acts_sf.size(0) == buffer.l2_acts_sf.size(0)
+    assert tight_buffer.l1_acts_sf.size(0) == tight_buffer.l2_acts_sf.size(0)
+    if num_ranks > 1:
+        expected_default_sf = max(256, ((num_ring_tokens * 8 + 255) // 256) * 256)
+        assert buffer.l1_acts_sf.size(0) == expected_default_sf, (
+            f'default multi-rank SF ring {buffer.l1_acts_sf.size(0)} != expected 8x {expected_default_sf}')
+        assert tight_buffer.l1_acts_sf.size(0) < buffer.l1_acts_sf.size(0)
+        assert tight_buffer.buffer.nbytes < buffer.buffer.nbytes
+    else:
+        assert buffer.l1_acts_sf.size(0) == tight_buffer.l1_acts_sf.size(0)
+    if (num_ranks * buffer.num_max_tokens_per_rank * num_topk) // num_experts > 24:
+        assert tight_buffer.l1_acts_sf.size(0) <= num_ring_tokens * 2, (
+            f'tight SF ring {tight_buffer.l1_acts_sf.size(0)} exceeded 2x ring tokens ({num_ring_tokens})')
+
+    os.environ['DG_MEGA_MOE_TIGHT_SF_RING'] = '0'
+    try:
+        legacy_bytes = deep_gemm._C.get_symm_buffer_size_for_mega_moe(
+            num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_topk,
+            hidden, inter, mma_type, 'swiglu', 0, None, None, None, False)
+    finally:
+        os.environ.pop('DG_MEGA_MOE_TIGHT_SF_RING', None)
+    assert legacy_bytes > tight_buffer.buffer.nbytes
+    if num_ranks > 1:
+        assert legacy_bytes > buffer.buffer.nbytes
+
+    os.environ['DG_MEGA_MOE_TILES'] = '2,16,8,128,2'
+    try:
+        override_tight_bytes = deep_gemm._C.get_symm_buffer_size_for_mega_moe(
+            num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_topk,
+            hidden, inter, mma_type, 'swiglu', 0, None, None, None, True)
+    finally:
+        os.environ.pop('DG_MEGA_MOE_TILES', None)
+    assert override_tight_bytes > tight_buffer.buffer.nbytes
+    dist_print(
+        f' > SF ring rows (ring={num_ring_tokens}): default={buffer.l1_acts_sf.size(0)} '
+        f'({buffer.buffer.nbytes / 1024**2:.1f} MiB), tight={tight_buffer.l1_acts_sf.size(0)} '
+        f'({tight_buffer.buffer.nbytes / 1024**2:.1f} MiB), legacy={legacy_bytes / 1024**2:.1f} MiB',
+        once_in_node=True)
 
     torch.manual_seed(rank_idx)
     l1 = torch.randn((num_local_experts, inter * 2, hidden), dtype=torch.bfloat16, device='cuda')
@@ -148,18 +193,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # Idle ranks launch one masked row, as SGLang does: the binding needs a non-null `y`.
         num_rows = max(num_tokens, 1)
 
-        def run(hint: Optional[int], recv_stats: torch.Tensor) -> torch.Tensor:
-            buffer.topk_idx[:num_rows].fill_(-1)
-            buffer.topk_weights[:num_rows].zero_()
+        def run(hint: Optional[int], recv_stats: Optional[torch.Tensor], sym_buf=buffer) -> torch.Tensor:
+            sym_buf.topk_idx[:num_rows].fill_(-1)
+            sym_buf.topk_weights[:num_rows].zero_()
             if num_tokens > 0:
-                buffer.x[:num_tokens].copy_(x_packed)
-                buffer.x_sf[:num_tokens].copy_(x_sf)
-                buffer.topk_idx[:num_tokens].copy_(topk_idx)
-                buffer.topk_weights[:num_tokens].copy_(topk_weights)
-                buffer.x_scales[:num_tokens].copy_(x_scales)
+                sym_buf.x[:num_tokens].copy_(x_packed)
+                sym_buf.x_sf[:num_tokens].copy_(x_sf)
+                sym_buf.topk_idx[:num_tokens].copy_(topk_idx)
+                sym_buf.topk_weights[:num_tokens].copy_(topk_weights)
+                sym_buf.x_scales[:num_tokens].copy_(x_scales)
             y = torch.empty((num_rows, hidden), dtype=torch.bfloat16, device='cuda')
             deep_gemm.fp8_fp4_mega_moe(
-                y, l1_weights, l2_weights, buffer,
+                y, l1_weights, l2_weights, sym_buf,
                 cumulative_local_expert_recv_stats=recv_stats, recipe=(1, 1, gran_k),
                 fast_math=bool(args.fast_math), use_x_scales=args.x_scales, global_num_tokens=hint)
             return y[:num_tokens]
@@ -196,6 +241,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y_pull, stats_pull, _ = run_and_check(global_num_tokens, simt_pull)
             assert torch.equal(y_pull, y_global) and torch.equal(stats_pull, stats_global), \
                 f'[{pattern}] rank {rank_idx}: DG_MEGA_MOE_SIMT_PULL={simt_pull} changed the output'
+
+        # Verify tight SF ring buffer (`use_global_token_hint=True`) produces bitwise-identical outputs.
+        tight_hints = (global_num_tokens, None) if pattern in ('balanced', 'all_idle') else (global_num_tokens,)
+        for tight_hint in tight_hints:
+            stats_tight = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
+            dist.barrier()
+            y_tight = run(tight_hint, stats_tight, sym_buf=tight_buffer)
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert torch.equal(y_tight, y_global) and torch.equal(stats_tight, stats_global), \
+                f'[{pattern}] rank {rank_idx}: tight SF buffer (hint={tight_hint}) changed output or recv counts'
         num_received = stats_global.sum().clone()
         dist.all_reduce(num_received, group=group)
         num_routed = torch.tensor(num_tokens * num_topk, dtype=torch.int, device='cuda')
@@ -241,6 +297,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('OK', once_in_node=True)
     dist.barrier()
+    tight_buffer.destroy()
     buffer.destroy()
     dist.destroy_process_group()
 
