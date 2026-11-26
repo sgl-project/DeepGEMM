@@ -66,9 +66,15 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
     const std::optional<std::tuple<int, int>>& recipe_a = std::nullopt,
-    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt) {
+    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt,
+    const int& max_block_m = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
+    // `max_block_m` > 0 sizes the rings for M tiles of at most that many rows (0: every candidate tile)
+    DG_HOST_ASSERT(max_block_m == 0 or std::any_of(
+        layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
+        [=](const auto& candidate) { return candidate == max_block_m; }));
+    const int largest_block_m = max_block_m > 0 ? max_block_m : layout::kMaxCandidateBlockM;
 
     // SiTU is implemented by the SM100 FP8xFP4/FP8xFP8/NVFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
@@ -89,6 +95,8 @@ get_symm_buffer_size_for_mega_moe(
     // Iterate all block candidates to get the maximum ring size
     int num_ring_tokens = 0;
     for (const auto& block_m: layout::kCandidateBlockM) {
+        if (block_m > largest_block_m)
+            continue;
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden);
@@ -112,6 +120,8 @@ get_symm_buffer_size_for_mega_moe(
     int num_sf_ring_tokens = 0;
     if (with_sf) {
         for (auto block_m: layout::kCandidateBlockM) {
+            if (block_m > largest_block_m)
+                continue;
             num_sf_ring_tokens = std::max(
                 num_sf_ring_tokens,
                 layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
@@ -244,7 +254,12 @@ static void fp8_fp4_mega_moe(
     const bool& post_expert_norm_weight_first = false,
     const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const bool& trtllm_numerics = false,
+    const int& split4_combine_max_tokens = 0,
+    const bool& packed_topk = false,
+    const int& packed_topk_first_expert = 0,
+    const int& max_block_m = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -282,8 +297,11 @@ static void fp8_fp4_mega_moe(
                             " does not match `" + mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ", or 128 for blockwise-128 FP8 SFs)");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(not use_shuffled_weights or mma_kind == MmaKind::NVFP4);
     const auto activation_kind = parse_activation(activation);
+    // Row-shuffled (TRT) weights: NVFP4, or routed FP8 x FP4 SiTU experts (packed FP4 weights, SM107 K=64 MMA)
+    DG_HOST_ASSERT(not use_shuffled_weights or mma_kind == MmaKind::NVFP4 or
+                   (mma_kind == MmaKind::MXFP8FP4 and activation_kind == MegaMoEActivation::SiTU and
+                    not shared_l1_weights_tuple_opt.has_value() and not shared_l2_weights_tuple_opt.has_value()));
     DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or
                    mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(activation_kind != MegaMoEActivation::SiTU or not activation_clamp_opt.has_value());
@@ -374,8 +392,10 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b
+        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b, max_block_m
     );
+    DG_HOST_ASSERT(max_block_m == 0 or get_block_m_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type, global_num_tokens) <= max_block_m);
     if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))
         DG_HOST_UNREACHABLE("symmetric buffer is " + std::to_string(sym_buffer.nbytes()) +
                             " bytes but `" + mma_type + "`/`" + activation + "` with " +
@@ -426,6 +446,20 @@ static void fp8_fp4_mega_moe(
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales] = slice(sym_buffer);
     const bool use_fp8_combine = deep_jit::get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
+    // trtllm-gen numerics: defined for routed FP8xFP4 SiTU experts reduced by the BF16 combine
+    if (trtllm_numerics) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::MXFP8FP4 and activation_kind == MegaMoEActivation::SiTU);
+        DG_HOST_ASSERT(num_shared_experts == 0 and not post_expert_norm and not use_fp8_combine);
+        // Not validated against trtllm-gen: blockwise-128 FP8 SFs, the broadcast output
+        DG_HOST_ASSERT(not blockwise_128 and not broadcast_y);
+    }
+    DG_HOST_ASSERT(split4_combine_max_tokens >= 0);
+    // Packed top-k words: one-rank groups of routed FP8xFP4 experts; ids are counted from `packed_topk_first_expert`
+    DG_HOST_ASSERT(packed_topk_first_expert >= 0 and (packed_topk or packed_topk_first_expert == 0));
+    DG_HOST_ASSERT(not packed_topk or (mma_kind == MmaKind::MXFP8FP4 and sym_buffer_ptrs.size() == 1 and
+                                       num_shared_experts == 0 and not post_expert_norm));
+    DG_HOST_ASSERT(split4_combine_max_tokens == 0 or (trtllm_numerics and hidden % 128 == 0));
+
     // Dispatch into different architectures
     if (arch_major == 10) {
         sm100_fp8_fp4_mega_moe(y,
@@ -460,7 +494,9 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_eps,
                                mma_kind,
                                use_fp8_combine, gran_k, weight_layout, global_num_tokens,
-                               situ_beta, situ_linear_beta, broadcast_y);
+                               situ_beta, situ_linear_beta, broadcast_y,
+                               trtllm_numerics, split4_combine_max_tokens, packed_topk,
+                               packed_topk_first_expert);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

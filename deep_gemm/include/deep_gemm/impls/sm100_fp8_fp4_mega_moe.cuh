@@ -25,9 +25,10 @@ namespace deep_gemm {
 //   => 4 * tanh(g/4) * sigmoid(g) = 2T(1+T)^2 / (1 + T^2)
 // needs beta == 4, and the tanh-only up branch needs linear_beta == 25. Both helpers fall back to
 // the literal definition for any other pair, so a different config stays correct -- just slower.
-template <bool kFastMath, float kSituBeta, float kSituLinearBeta>
+// `kLiteralGate` forces the literal gate, whose FP32 rounding matches FlashInfer's trtllm-gen MoE
+template <bool kFastMath, float kSituBeta, float kSituLinearBeta, bool kLiteralGate = false>
 __forceinline__ __device__ float2 sm100_fp8_fp4_mega_moe_situ_gate(float2 gate) {
-    if constexpr (kSituBeta == 4.0f and kSituLinearBeta == 25.0f) {
+    if constexpr (not kLiteralGate and kSituBeta == 4.0f and kSituLinearBeta == 25.0f) {
         const float2 one = {1.0f, 1.0f};
         const float2 q = __fmul2_rn(gate, make_float2(0.25f, 0.25f));
         float2 t;
@@ -131,6 +132,13 @@ template <
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kBroadcastY = false,
+    // FlashInfer trtllm-gen numerics: top-k weight at the combine, SiTU on the FP32 accumulators, literal SiTU gate
+    bool kUseTrtllmNumerics = false,
+    // Token limit of trtllm-gen's small-call combine order (0: off)
+    uint32_t kNumSplit4CombineMaxTokens = 0,
+    // Top-k inputs as packed words `(expert id << 16) | bf16(weight)` in the `topk_idx` region (one-rank groups)
+    bool kPackedTopk = false,
+    uint32_t kPackedTopkFirstExpert = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -175,6 +183,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_m8,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_m8,
                             const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
@@ -200,13 +210,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
                      "Post-expert norm weight without the post-expert norm");
     DG_STATIC_ASSERT(not kUseShuffledWeights or
-                     (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
-                     "TRT weight layout requires routed NVFP4 experts");
+                     ((kMmaKind == MmaKind::NVFP4 or kUseSM107K64) and kNumSharedExperts == 0),
+                     "TRT weight layout requires routed NVFP4 experts, or routed FP8 x FP4 experts with the K=64 MMA");
     DG_STATIC_ASSERT(not kUseInterleavedWeights or
                      (kNumSharedExperts == 0 and
                       (kMmaKind == MmaKind::NVFP4 or (kMmaKind == MmaKind::MXFP8FP4 and
                                                       cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>))),
                      "Gate/up interleaved weight layout requires routed NVFP4 or FP8xFP8 experts");
+
+    // NOTES: the post-expert norm already applies the top-k weight in the combine
+    constexpr bool kWeightAtCombine = kUseTrtllmNumerics and not kWithPostExpertNorm;
+    constexpr bool kSituOnFp32 = kUseTrtllmNumerics and kUseSitu;
+    DG_STATIC_ASSERT(kNumSplit4CombineMaxTokens == 0 or
+                     (kWeightAtCombine and not kUseFp8Combine and kNumSharedExperts == 0 and kHidden % 128 == 0 and
+                      not kBroadcastY),
+                     "Split-4 combine needs trtllm numerics, the BF16 combine, no shared experts and a local output");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -344,7 +362,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kPackedFP4Weights = kUseSM107K64;
     DG_STATIC_ASSERT(not kPackedFP4Weights or
                      (kMmaKind == MmaKind::MXFP8FP4 and not kIsWeightFP8 and kGranK == 32 and
-                      BLOCK_K == 128 and not kUseShuffledWeights),
+                      BLOCK_K == 128),
                      "The K=64 MMA only applies to FP8 x FP4 with per-32 SFs and 128-wide K blocks");
     constexpr uint32_t UMMA_K = kPackedFP4Weights ? 64 : UMMA_K_BYTES * 8 / kNumElemBits;
     constexpr uint32_t UMMA_A_K_BYTES = UMMA_K * kNumElemBits / 8;
@@ -400,11 +418,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t L1_OUT_BLOCK_N_BYTES = L1_OUT_BLOCK_N * kNumElemBits / 8;
     constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M_L1 / 2; // float2
 
+    constexpr uint32_t kNumExpertCountWords =
+        math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment) / sizeof(uint32_t);
     struct SharedStorage {
+        // NOTES: the SIMT pull goes through registers, so it needs no send buffer
+        // NOTES: `count_words` exposes the union's padding for the one-rank flags (`kOneRankFlagBaseWord`)
         union alignas(kSharedMemoryAlignment) {
             uint32_t expert_token_count[kNumExperts];
-            // NOTES: the SIMT pull goes through registers, so it needs no send buffer
             uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull];
+            uint32_t count_words[kNumExpertCountWords];
         };
         union {
             alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES];
@@ -531,6 +553,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     cudaGridDependencySynchronize();
     const uint32_t tmem_base = ptx::ld_shared(&shared_storage.tmem_ptr_in_smem);
 
+    // Packed top-k words: bit 30 selects the FP32 weight of `topk_weights` instead of the word's BF16 bits
+    DG_STATIC_ASSERT(not kPackedTopk or (kNumRanks == 1 and not kWithPostExpertNorm and kNumSharedExperts == 0),
+                     "Packed top-k inputs are for one-rank groups of routed experts");
+    const int* packed_topk_ptr = buffer.input_topk_idx_buffer.template get_base_ptr<int>();
+    const auto read_topk_expert_idx = [&](const uint32_t& i) -> int {
+        if constexpr (kPackedTopk) {
+            const int id = packed_topk_ptr[i] >> 16;
+            const int expert_idx = (id & 0x3fff) - static_cast<int>(kPackedTopkFirstExpert);
+            return (id >= 0 and expert_idx >= 0 and expert_idx < static_cast<int>(kNumExpertsPerRank)) ? expert_idx : -1;
+        } else {
+            return static_cast<int>(buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>()[i]);
+        }
+    };
+    const auto read_packed_topk_weight = [&](const uint32_t& i) -> float {
+        const int word = packed_topk_ptr[i];
+        if (word >= 0 and (word & 0x40000000))
+            return buffer.input_topk_weights_buffer.template get_base_ptr<float>()[i];
+        const uint16_t bits = static_cast<uint16_t>(word & 0xffff);
+        return __bfloat162float(*reinterpret_cast<const nv_bfloat16*>(&bits));
+    };
+
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
@@ -546,6 +589,48 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_info_empty_barriers,
             shared_storage.task_infos
     );
+    scheduler.check_deps = true;
+    scheduler.l1_first_whenever_fits = (kNumRanks == 1);
+
+    // One-rank groups: expert token counts from token masks, a `topk_idx` scan or the send counts (see the scheduler)
+    // NOTES: the flags live in the count union behind the counts and the send buffer, zeroed in the prologue
+    constexpr uint32_t kOneRankScanBudget = 64;
+    constexpr uint32_t kOneRankMaskMaxTokens = 128;
+    constexpr uint32_t kOneRankFlagBaseWord = cute::max<uint32_t>(
+        kNumExperts, math::constexpr_ceil_div<uint32_t>(sizeof(SharedStorage::dispatch_send_buffer), sizeof(uint32_t)));
+    constexpr uint32_t kNumSpareCountWords =
+        kNumExpertCountWords > kOneRankFlagBaseWord ? kNumExpertCountWords - kOneRankFlagBaseWord : 0u;
+    constexpr uint32_t kSendCountsReadyWord = kOneRankFlagBaseWord, kTokenMasksReadyWord = kOneRankFlagBaseWord + 1,
+                       kPullsDoneWord = kOneRankFlagBaseWord + 2;
+    constexpr uint32_t kNumTokenMaskWords = kNumExperts * 4 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 4 :
+                              kNumExperts * 2 * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) ? 2 : 1;
+    constexpr bool kTokenMasksFit = kUseSimtPull and not kHasShared and
+        kNumExperts * kNumTokenMaskWords * sizeof(uint32_t) <= sizeof(SharedStorage::smem_d) and
+        kNumSpareCountWords >= 4;
+    const bool use_token_masks = kTokenMasksFit and (kNumRanks == 1) and num_tokens <= kOneRankMaskMaxTokens and
+        num_tokens <= 32 * kNumTokenMaskWords and num_tokens * kNumTopk <= kNumDispatchThreads * 8;
+    uint32_t* token_masks = reinterpret_cast<uint32_t*>(&shared_storage.smem_d);
+    // Set by this CTA's dispatch warps: the masks are complete / the pulls are done (`smem_d` is free again)
+    uint32_t* token_masks_ready = shared_storage.count_words + kTokenMasksReadyWord;
+    uint32_t* pulls_done = shared_storage.count_words + kPullsDoneWord;
+    scheduler.use_token_masks = use_token_masks;
+    scheduler.token_masks = token_masks;
+    scheduler.token_masks_ready = token_masks_ready;
+    scheduler.num_token_mask_words = kNumTokenMaskWords;
+    const bool use_local_counts = use_token_masks or (kNumRanks == 1) and
+        num_tokens * math::constexpr_ceil_div(kNumExpertsPerRank, 32u) <= kOneRankScanBudget;
+    scheduler.use_local_counts = use_local_counts;
+    scheduler.topk_idx = buffer.input_topk_idx_buffer.template get_base_ptr<int64_t>();
+    scheduler.num_call_tokens = num_tokens;
+    scheduler.num_topk = kNumTopk;
+    scheduler.packed_topk = kPackedTopk;
+    scheduler.packed_topk_first_expert = static_cast<int>(kPackedTopkFirstExpert);
+    constexpr bool kSendCountsFlagFits = kNumSpareCountWords >= 1;
+    const bool use_send_counts = kSendCountsFlagFits and (kNumRanks == 1) and not use_local_counts;
+    // Set by this CTA's dispatch warps after the dispatch grid sync: every SM's send count is in
+    uint32_t* send_counts_ready = shared_storage.count_words + kSendCountsReadyWord;
+    scheduler.use_send_counts = use_send_counts;
+    scheduler.send_counts_ready = send_counts_ready;
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -606,8 +691,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-                    expert_idx = static_cast<int>(
-                        buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[i * kNumTopk + lane_idx]);
+                    expert_idx = read_topk_expert_idx(i * kNumTopk + lane_idx);
                     if (expert_idx >= 0)
                         process(i * kNumTopk + lane_idx, expert_idx);
                 }
@@ -629,6 +713,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             nvl_barrier_counter = *workspace.get_nvl_barrier_counter_ptr();
 
         // Count experts' tokens
+        // NOTES: local counts (one-rank groups) publish no count and push no source index
+        if (not use_local_counts)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
         });
@@ -644,17 +730,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     process(j, i);
             }
         };
+        if (not use_local_counts)
         for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
             if (const uint64_t num_tokens_to_expert = shared_storage.expert_token_count[i]; num_tokens_to_expert != 0)
                 expert_send_status[j] = static_cast<uint32_t>(
                     ptx::atomic_add(workspace.get_expert_send_count_ptr(i), num_tokens_to_expert));
         });
+        if (not use_local_counts)
         for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
             shared_storage.expert_token_count[i] = expert_send_status[j];
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
+        if (not use_local_counts)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -664,10 +753,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         });
 
         // Grid sync
+        if (not use_local_counts)
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        if (use_send_counts and thread_idx == 0)
+            ptx::st_shared(send_counts_ready, 1u);
 
         // Write expert count
         if (sm_idx == 0) {
@@ -683,9 +775,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
+            // NOTES: the one-rank count paths do not read the relayed sums
+            if (not use_local_counts and not use_send_counts)
             for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 expert_send_status[j] = static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i));
             });
+            if (not use_local_counts and not use_send_counts)
             for_each_thread_expert([&](const uint32_t& j, const uint32_t& i) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
@@ -711,6 +806,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+        // NOTES: a one-rank group has no peer to wait for
+        if constexpr (kNumRanks > 1)
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -735,6 +832,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+        if (use_token_masks) {
+            for (uint32_t i = thread_idx; i < kNumExperts * kNumTokenMaskWords; i += kNumDispatchThreads)
+                ptx::st_shared(token_masks + i, 0u);
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            const uint32_t num_ids = num_tokens * kNumTopk;
+            int expert_ids[8];
+            #pragma unroll
+            for (uint32_t b = 0; b < 8; ++ b) {
+                const uint32_t id_idx = thread_idx + b * kNumDispatchThreads;
+                expert_ids[b] = id_idx < num_ids ?
+                    read_topk_expert_idx(id_idx) : -1;
+            }
+            #pragma unroll
+            for (uint32_t b = 0; b < 8; ++ b) {
+                if (expert_ids[b] >= 0) {
+                    const uint32_t token_idx = (thread_idx + b * kNumDispatchThreads) / kNumTopk;
+                    atomicOr_block(token_masks + static_cast<uint32_t>(expert_ids[b]) * kNumTokenMaskWords + token_idx / 32, 1u << (token_idx % 32));
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::st_shared(token_masks_ready, 1u);
+        }
+
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
@@ -742,16 +863,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
-            while (token_idx >= expert_end_idx) {
-                if (++ current_expert_idx >= kNumExpertsPerRank)
-                    break;
-
-                // Update pool block offset for the new expert
-                expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-
-                // Move start and end to the next expert
-                expert_start_idx = expert_end_idx;
-                expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+            // One prefix-sum pass over the per-lane counts plus a ballot
+            if (token_idx >= expert_end_idx) {
+                constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+                uint32_t num_prefix_tokens = 0, found_start_idx = 0, found_num_tokens = 0;
+                int found_expert_idx = -1;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+                    const uint32_t count = (i * 32 + lane_idx < kNumExpertsPerRank) ? scheduler.stored_num_tokens_per_expert[i] : 0u;
+                    const uint32_t inclusive = math::warp_inclusive_sum(count, lane_idx) + num_prefix_tokens;
+                    const uint32_t exclusive = inclusive - count;
+                    const uint32_t mask = __ballot_sync(0xffffffff, count > 0 and token_idx >= exclusive and token_idx < inclusive);
+                    if (mask != 0 and found_expert_idx < 0) {
+                        const uint32_t found_lane_idx = static_cast<uint32_t>(__ffs(mask) - 1);
+                        found_expert_idx = static_cast<int>(i * 32 + found_lane_idx);
+                        found_start_idx = ptx::exchange(exclusive, found_lane_idx);
+                        found_num_tokens = ptx::exchange(count, found_lane_idx);
+                    }
+                    num_prefix_tokens = ptx::exchange(inclusive, 31);
+                }
+                if (found_expert_idx < 0) {
+                    current_expert_idx = kNumExpertsPerRank;
+                } else {
+                    current_expert_idx = found_expert_idx;
+                    expert_start_idx = found_start_idx;
+                    expert_end_idx = found_start_idx + found_num_tokens;
+                    expert_pool_block_offset = scheduler.get_pool_block_offset(static_cast<uint32_t>(found_expert_idx));
+                }
             }
 
             // Finish all tokens
@@ -766,8 +904,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
+                    // NOTES: with one rank, the rank's count is the expert's count this warp already holds
                     stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, phys_expert_idx)) : 0;
+                        (kNumRanks == 1 ? (expert_end_idx - expert_start_idx) :
+                         static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, phys_expert_idx))) : 0;
                 }
             }
 
@@ -821,8 +961,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     remaining[i] -= cute::min(remaining[i], length);
             }
 
-            // Read source token-topk index (written by remote dispatch via NVLink)
-            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
+            // Read source token-topk index (written by remote dispatch via NVLink, or found locally in a one-rank group)
+            const uint32_t src_token_topk_idx = use_local_counts ?
+                scheduler.find_src_token_topk_idx(phys_expert_idx, token_idx_in_expert) :
+                *workspace.get_src_token_topk_idx_ptr(
                 phys_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
@@ -873,7 +1015,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t j = i * 32 + lane_idx;
                     pulled_sf[i] = j < kNumSFUint32 ? remote_sf_ptr[j] : 0;
                 }
-                const auto weight = *sym_buffer.map(
+                const float weight = kPackedTopk ? read_packed_topk_weight(src_token_topk_idx) : *sym_buffer.map(
                     buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 if constexpr (kUseXScales) {
@@ -951,7 +1093,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight and x_scale first, so that their remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
+            const float weight = kPackedTopk ? read_packed_topk_weight(src_token_topk_idx) : *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                 current_rank_in_expert_idx);
             if constexpr (kUseXScales) {
@@ -1036,6 +1178,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+        // One-rank token masks: the epilogue may use `smem_d` from here on
+        if (use_token_masks) {
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::st_shared(pulls_done, 1u);
+        }
+
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1097,6 +1246,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         // Wait for all ranks to finish cleaning
+        // NOTES: skipped for a one-rank group, whose next call has no pull barrier to pair with it
+        if constexpr (kNumRanks > 1)
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -1128,7 +1279,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the entire token arrival
-            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+            // NOTES: the scheduler has already checked the inputs of a task that carries `kDepsCheckedBit`
+            const bool deps_checked = (task_info.m_block_idx & scheduler.kDepsCheckedBit) != 0;
+            if (task_info.block_phase == sched::BlockPhase::Linear1 and not deps_checked) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
@@ -1138,9 +1291,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
+            // A 16-row MMA tile: each CTA reads only its 8 rows
+            // NOTES: only validated for kernels without shared experts
+            const bool use_m8_acts = not kHasShared and not task_info.is_shared() and LOAD_BLOCK_M > 8 and
+                task_info.get_umma_aligned_valid_m() == 16;
+            const auto tensor_map_a_m8_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts_m8 : &tensor_map_l2_acts_m8;
+
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                if (task_info.block_phase == sched::BlockPhase::Linear2) {
+                if (task_info.block_phase == sched::BlockPhase::Linear2 and not deps_checked) {
                     l2_k_block_dependency.wait(k_block_idx);
                     // Blockwise-128 reuses one SF word across `kNumSFStagesPerLoad` K blocks, but its later
                     // bytes are produced by those blocks' L1 epilogue: wait for all of them or they are stale.
@@ -1177,6 +1336,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (is_split_k) {
                         tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_M, kSwizzleK64Mode, a_dtype_t, false, kActsCacheHint>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                    } else if (use_m8_acts) {
+                        tma::copy<BLOCK_K_BYTES, 8, kSwizzleAMode, a_dtype_t, false, kActsCacheHint>(
+                            tensor_map_a_m8_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
                     } else {
                         tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, false, kActsCacheHint>(
                             tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
@@ -1186,7 +1348,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     }
                     if (is_leader_cta) {
-                        const uint32_t num_a_bytes = is_split_k ? LOAD_BLOCK_M * SHARED_BLOCK_K : sizeof(SharedStorage::smem_a[0]);
+                        const uint32_t num_a_bytes = is_split_k ? LOAD_BLOCK_M * SHARED_BLOCK_K :
+                            use_m8_acts ? 8u * BLOCK_K_BYTES : sizeof(SharedStorage::smem_a[0]);
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
                             num_a_bytes * 2 + (load_sfa ? sizeof(SharedStorage::smem_sfa[0]) * 2 : 0));
                     } else {
@@ -1239,7 +1402,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     task_info.local_expert_idx * shape_sfb_k + (k_block_idx / kNumSFStagesPerLoad) * kNumSFWordsPerStage;
 
                 // TMA copy weights with SF
-                if constexpr (kUseShuffledWeights) {
+                if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
+                    // NOTES: SMEM holds the `megamoe` order except for L1's 16-channel order, which the L1 epilogue undoes
+                    DG_STATIC_ASSERT(LOAD_BLOCK_N == 128 and BLOCK_N == 128 and BLOCK_K == 128 and
+                                     kSFChunkK == 128 and kNumSFWordsPerStage == 1 and kNumSFStagesPerLoad == 1,
+                                     "Row-shuffled FP8 x FP4 weights need 128x128 tiles with one SF word per stage");
+                    const bool is_l1 = task_info.block_phase == sched::BlockPhase::Linear1;
+                    const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
+                    const uint32_t sf_slab_idx = (expert_n_idx / 128) * (shape_k / 128) + k_block_idx;
+                    auto* full = reinterpret_cast<uint64_t*>(&shared_storage.full_barriers[stage_idx]);
+                    auto* weight_tile = reinterpret_cast<uint8_t*>(shared_storage.smem_b[stage_idx]);
+                    auto* sf_tile = reinterpret_cast<uint8_t*>(shared_storage.smem_sfb[stage_idx]);
+                    if (cute::elect_one_sync()) {
+                        if (is_l1) {
+                            cute::SM100_TMA_2SM_LOAD_2D::copy(
+                                tensor_map_b_ptr, full, weight_cache_hint, weight_tile, k_block_idx * 128, expert_n_idx);
+                            cute::SM100_TMA_2SM_LOAD_2D::copy(
+                                tensor_map_sfb_ptr, full, weight_cache_hint, sf_tile, 0, sf_slab_idx);
+                        } else {
+                            cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                tensor_map_b_ptr, full, weight_cache_hint, weight_tile, k_block_idx * 128, 0, 0, expert_n_idx / 32);
+                            cute::SM100_TMA_2SM_LOAD_4D::copy(
+                                tensor_map_sfb_ptr, full, weight_cache_hint, sf_tile, 0, 0, 0, sf_slab_idx);
+                        }
+                        if (is_leader_cta)
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                (sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0])) * 2);
+                        else
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                    }
+                } else if constexpr (kUseShuffledWeights) {
                     // TRT weights are 2D `[E * N, K]` rows (no shared experts); `localize_rows` homes row half `d` of each expert in domain `d`
                     const uint32_t expert_n_idx = task_info.local_expert_idx * shape_n + n_idx;
 
@@ -1520,7 +1712,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                             auto smem_ptr = shared_storage.smem_sfb[stg] +
-                                ((kUseShuffledWeights or kUseInterleavedWeights)
+                                (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                     ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk * kNumUTCCPAlignedElems
                                     : sf_chunk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                             mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1642,7 +1834,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = shared_storage.smem_sfb[stg] +
-                                    ((kUseShuffledWeights or kUseInterleavedWeights)
+                                    (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                         ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk * kNumUTCCPAlignedElems
                                         : sf_chunk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                 mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1764,7 +1956,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                                     auto smem_ptr = shared_storage.smem_sfb[stage_idx] +
-                                        ((kUseShuffledWeights or kUseInterleavedWeights)
+                                        (((kUseShuffledWeights and not kPackedFP4Weights) or kUseInterleavedWeights)
                                             ? i * (kNumSFWordsPerStage * kNumUTCCPAlignedElems) + sf_chunk_idx * kNumUTCCPAlignedElems
                                             : sf_chunk_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                                     mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
@@ -1856,6 +2048,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
+        // The one-rank count paths wait for this CTA's dispatch warps here
+        scheduler.is_scheduler_warp = true;
         // Do mainloop by the leader CTA
         if (is_leader_cta)
             scheduler.mainloop(num_tokens, sm_locality_domains);
@@ -1903,6 +2097,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Now we can release the task
             scheduler.release_task_info();
+            // NOTES: the one-rank token masks live in `smem_d` until this CTA's pulls are done
+            if (use_token_masks)
+                while (ptx::ld_volatile_shared(pulls_done) == 0u) {}
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
@@ -2023,9 +2220,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
                         // Load weights from global into register cache per 32 tokens
-                        // NOTES: the post-expert norm applies the top-k weight in the combine
+                        // NOTES: the post-expert norm and the trtllm numerics apply the top-k weight in the combine
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not kWithPostExpertNorm and not task_info.is_shared() and
+                        if (not kWithPostExpertNorm and not kWeightAtCombine and not task_info.is_shared() and
                             (j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
@@ -2056,7 +2253,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from register cache
                         float2 weights = {1.0f, 1.0f};
-                        if constexpr (not kWithPostExpertNorm) {
+                        if constexpr (not kWithPostExpertNorm and not kWeightAtCombine) {
                             weights = {
                                 ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                                 ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
@@ -2092,9 +2289,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             constexpr bool kIsOAISwiGLU = kSwiGLUAlpha != 0.0f;
                             auto gate = __bfloat1622float2(bf16_gate);
                             auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kSituOnFp32) {
+                                // trtllm-gen feeds the FP32 accumulators to SiTU
+                                gate = fp32_values[k * 2 + kGateSlot];
+                                up = fp32_values[k * 2 + kUpSlot];
+                            }
                             if constexpr (kUseSitu) {
                                 // Tanh-bounded gate and soft-clipped up branch.
-                                gate = sm100_fp8_fp4_mega_moe_situ_gate<kFastMath, kSituBeta, kSituLinearBeta>(gate);
+                                gate = sm100_fp8_fp4_mega_moe_situ_gate<kFastMath, kSituBeta, kSituLinearBeta, kUseTrtllmNumerics>(gate);
                                 up = sm100_fp8_fp4_mega_moe_situ_up<kFastMath, kSituBeta, kSituLinearBeta>(up);
                             } else {
                                 // SwiGLU: silu(gate) * up
@@ -2278,6 +2480,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         __syncwarp();
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    if constexpr (kUseShuffledWeights and kPackedFP4Weights) {
+                        // Row-shuffled L1 rows hold 8 even then 8 odd channels per 16: interleave the halves of every 16-byte word
+                        constexpr uint32_t kNumStagedUint4 = STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES / sizeof(uint4);
+                        DG_STATIC_ASSERT(L1_OUT_BLOCK_N_BYTES % 16 == 0 and not kIsFP4Acts, "Invalid L1 output staging");
+                        auto* staged = reinterpret_cast<uint4*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx]);
+                        for (uint32_t j = warp_idx_in_wg * 32 + lane_idx; j < kNumStagedUint4; j += 128) {
+                            const uint4 x = staged[j];
+                            staged[j] = make_uint4(__byte_perm(x.x, x.z, 0x5140), __byte_perm(x.x, x.z, 0x7362),
+                                                   __byte_perm(x.y, x.w, 0x5140), __byte_perm(x.y, x.w, 0x7362));
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    }
 
                     if constexpr (kIsNVFP4) {
                         if (warp_idx_in_wg == 0u) {
@@ -2607,7 +2822,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
+        // NOTES: a one-rank group has no peer to tag, only the broadcast output still reads its own index
         uint64_t peer_grid_idx = 0;
+        if constexpr (kNumRanks > 1 or kBroadcastY)
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
@@ -2618,22 +2835,98 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         );
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
+        if constexpr (kNumRanks > 1)
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
+
+        // trtllm-gen numerics, small calls: slot `s` goes to accumulator `s % 4`, reduced as `((a0 + a1) + a2) + a3`
+        uint32_t num_combine_token_chunks = num_tokens * kNumChunks;
+        if constexpr (kNumSplit4CombineMaxTokens > 0) {
+            if (num_tokens <= kNumSplit4CombineMaxTokens) {
+                // The main combine below is skipped
+                num_combine_token_chunks = 0;
+
+                constexpr uint32_t kNumSubChunkElems = 128;
+                constexpr uint32_t kNumSubChunks = kHidden / kNumSubChunkElems;
+                for (uint32_t item_idx = epilogue_warp_idx * kNumSMs + sm_idx; item_idx < num_tokens * kNumSubChunks; item_idx += kNumSMs * kNumEpilogueWarps) {
+                    const uint32_t token_idx = item_idx / kNumSubChunks;
+                    const uint32_t sub_chunk_idx = item_idx % kNumSubChunks;
+
+                    const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+                        read_topk_expert_idx(token_idx * kNumTopk + lane_idx) : -1;
+                    const float stored_topk_weight = lane_idx < kNumTopk ?
+                        (kPackedTopk ? read_packed_topk_weight(token_idx * kNumTopk + lane_idx) :
+                         buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_idx * kNumTopk + lane_idx]) : 0.0f;
+                    const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+
+                    // Wait for the ranks of the selected experts to finish their L2 writes
+                    const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+                    const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                        is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+                    // NOTES: a one-rank group publishes no readiness word, its rows were written before the grid sync above
+                    if constexpr (kNumRanks > 1)
+                    comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                                     [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
+                    // NOTES: not `__ldg`, peers write these rows over NVLink
+                    uint2 slot_values[kNumTopk];
+                    #pragma unroll
+                    for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                        slot_values[slot_idx] = make_uint2(0u, 0u);
+                        if (total_mask >> slot_idx & 1)
+                            slot_values[slot_idx] = buffer.combine_token_buffer.get_rank_buffer(slot_idx).get_data_buffer(token_idx)
+                                                        .get_base_ptr<uint2>()[sub_chunk_idx * 32 + lane_idx];
+                    }
+
+                    float2 split_acc_lo[4] = {}, split_acc_hi[4] = {};
+                    #pragma unroll
+                    for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
+                        // Warp-uniform: `total_mask` is a ballot result
+                        if (total_mask >> slot_idx & 1) {
+                            const float slot_weight = __shfl_sync(0xffffffff, stored_topk_weight, slot_idx);
+                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&slot_values[slot_idx]);
+                            const float2 pair_lo = __bfloat1622float2(bf16_values[0]);
+                            const float2 pair_hi = __bfloat1622float2(bf16_values[1]);
+                            auto& acc_lo = split_acc_lo[slot_idx & 3];
+                            auto& acc_hi = split_acc_hi[slot_idx & 3];
+                            acc_lo.x = __fmaf_rn(pair_lo.x, slot_weight, acc_lo.x);
+                            acc_lo.y = __fmaf_rn(pair_lo.y, slot_weight, acc_lo.y);
+                            acc_hi.x = __fmaf_rn(pair_hi.x, slot_weight, acc_hi.x);
+                            acc_hi.y = __fmaf_rn(pair_hi.y, slot_weight, acc_hi.y);
+                        }
+                    }
+                    float2 sum_lo = split_acc_lo[0], sum_hi = split_acc_hi[0];
+                    #pragma unroll
+                    for (uint32_t i = 1; i < 4; ++ i) {
+                        sum_lo.x = __fadd_rn(sum_lo.x, split_acc_lo[i].x);
+                        sum_lo.y = __fadd_rn(sum_lo.y, split_acc_lo[i].y);
+                        sum_hi.x = __fadd_rn(sum_hi.x, split_acc_hi[i].x);
+                        sum_hi.y = __fadd_rn(sum_hi.y, split_acc_hi[i].y);
+                    }
+
+                    uint2 casted;
+                    auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                    casted_bf16[0] = __float22bfloat162_rn(sum_lo);
+                    casted_bf16[1] = __float22bfloat162_rn(sum_hi);
+                    reinterpret_cast<uint2*>(math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes))[sub_chunk_idx * 32 + lane_idx] = casted;
+                }
+            }
+        }
+
         uint64_t known_ready_ranks = 0;
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
+        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_combine_token_chunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
+                read_topk_expert_idx(token_idx * kNumTopk + lane_idx) :
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
@@ -2647,7 +2940,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto print_peers_timeout = [&]() {
                 printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx);
             };
-            bool is_lane_ready = not is_routed or ((known_ready_ranks & peer_rank_bit) != 0ull);
+            bool is_lane_ready = not is_routed or kNumRanks == 1 or ((known_ready_ranks & peer_rank_bit) != 0ull);
             const auto record_ready_ranks = [&]() {
                 if constexpr (kNumRanks <= 32) {
                     known_ready_ranks |= __reduce_or_sync(
@@ -2684,6 +2977,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
             // scale-invariant norm would otherwise erase.
             float slot_norm_scale = 1.0f;
+            if constexpr (kWeightAtCombine) {
+                // trtllm numerics: lane `s` holds slot `s`'s top-k weight, the shared slot keeps 1
+                if (lane_idx < kNumTopk)
+                    slot_norm_scale = kPackedTopk ? read_packed_topk_weight(token_idx * kNumTopk + lane_idx) :
+                                      __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                                            token_idx * kNumTopk + lane_idx);
+            }
             if constexpr (kFusedPostNormPartials) {
                 // Lane `s` reads slot `s`'s total, already accumulated by the L2 tiles.
                 const float my_topk_weight = lane_idx < kNumTopk ?
@@ -2817,7 +3117,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
 
                     float slot_scale = 1.0f;
-                    if constexpr (kWithPostExpertNorm)
+                    if constexpr (kWithPostExpertNorm or kWeightAtCombine)
                         slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
                                                  static_cast<uint32_t>(active_slot));
 
@@ -2835,7 +3135,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 (chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 16) / kCombineGranK;
                             const uint8_t sf_byte = __ldg(sf_token_ptr + sf_idx);
                             float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
-                            if constexpr (kWithPostExpertNorm)
+                            if constexpr (kWithPostExpertNorm or kWeightAtCombine)
                                 sf *= slot_scale;
                             const uint32_t* w = reinterpret_cast<const uint32_t*>(&uint4_values);
                             #pragma unroll
@@ -2867,7 +3167,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
                                 auto& acc = reduced[j * kNumElemsPerUint4 + l];
-                                if constexpr (kWithPostExpertNorm) {
+                                if constexpr (kWithPostExpertNorm or kWeightAtCombine) {
                                     const float2 pair = __bfloat1622float2(bf16_values[l]);
                                     acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
                                     acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);

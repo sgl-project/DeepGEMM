@@ -65,8 +65,18 @@ class SymmBuffer:
                  recipe_a: Optional[Tuple[int, int]] = None,
                  recipe_b: Optional[Tuple[int, int]] = None,
                  base: Optional['SymmBuffer'] = None,
-                 gather_output: bool = False):
-        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+                 gather_output: bool = False,
+                 exact_num_max_tokens: bool = False,
+                 max_block_m: Optional[int] = None):
+        # `exact_num_max_tokens`: keep the row count as given; `max_block_m`: largest M tile the rings are sized for
+        if exact_num_max_tokens:
+            assert num_max_tokens_per_rank > 0 and num_max_tokens_per_rank % 128 == 0, \
+                '`exact_num_max_tokens` needs a positive multiple of 128 rows'
+        else:
+            num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+        assert not (exact_num_max_tokens or max_block_m) or mma_type != 'bf16xbf16', \
+            '`exact_num_max_tokens` and `max_block_m` are not supported by the BF16 kernel'
+        self.max_block_m = int(max_block_m or 0)
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
         assert activation != 'situ' or mma_type in ('fp8xfp4', 'fp8xfp8', 'nvfp4xnvfp4'), \
             '`situ` activation is supported only for `fp8xfp4`, `fp8xfp8` and `nvfp4xnvfp4` MegaMoE'
@@ -86,7 +96,7 @@ class SymmBuffer:
                        num_max_tokens_per_rank, num_topk,
                        hidden, intermediate_hidden,
                        mma_type, activation,
-                       num_shared_experts, recipe, recipe_a, recipe_b)
+                       num_shared_experts, recipe, recipe_a, recipe_b, self.max_block_m)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
         num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
@@ -311,7 +321,13 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      post_expert_norm_weight: Optional[torch.Tensor] = None,
                      post_expert_norm_eps: float = 1e-6,
                      post_expert_norm_weight_first: bool = False,
-                     broadcast_y: bool = False):
+                     broadcast_y: bool = False,
+                     numerics: str = 'default',
+                     split4_combine_max_tokens: int = 0,
+                     topk_format: str = 'int64',
+                     topk_first_expert: int = 0):
+    # `numerics='trtllm'`: rounding placement of FlashInfer's trtllm-gen MoE; the split-4 combine is not batch-invariant
+    # `topk_format='packed'`: int32 words `(expert id << 16) | bf16(weight)`, ids counted from `topk_first_expert`
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     if broadcast_y:
@@ -322,8 +338,24 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             y.storage_offset() == gathered_y.storage_offset(), \
             '`broadcast_y` needs `y` to be a leading slice of `sym_buffer.gathered_y`'
     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
-    if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4':
-        raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA')
+    if numerics not in ('default', 'trtllm'):
+        raise ValueError(f"`numerics` must be 'default' or 'trtllm'; got {numerics!r}")
+    if numerics == 'trtllm' and (sym_buffer.mma_type != 'fp8xfp4' or activation != 'situ'):
+        raise ValueError("`numerics='trtllm'` is only supported for `fp8xfp4` with `activation='situ'`")
+    if topk_format not in ('int64', 'packed'):
+        raise ValueError(f"`topk_format` must be 'int64' or 'packed'; got {topk_format!r}")
+    if topk_format == 'packed' and (sym_buffer.group.size() != 1 or sym_buffer.mma_type != 'fp8xfp4'
+                                    or shared_l1_weights is not None or post_expert_norm):
+        raise ValueError("`topk_format='packed'` is only supported for one-rank `fp8xfp4` groups of routed experts")
+    if topk_first_expert != 0 and topk_format != 'packed':
+        raise ValueError("`topk_first_expert` requires `topk_format='packed'`")
+    if not 0 <= topk_first_expert < 16384:
+        raise ValueError(f'`topk_first_expert` must be in [0, 16384); got {topk_first_expert}')
+    if split4_combine_max_tokens != 0 and numerics != 'trtllm':
+        raise ValueError("`split4_combine_max_tokens` requires `numerics='trtllm'`")
+    if weight_layout == 'row_shuffled' and sym_buffer.mma_type != 'nvfp4xnvfp4' and not (
+            sym_buffer.mma_type == 'fp8xfp4' and activation == 'situ'):
+        raise ValueError('Row-shuffled (TRT-LLM) weights require NVFP4 MMA, or FP8xFP4 with the SiTU activation')
     if weight_layout in ('gate_up_interleaved', 'up_gate_block16') and sym_buffer.mma_type not in ('nvfp4xnvfp4', 'fp8xfp8'):
         raise ValueError('Gate/up interleaved weights require NVFP4 or FP8xFP8 MMA')
     if use_x_scales and sym_buffer.mma_type != 'nvfp4xnvfp4':
@@ -363,7 +395,10 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
-        weight_layout, global_num_tokens, broadcast_y
+        weight_layout, global_num_tokens, broadcast_y,
+        numerics == 'trtllm', split4_combine_max_tokens,
+        topk_format == 'packed', topk_first_expert,
+        sym_buffer.max_block_m
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
