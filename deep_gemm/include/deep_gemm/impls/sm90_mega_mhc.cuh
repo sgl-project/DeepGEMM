@@ -425,24 +425,24 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                 const float2 post = row_post_coeff[output_route_idx];
                                 const float post_coeff = row_idx == 0 ? post.x : post.y;
                                 auto& post_value = post_values[output_route_idx][row_idx];
-                                post_value = math::mul_fp32x2_rn(x[row_idx], {post_coeff, post_coeff});
+                                post_value = math::mul2(x[row_idx], {post_coeff, post_coeff});
                                 #pragma unroll
                                 for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx) {
                                     const uint32_t comb_idx = input_route_idx * kNumRoutes + output_route_idx;
                                     const float2 comb = row_comb_coeff[comb_idx];
                                     const float coeff = row_idx == 0 ? comb.x : comb.y;
-                                    post_value = math::fma_fp32x2_rn(residual[row_idx][input_route_idx], {coeff, coeff}, post_value);
+                                    post_value = math::fma2(residual[row_idx][input_route_idx], {coeff, coeff}, post_value);
                                 }
                                 // NOTES: this BF16 round is the shared numerical boundary for all consumers.
                                 const nv_bfloat162 post_value_bf16 = __float22bfloat162_rn(post_value);
                                 post_value = __bfloat1622float2(post_value_bf16);
                                 smem.residual[io_stage_idx][output_route_idx][
                                     get_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = post_value_bf16;
-                                hc_norm_sqr_sums[row_idx] = math::fma_fp32x2_rn(post_value, post_value, hc_norm_sqr_sums[row_idx]);
+                                hc_norm_sqr_sums[row_idx] = math::fma2(post_value, post_value, hc_norm_sqr_sums[row_idx]);
                                 if constexpr (kIsShifted) {
                                     const float2 pre = row_pre_coeff[output_route_idx];
                                     const float coeff = row_idx == 0 ? pre.x : pre.y;
-                                    x1[row_idx] = math::fma_fp32x2_rn(post_value, {coeff, coeff}, x1[row_idx]);
+                                    x1[row_idx] = math::fma2(post_value, {coeff, coeff}, x1[row_idx]);
                                 }
                             }
                         }

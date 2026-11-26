@@ -4,7 +4,6 @@
 #include <cutlass/arch/reg_reconfig.h>
 
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/fp32x2.cuh>
 #include <deep_gemm/layout/mega_mhc.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/scheduler/mega_mhc.cuh>
@@ -120,7 +119,7 @@ constexpr uint32_t kNumLanesPerSFWord = kHiddenPerSFWord / kHiddenPerNormLane;
 
 // Shared normalization and FP8 output helpers.
 CUTLASS_DEVICE nv_bfloat162 normalize_bf16_pair(const nv_bfloat162& input, const nv_bfloat162& weight, const float& scale) {
-    return __float22bfloat162_rn(math::mul_fp32x2_rn(math::mul_fp32x2_rn(bf16x2_to_float2(input), {scale, scale}), bf16x2_to_float2(weight)));
+    return __float22bfloat162_rn(math::mul2(math::mul2(bf16x2_to_float2(input), {scale, scale}), bf16x2_to_float2(weight)));
 }
 
 template <uint32_t SF_BLOCK_M>
@@ -217,13 +216,13 @@ CUTLASS_DEVICE void run_normal_worker(Storage& smem, const Workspace<kNumSplits>
                 const auto pairs = reinterpret_cast<const nv_bfloat162*>(&input);
                 #pragma unroll
                 for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
-                    values[pair_idx] = math::fma_fp32x2_rn(bf16x2_to_float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
+                    values[pair_idx] = math::fma2(bf16x2_to_float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
             }
             #pragma unroll
             for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx) {
                 output[pair_idx] = __float22bfloat162_rn(values[pair_idx]);
                 values[pair_idx] = bf16x2_to_float2(output[pair_idx]);
-                sqr_sum = math::fma_fp32x2_rn(values[pair_idx], values[pair_idx], sqr_sum);
+                sqr_sum = math::fma2(values[pair_idx], values[pair_idx], sqr_sum);
             }
         }
 

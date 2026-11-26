@@ -63,6 +63,14 @@ CUTLASS_DEVICE void swap(T& a, T& b) {
 }
 
 #ifdef DG_IN_CUDA_COMPILATION
+CUTLASS_DEVICE float2 mul2(const float2& a, const float2& b) {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+    return __fmul2_rn(a, b);
+#else
+    return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
 CUTLASS_DEVICE float2 fma2(const float2& a, const float2& b, const float2& c) {
 #if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
     return __ffma2_rn(a, b, c);
@@ -177,7 +185,7 @@ template <bool kUseUE8M0 = true>
 CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
     DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
     const float2 finfo_factor = {1.0 / 448.0, 1.0 / 448.0};
-    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto scaled = mul2(amax, finfo_factor);
     const auto exp_x = fast_log2_ceil(scaled.x);
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
@@ -191,7 +199,7 @@ template <bool kUseUE8M0 = true>
 CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
     DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
     const float2 finfo_factor = {1.0f / 6.0f, 1.0f / 6.0f};
-    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto scaled = mul2(amax, finfo_factor);
     const auto exp_x = fast_log2_ceil(scaled.x);
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
@@ -202,7 +210,7 @@ CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float
 // to `__frcp_rn` across all finite non-negative E4M3 values, without a shared-memory LUT.
 CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv, uint2& sf_bits) {
     constexpr float kInvMax = 1.0f / 6.0f;
-    const float2 scaled = __fmul2_rn(amax, {kInvMax, kInvMax});
+    const float2 scaled = mul2(amax, {kInvMax, kInvMax});
     const __nv_fp8_e4m3 qx(scaled.x), qy(scaled.y);
     sf_bits = {qx.__x, qy.__x};
     sf = {static_cast<float>(qx), static_cast<float>(qy)};
@@ -231,7 +239,7 @@ CUTLASS_DEVICE void init_nvfp4_sf_inv_lut(float* lut, const uint32_t& lane_idx) 
 CUTLASS_DEVICE void get_nvfp4_sf_inv_from_lut(const float2& amax, const float* lut,
                                               float2& sf_inv, uint2& sf_bits) {
     constexpr float kInvMax = 1.0f / 6.0f;
-    const float2 scaled = __fmul2_rn(amax, {kInvMax, kInvMax});
+    const float2 scaled = mul2(amax, {kInvMax, kInvMax});
     const __nv_fp8_e4m3 qx(scaled.x), qy(scaled.y);
     sf_bits = {qx.__x, qy.__x};
     sf_inv = {lut[qx.__x], lut[qy.__x]};
