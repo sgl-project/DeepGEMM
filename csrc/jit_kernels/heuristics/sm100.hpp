@@ -306,8 +306,11 @@ struct SM100ArchSpec {
         const auto num_waves = ceil_div(num_blocks, desc.num_sms);
         const auto num_last_blocks = num_blocks % desc.num_sms;
         const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
+        const int num_effective_m_blocks =
+            (desc.gemm_type == GemmType::Normal and desc.kernel_type == KernelType::Kernel1D1D and desc.get_expected_m() <= 256)
+            ? ceil_div(ceil_div(desc.get_expected_m(), layout.block_m), layout.cluster_m) : 0;
         // TODO: calculate expected cycles
-        return {num_waves, last_wave_util, 0, layout};
+        return {num_waves, last_wave_util, 0, layout, num_effective_m_blocks};
     }
 
     // A regular comparator
@@ -315,6 +318,14 @@ struct SM100ArchSpec {
         // Single wave is always better
         if ((a.num_waves == 1 or b.num_waves == 1) and a.num_waves != b.num_waves)
             return a.num_waves < b.num_waves;
+
+        // Small-M single-wave 1D1D: minimize effective M-blocks, then maximize SM utilization
+        if (a.num_waves == 1 and b.num_waves == 1 and a.num_effective_m_blocks > 0 and b.num_effective_m_blocks > 0) {
+            if (a.num_effective_m_blocks != b.num_effective_m_blocks)
+                return a.num_effective_m_blocks < b.num_effective_m_blocks;
+            if (a.last_wave_util != b.last_wave_util)
+                return a.last_wave_util > b.last_wave_util;
+        }
 
         // Doing multicast is better
         if (a.layout.get_cluster_size() != b.layout.get_cluster_size())
