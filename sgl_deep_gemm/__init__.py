@@ -331,6 +331,8 @@ def mega_mhc(x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scal
         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
         y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, shared_sf_block_m)
 
+mega_mhc.supported_architectures = (9, 10)
+
 # Mega kernels
 from . import mega
 from .mega import (

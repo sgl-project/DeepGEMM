@@ -216,6 +216,10 @@ for t in test_mega_gate.py test_mega_mhc.py test_locality_domain.py; do
   fi
 done
 
+if [ "${ARCH_MAJOR}" -eq 9 ]; then
+  SINGLE_GPU_JOBS+=("test_sm90_mega_mhc.py")
+fi
+
 run_parallel "${SINGLE_GPU_JOBS[@]}"
 
 if [ "${ARCH_MAJOR}" -eq 12 ]; then
