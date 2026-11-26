@@ -584,7 +584,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             shared_storage.task_info_empty_barriers,
             shared_storage.task_infos
     );
-    // The load warps below honor `kDepsCheckedBit`
     scheduler.check_deps = true;
     scheduler.l1_first_whenever_fits = (kNumRanks == 1);
 
@@ -828,7 +827,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
-        // One-rank token masks
         if (use_token_masks) {
             for (uint32_t i = thread_idx; i < kNumExperts * kNumTokenMaskWords; i += kNumDispatchThreads)
                 ptx::st_shared(token_masks + i, 0u);
@@ -880,7 +878,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     num_prefix_tokens = ptx::exchange(inclusive, 31);
                 }
                 if (found_expert_idx < 0) {
-                    // Finish all tokens
                     current_expert_idx = kNumExpertsPerRank;
                 } else {
                     current_expert_idx = found_expert_idx;

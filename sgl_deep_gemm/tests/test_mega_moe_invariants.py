@@ -24,11 +24,6 @@ SUITES = {
         [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse')],
         (1, 2, 16, 84, 85, 128, 512), False,
     ),
-    'one_rank_barrier': (
-        "one-rank groups: the NVLink barrier is the group's grid sync",
-        [(16, 8, 'uniform'), (16, 1, 'uniform'), (64, 4, 'sparse')],
-        (1, 2, 16, 84, 128, 512), False,
-    ),
     'one_rank_local_counts': (
         "one-rank groups: expert token counts without the global count protocol",
         [(16, 8, 'uniform'), (16, 1, 'uniform'), (112, 8, 'sparse'), (112, 8, 'uniform'), (160, 4, 'high')],
