@@ -123,9 +123,6 @@ get_symm_buffer_size_for_mega_moe(
         get_granularities_for_mega_moe(recipe, recipe_a, recipe_b, mma_kind);
     DG_HOST_ASSERT(gran_m == 1 and gran_n == 1);
     DG_HOST_ASSERT(gran_k == get_sf_gran_k(mma_kind) or gran_k == 128);
-    // Shared expert reuses the L1 epilogue that quantizes blockwise-128 activations, so it is routed-only
-    DG_HOST_ASSERT((gran_k == get_sf_gran_k(mma_kind) or num_shared_experts == 0)
-                   and "blockwise-128 SFs (recipe gran_k=128) do not support shared experts");
     const auto mega_buffer = layout::MegaMoEBuffer(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
@@ -274,9 +271,6 @@ static void fp8_fp4_mega_moe(
                             "allocate the symmetric buffer with one of those");
     // Blockwise-128 SFs only exist for FP8 e4m3 operands under `fp8xfp4`
     DG_HOST_ASSERT(not blockwise_128 or mma_kind == MmaKind::MXFP8FP4);
-    // Shared expert reuses the blockwise-128 L1 epilogue, so blockwise-128 is routed-only
-    DG_HOST_ASSERT((not blockwise_128 or not shared_l1_weights_tuple_opt.has_value())
-                   and "blockwise-128 SFs (recipe gran_k=128) do not support shared experts");
     if (gran_k != get_sf_gran_k(mma_kind) and not blockwise_128)
         DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(gran_k) +
                             " does not match `" + mma_type + "` (expected " +
