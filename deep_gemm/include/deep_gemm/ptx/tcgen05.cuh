@@ -201,6 +201,27 @@ struct SM100_MMA_MXF4NVF4_2x1SM_SS {
     }
 };
 
+// SM107 K=128 MXFP4 uses `kind::mxf4nvf4.block_scale.block32` (4 UE8M0 SFs per K=128 MMA)
+struct SM100_MMA_MXF4NVF4_BLOCK32_2x1SM_SS {
+    CUTLASS_DEVICE static void
+    fma(uint64_t const& desc_a,
+        uint64_t const& desc_b,
+        uint32_t const& tmem_c,
+        uint32_t const& scale_c,
+        uint64_t const& desc,
+        uint32_t const& tmem_sfa,
+        uint32_t const& tmem_sfb) {
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.block32 [%0], %1, %2, %3, [%5], [%6], p; \n\t"
+            "}\n"
+            :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(static_cast<uint32_t>(desc >> 32)), "r"(scale_c),
+               "r"(tmem_sfa), "r"(tmem_sfb));
+    }
+};
+
 struct SM100_MMA_F16BF16_WS_SS {
     CUTLASS_DEVICE static void
     fma(uint64_t const& desc_a,
@@ -273,6 +294,17 @@ struct Allocator2Sm {
     }
     CUTLASS_DEVICE void release_allocation_lock() const {
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+    }
+};
+
+/// Exclusive 2-CTA allocator (SM107): `num_columns` is any multiple of 32 up to 576
+struct Allocator2SmExclusive {
+    CUTLASS_DEVICE void allocate(const uint32_t& num_columns, uint32_t* dst_ptr) const {
+        asm volatile("tcgen05.alloc.exclusive.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
+                     :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))), "r"(num_columns));
+    }
+    CUTLASS_DEVICE void free(const uint32_t& tmem_ptr, const uint32_t& num_columns) const {
+        asm volatile("tcgen05.dealloc.exclusive.cta_group::2.sync.aligned.b32 %0, %1;" :: "r"(tmem_ptr), "r"(num_columns));
     }
 };
 

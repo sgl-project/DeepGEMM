@@ -14,15 +14,22 @@
 
 namespace deep_gemm {
 
-struct SM103ArchSpec {
-    static bool is_current() { return jit->device.get_arch_pair() == std::make_pair(10, 3); }
-};
-
 struct SM107ArchSpec {
     static constexpr int oversized_smem_capacity = 334848;
 
     static bool is_current() { return jit->device.get_arch_pair() == std::make_pair(10, 7); }
 };
+
+// The SM10x arch the JIT compiles kernels for (`__CUDA_ARCH__` on device), which an older NVCC
+// can leave at the `100f` family on CC 10.3 / 10.7 devices
+static SM10xArch get_sm10x_arch() {
+    const auto arch = jit->default_compiler_options.arch.value_or("");
+    if (arch.starts_with("107"))
+        return SM10xArch::SM107;
+    if (arch.starts_with("103"))
+        return SM10xArch::SM103;
+    return SM10xArch::SM100;
+}
 
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
