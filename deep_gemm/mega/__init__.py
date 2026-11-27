@@ -65,7 +65,8 @@ class SymmBuffer:
                  recipe_a: Optional[Tuple[int, int]] = None,
                  recipe_b: Optional[Tuple[int, int]] = None,
                  base: Optional['SymmBuffer'] = None,
-                 gather_output: bool = False):
+                 gather_output: bool = False,
+                 use_global_token_hint: bool = False):
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
         assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
         assert activation != 'situ' or mma_type in ('fp8xfp4', 'fp8xfp8', 'nvfp4xnvfp4'), \
@@ -80,13 +81,15 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self.use_global_token_hint = bool(use_global_token_hint)
 
         # Allocate or reuse a symmetric buffer; the recipe's K granularity sizes every SF view
         layout_args = (group.size(), num_experts,
                        num_max_tokens_per_rank, num_topk,
                        hidden, intermediate_hidden,
                        mma_type, activation,
-                       num_shared_experts, recipe, recipe_a, recipe_b)
+                       num_shared_experts, recipe, recipe_a, recipe_b,
+                       self.use_global_token_hint)
         num_bytes = _C.get_symm_buffer_size_for_mega_moe(*layout_args)
         # `gather_output` appends every rank's output rows at the end of the buffer for `broadcast_y`
         num_gathered_bytes = group.size() * num_max_tokens_per_rank * hidden * 2 if gather_output else 0
@@ -146,7 +149,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  activation: str = 'swiglu',
                                  recipe: Optional[Tuple[int, int, int]] = None,
                                  recipe_a: Optional[Tuple[int, int]] = None,
-                                 recipe_b: Optional[Tuple[int, int]] = None) -> SymmBuffer:
+                                 recipe_b: Optional[Tuple[int, int]] = None,
+                                 use_global_token_hint: bool = False) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -161,7 +165,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         hidden, intermediate_hidden,
         num_shared_experts,
         mma_type=mma_type, activation=activation,
-        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+        use_global_token_hint=use_global_token_hint
     )
 
 
@@ -363,7 +368,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
-        weight_layout, global_num_tokens, broadcast_y
+        weight_layout, global_num_tokens, broadcast_y,
+        getattr(sym_buffer, 'use_global_token_hint', False)
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,

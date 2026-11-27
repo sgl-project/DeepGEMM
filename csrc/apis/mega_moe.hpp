@@ -66,7 +66,8 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
     const std::optional<std::tuple<int, int>>& recipe_a = std::nullopt,
-    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt) {
+    const std::optional<std::tuple<int, int>>& recipe_b = std::nullopt,
+    const bool& use_global_token_hint = false) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
@@ -108,15 +109,11 @@ get_symm_buffer_size_for_mega_moe(
 
     const bool host_use_fp8_combine = with_sf and deep_jit::get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
-    // Compute num_sf_ring_tokens (max across all candidate block sizes)
-    int num_sf_ring_tokens = 0;
-    if (with_sf) {
-        for (auto block_m: layout::kCandidateBlockM) {
-            num_sf_ring_tokens = std::max(
-                num_sf_ring_tokens,
-                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
-        }
-    }
+    // Compute SF ring capacity (tile-aware when `use_global_token_hint` or single-rank,
+    // otherwise 8x over SM100 candidate tiles)
+    const int num_sf_ring_tokens = get_num_sf_ring_tokens_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        num_ring_tokens, mma_kind, use_global_token_hint);
 
     // All buffers
     const auto [gran_m, gran_n, gran_k] =
@@ -244,7 +241,8 @@ static void fp8_fp4_mega_moe(
     const bool& post_expert_norm_weight_first = false,
     const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const bool& use_global_token_hint = false
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -374,7 +372,8 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b
+        mma_type, activation, num_shared_experts, recipe, recipe_a, recipe_b,
+        use_global_token_hint
     );
     if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))
         DG_HOST_UNREACHABLE("symmetric buffer is " + std::to_string(sym_buffer.nbytes()) +

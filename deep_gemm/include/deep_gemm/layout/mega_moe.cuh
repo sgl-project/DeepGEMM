@@ -12,6 +12,8 @@ namespace deep_gemm::layout {
 
 static constexpr int kNumCandidateBlockMs = 8;
 static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+static constexpr int kNumSM100CandidateBlockMs = 7;
+static constexpr int kSM100CandidateBlockM[kNumSM100CandidateBlockMs] = {16, 32, 64, 96, 128, 192, 240};
 static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;

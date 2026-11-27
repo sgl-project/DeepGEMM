@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <format>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -313,6 +315,110 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     return {cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_warpgroups * 128};
 }
 
+// Worst-case SF ring tokens touched by a launch with `max_global_tokens` total input tokens
+// across all EP ranks under tile size `block_m`.
+static int64_t get_max_sf_ring_tokens_for_launch(
+    const int& num_ranks, const int& num_experts, const int& num_topk,
+    const int& num_ring_tokens, const int64_t& max_global_tokens, const int& block_m) {
+    const int64_t e_local = num_experts / num_ranks;
+    const int64_t active_topk = std::min<int64_t>(num_topk, e_local);
+    const int64_t m_recv = std::max<int64_t>(0, max_global_tokens) * active_topk;
+    const int64_t non_empty = std::min<int64_t>(e_local, m_recv);
+    const int64_t max_blocks = m_recv > 0 ? (non_empty + (m_recv - non_empty) / block_m) : 1;
+    const int64_t ring_blocks = num_ring_tokens / block_m;
+    const int64_t used_blocks = std::min<int64_t>(std::max<int64_t>(max_blocks, 1), ring_blocks);
+    const int64_t sf_block_m = align(block_m, 128);
+    return used_blocks * sf_block_m;
+}
+
+static int get_num_sf_ring_tokens_for_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& num_ring_tokens, const MmaKind& mma_kind,
+    const bool& use_global_token_hint = false) {
+    if (not is_mma_with_sf(mma_kind))
+        return 0;
+
+    // `DG_MEGA_MOE_TIGHT_SF_RING`:
+    //   0: legacy 16x worst-case over `kCandidateBlockM` (includes SM90 `block_m=8`)
+    //   1: force tile-aware tight SF ring sizing
+    //  -1 (default): tile-aware tight sizing when `use_global_token_hint` or `num_ranks == 1`,
+    //                otherwise 8x worst-case over SM100 `kSM100CandidateBlockM` (starts at 16).
+    const int env_mode = deep_jit::get_env<int>("DG_MEGA_MOE_TIGHT_SF_RING", -1);
+    if (env_mode == 0) {
+        int num_sf_ring_tokens = 0;
+        for (const auto& block_m: layout::kCandidateBlockM) {
+            num_sf_ring_tokens = std::max(
+                num_sf_ring_tokens,
+                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+        }
+        return num_sf_ring_tokens;
+    }
+
+    // `fp8_fp4_mega_moe` and `slice_symm_buffer_for_mega_moe` re-query the buffer layout,
+    // so memoize the computed SF ring size per shape on each host thread.
+    const bool tight = (env_mode > 0) or use_global_token_hint or (num_ranks == 1);
+    const auto tiles_override = deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES");
+    using CacheKey = std::tuple<int, int, int, int, int, int, bool, int, std::string>;
+    const CacheKey cache_key{
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        num_ring_tokens, static_cast<int>(mma_kind), tight, env_mode, tiles_override
+    };
+    thread_local std::map<CacheKey, int> sf_ring_cache;
+    if (const auto it = sf_ring_cache.find(cache_key); it != sf_ring_cache.end())
+        return it->second;
+
+    if (not tight) {
+        int num_sf_ring_tokens = 0;
+        for (const auto& block_m: layout::kSM100CandidateBlockM) {
+            num_sf_ring_tokens = std::max(
+                num_sf_ring_tokens,
+                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+        }
+        const int aligned = std::max(256, align(num_sf_ring_tokens, 256));
+        sf_ring_cache.emplace(cache_key, aligned);
+        return aligned;
+    }
+
+    // Tile-aware bound: once `num_covered_tokens > 768` (`T > ceil(800 * E / topk)`),
+    // `get_block_config_for_mega_moe` permanently selects its asymptotic largest tile
+    // (`192` for NVFP4, `240` for MXFP8FP4/MXFP4), whose SF usage is monotonically
+    // non-decreasing in `T` and maximized at `T = limit`.
+    const int64_t limit = static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank;
+    int64_t max_sf_tokens = 256;
+    auto eval_at = [&](const int64_t& t) {
+        const int bm = std::get<1>(get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+            /*num_tokens=*/0, mma_kind, std::optional<int64_t>(t)));
+        // Allow up to `+ num_ranks` slack for off-by-one unhinted shard rounding (e.g. CP).
+        const int64_t max_actual_t = std::min<int64_t>(limit, t + num_ranks);
+        max_sf_tokens = std::max(
+            max_sf_tokens,
+            get_max_sf_ring_tokens_for_launch(
+                num_ranks, num_experts, num_topk, num_ring_tokens, max_actual_t, bm));
+    };
+
+    if (not tiles_override.empty()) {
+        eval_at(0);
+        eval_at(limit);
+    } else {
+        const int64_t scan_end = std::min<int64_t>(
+            limit,
+            static_cast<int64_t>(std::ceil(800.0 * num_experts / std::max(num_topk, 1))) + num_ranks);
+        for (int64_t t = 0; t <= scan_end; ++t)
+            eval_at(t);
+        if (limit > scan_end)
+            eval_at(limit);
+    }
+
+    // Align to 256 (>= max SF_BLOCK_M=256 and TMA-aligned) so TMA box dims are always valid.
+    max_sf_tokens = align<int64_t>(max_sf_tokens, 256);
+    DG_HOST_ASSERT(max_sf_tokens <= static_cast<int64_t>(std::numeric_limits<int>::max()));
+    const int result = static_cast<int>(max_sf_tokens);
+    sf_ring_cache.emplace(cache_key, result);
+    return result;
+}
+
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -415,6 +521,14 @@ static MegaMoEConfig get_mega_moe_config(
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
         SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);
+    if (is_mma_with_sf(mma_kind)) {
+        const int64_t effective_global_tokens = global_num_tokens.value_or(
+            static_cast<int64_t>(num_tokens) * num_ranks);
+        DG_HOST_ASSERT(
+            get_max_sf_ring_tokens_for_launch(
+                num_ranks, num_experts, num_topk, num_ring_tokens,
+                effective_global_tokens, block_m) <= num_sf_ring_tokens);
+    }
     // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle;
     // NVFP4 keeps FP4 packed, so a 128B swizzle atom covers twice as many elements
     const int swizzle_acts_mode = 128;
