@@ -6,6 +6,7 @@
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/sm100_mega_mhc.hpp"
+#include "../jit_kernels/impls/sm90_mega_mhc.hpp"
 #include "../utils/layout.hpp"
 
 namespace deep_gemm::mega_mhc {
@@ -39,6 +40,19 @@ static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidde
             best_num_splits = s;
     }
     return best_num_splits;
+}
+
+static uint32_t get_num_sm90_splits(const uint32_t num_m_blocks, const uint32_t hidden,
+                                     const uint32_t num_sms, const bool use_decode_mix) {
+    if (heuristics_runtime->get_deterministic_algorithms())
+        return mhc_layout::kDefaultNumSplits;
+
+    // Fewer prefill tasks amortize partial-reduction overhead. Cooperative decode
+    // Mix can consume more splits, filling Hopper's otherwise underused SMs.
+    const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+    const uint32_t split_cap = use_decode_mix ? mhc_layout::kNumMaxSM90Splits : mhc_layout::kNumMaxSplits;
+    const uint32_t max_num_splits = cute::min(split_cap, cute::max(4u, num_sms / num_m_blocks));
+    return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
 }
 
 static const torch::Tensor& get_split_barriers(const torch::TensorOptions& options) {
@@ -246,7 +260,8 @@ static void mega_mhc(const torch::Tensor& x,
         DG_HOST_ASSERT(num_required_bytes <= y_shared_sf->storage().nbytes());
     }
 
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 9 or arch_major == 10);
     const auto num_sms = runtime->get_num_sms();
     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
     // Shifted on SM107 normalizes X1 inside the producing CTA when the X1 tile buffers fit the oversized shared memory
@@ -261,8 +276,10 @@ static void mega_mhc(const torch::Tensor& x,
         (SM107ArchSpec::oversized_smem_capacity - mhc_layout::get_x1_tiles_smem_offset() - kNumStaticSmemReserveBytes -
          mhc_layout::get_in_cta_norm_smem_size(0, static_cast<uint32_t>(hidden))) /
         mhc_layout::get_x1_tiles_smem_size(1);
-    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
-                                           x1_k_block_budget);
+    const bool use_decode_mix = is_shifted and num_tokens >= 16 and num_tokens <= mhc_layout::BLOCK_M;
+    const auto num_splits = arch_major == 9
+        ? get_num_sm90_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms), use_decode_mix)
+        : get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms), x1_k_block_budget);
     // A CTA holding more than kNumX1Buffers splits of one m-block would wait on its own Post, so in-CTA Norm keeps
     // grid-stride task ownership and needs a grid at least as wide as the split count
     in_cta_norm = in_cta_norm and num_splits <= static_cast<uint32_t>(num_sms) and
@@ -271,8 +288,12 @@ static void mega_mhc(const torch::Tensor& x,
 
     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted and not in_cta_norm;
     const auto num_bf16_scratch_bytes = needs_bf16_scratch ? static_cast<int64_t>(num_tokens) * hidden * x.element_size() : 0;
-    // Reject an unwarmed stream before allocating temporary capture storage.
-    const auto& split_barriers = get_split_barriers(x.options());
+    // SM90 graph nodes own their split state, even when captured on the same
+    // stream and replayed concurrently. Preserve the existing SM100 epoch path.
+    const auto split_barriers = arch_major == 9
+        ? torch::empty({mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks,
+                        mhc_layout::kSplitBarrierLineBytes}, x.options().dtype(torch::kByte))
+        : get_split_barriers(x.options());
     const auto scratch = torch::empty({static_cast<int64_t>(num_mhc_scratch_bytes) + num_bf16_scratch_bytes},
                                       x.options().dtype(torch::kByte));
     // CUDA graph replays reuse grid IDs. Clear this launch's active barrier lines
@@ -291,15 +312,27 @@ static void mega_mhc(const torch::Tensor& x,
     // GEMM and routed SF differ only in strides and share one primary writer.
     const auto& y_primary_sf = y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
 
-    sm100_mega_mhc(
-        x, residual, post_mix, comb_res_mix, shifted_prev_mix,
-        fn, mix_scales, mix_bases,
-        hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters,
-        rmsnorm_weight, rmsnorm_eps,
-        new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
-        y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
-        y_fp8, y_primary_sf, y_shared_sf,
-        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, in_cta_norm);
+    if (arch_major == 9) {
+        sm90_mega_mhc(
+            x, residual, post_mix, comb_res_mix, shifted_prev_mix,
+            fn, mix_scales, mix_bases,
+            hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters,
+            rmsnorm_weight, rmsnorm_eps,
+            new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
+            y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
+            y_fp8, y_primary_sf, y_shared_sf,
+            shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
+    } else {
+        sm100_mega_mhc(
+            x, residual, post_mix, comb_res_mix, shifted_prev_mix,
+            fn, mix_scales, mix_bases,
+            hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters,
+            rmsnorm_weight, rmsnorm_eps,
+            new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
+            y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
+            y_fp8, y_primary_sf, y_shared_sf,
+            shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms, in_cta_norm);
+    }
 }
 
 #ifndef DG_USE_TORCH_LIBRARY
