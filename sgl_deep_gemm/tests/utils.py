@@ -6,6 +6,14 @@ from deep_gemm.testing import assert_bitwise_equal
 from deep_gemm.utils import align, ceil_div, get_mk_alignment_for_contiguous_layout
 
 
+def to_flashinfer_128x4_sf(sf: torch.Tensor, pad_value: int = -1) -> torch.Tensor:
+    """MN-major packed UE8M0 SF `[rows, k_words]` -> FlashInfer's 128x4 swizzle `[ceil(rows / 128), k_words, 32, 4]`."""
+    rows, k_words = sf.shape
+    padded = torch.full((align(rows, 128), k_words), pad_value, dtype=sf.dtype, device=sf.device)
+    padded[:rows] = sf
+    return padded.view(-1, 4, 32, k_words).permute(0, 3, 2, 1).contiguous()
+
+
 def assert_psum_zero_padding(a: torch.Tensor | tuple, d: torch.Tensor, grouped_layout: torch.Tensor, dtype_label: str) -> None:
     a_data = a[0] if isinstance(a, tuple) else a
     for group_idx, current_m in enumerate(grouped_layout.cpu().tolist()):

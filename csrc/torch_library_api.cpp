@@ -21,9 +21,9 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/locality_domain.hpp"
-#include "apis/mega_moe.hpp"
+#include "apis/mega_moe_inference.hpp"
 #include "apis/mega_gate.hpp"
-#include "apis/mega_mhc.hpp"
+#include "apis/mega_mhc_inference.hpp"
 #include "apis/sm90_mega.hpp"
 
 using namespace deep_gemm;
@@ -69,6 +69,9 @@ std::shared_ptr<EpilogueClass> make_epilogue_class(int64_t kind, std::optional<d
             return std::make_shared<FP8CastWithClampEpilogue>(
                 sfd.value(), scalar.has_value() ? std::make_optional(static_cast<float>(scalar.value())) : std::nullopt, count);
         case 4: return std::make_shared<BF16StochasticRoundingEpilogue>();
+        case 5:
+            DG_HOST_ASSERT(sfd.has_value());
+            return std::make_shared<FP8StochasticRoundingEpilogue>(sfd.value());
         default: DG_HOST_UNREACHABLE("Unknown epilogue kind");
     }
 }
@@ -704,12 +707,13 @@ void dg_mega_mhc(const Tensor& x, const Tensor& residual, const OptTensor& shift
                  const Tensor& new_post_mix, const Tensor& new_comb_res_mix,
                  const OptTensor& y_bf16, const OptTensor& y_fp8, const OptTensor& y_gemm_sf,
                  const OptTensor& y_routed_sf, const OptTensor& y_shared_sf, int64_t shared_sf_block_m) {
+    DG_HOST_ASSERT(shifted_prev_mix.has_value() and new_prev_mix.has_value() and "Mega mHC supports Shifted mode only");
     mega_mhc::mega_mhc(
-        x, residual, shifted_prev_mix, post_mix, comb_res_mix, fn, mix_scales, mix_bases,
+        x, residual, shifted_prev_mix.value(), post_mix, comb_res_mix, fn, mix_scales, mix_bases,
         static_cast<int>(hc_mult), static_cast<float>(hc_norm_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_post_scale), static_cast<float>(sinkhorn_eps), static_cast<int>(num_sinkhorn_iters),
         rmsnorm_weight, static_cast<float>(rmsnorm_eps), static_cast<float>(rmsnorm_scale),
-        new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
+        new_residual, new_prev_mix.value(), new_post_mix, new_comb_res_mix,
         y_bf16, y_fp8, y_gemm_sf, y_routed_sf, y_shared_sf, static_cast<int>(shared_sf_block_m));
 }
 

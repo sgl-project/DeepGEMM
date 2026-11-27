@@ -5,11 +5,11 @@
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 
 namespace deep_gemm::sched {
 

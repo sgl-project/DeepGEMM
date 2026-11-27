@@ -12,7 +12,7 @@
 #include <unordered_set>
 #include <utility>
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/utils/env.hpp>
 

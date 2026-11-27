@@ -5,7 +5,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/exception.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
@@ -165,8 +165,12 @@ struct L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K, true> {
     // Re-read the mask only when the K block is not fed yet
     CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
         const auto k_block_mask = ((1ull << kNumL1BlockNsPerL2KBlock) - 1) << (k_block_idx * kNumL1BlockNsPerL2KBlock);
-        while (pending_mask & k_block_mask)
-            pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+        if (pending_mask & k_block_mask) {
+            do {
+                pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+            } while (pending_mask & k_block_mask);
+            asm volatile("fence.proxy.async.global;" ::: "memory");
+        }
     }
 };
 
@@ -193,6 +197,7 @@ struct L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K, false> {
     CUTLASS_DEVICE void wait(const uint32_t&) {
         if (not ready) {
             while (ptx::ld_acq_gpu(count_ptr) < expected_count) {}
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             ready = true;
         }
     }

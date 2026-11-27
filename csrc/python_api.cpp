@@ -8,12 +8,13 @@
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/epilogue_class.hpp"
+#include "apis/experimental.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/locality_domain.hpp"
-#include "apis/mega_moe.hpp"
-#include "apis/mega_mhc.hpp"
+#include "apis/mega_moe_inference.hpp"
+#include "apis/mega_mhc_inference.hpp"
 #include "apis/mega_gate.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -46,4 +47,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::mega::register_apis(m);
     deep_gemm::mega_mhc::register_apis(m);
     deep_gemm::mega_gate::register_apis(m);
+
+    // Register experimental kernels
+    deep_gemm::experimental::register_apis(m);
 }

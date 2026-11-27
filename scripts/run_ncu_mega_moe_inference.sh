@@ -48,7 +48,7 @@ mkdir -p $output_dir
 export DG_JIT_WITH_LINEINFO=1 # for source counters
 
 echo "Warm up JIT cache"
-python tests/test_mega_moe.py --ncu-profile-only "${python_args[@]}"
+python tests/test_mega_moe_inference.py --ncu-profile-only "${python_args[@]}"
 
 sleep 2
 
@@ -78,7 +78,7 @@ echo "Run Job"
 
 for ((i = 0; i < num_processes; ++i)); do
     ncu ${ncu_args[@]} -o "${output_dir%/}/mega-moe.$i" \
-        python tests/test_mega_moe.py \
+        python tests/test_mega_moe_inference.py \
             --local-rank-idx=$i \
             --ncu-profile-only \
             "${python_args[@]}" &

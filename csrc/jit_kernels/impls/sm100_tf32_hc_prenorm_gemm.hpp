@@ -38,8 +38,7 @@ static void sm100_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
                                               block_m, block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                              get_swizzle_mode(block_k, a.element_size()), 0,
-                                              true);
+                                              get_swizzle_mode(block_k, a.element_size()));
     const auto make_b_desc = [&](const torch::Tensor& t) {
         return make_tma_b_desc(cute::UMMA::Major::K, t, n, k,
                                block_n, block_k,
@@ -66,7 +65,7 @@ static void sm100_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     // Calculate stages
     int num_stages = 12, smem_size = 0;
     while (num_stages > 0) {
-        const int smem_a_per_stage = block_m * block_k * static_cast<int>(sizeof(nv_bfloat16));
+        const int smem_a_per_stage = block_m * block_k * static_cast<int>(a.element_size());
         const int smem_b_per_stage = num_b * block_n * block_k * static_cast<int>(sizeof(float));
         const int smem_cd = num_b * block_m * swizzle_cd_mode;
         const int smem_barriers = (num_stages * 4 + 1) * 8;
@@ -103,6 +102,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {},
+        {},
         {}
     >);
 }};
@@ -113,7 +113,8 @@ static void __instantiate_kernel() {{
         swizzle_cd_mode,
         num_stages,
         num_mma_threads, num_cast_and_reduce_threads,
-        num_b));
+        num_b,
+        a.scalar_type() != torch::kBFloat16 ? to_string(a.scalar_type()) : "nv_bfloat16"));
 
     // Launch
     jit->launch(

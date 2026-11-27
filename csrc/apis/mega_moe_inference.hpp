@@ -5,11 +5,11 @@
 #include <torch/torch.h>
 
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 
 #include "../runtime/runtime.hpp"
-#include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
-#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_bf16_mega_moe_inference.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_inference.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_pre_dispatch.hpp"
 #include "locality_domain.hpp"
 

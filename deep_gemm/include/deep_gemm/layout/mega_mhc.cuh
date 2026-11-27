@@ -7,14 +7,6 @@
 
 namespace deep_gemm::layout::mega_mhc {
 
-#if defined(__CUDACC__)
-// Exact BF16x2 widening: one shift and one mask, no PRMT
-CUTLASS_DEVICE float2 bf16x2_to_float2(const nv_bfloat162& value) {
-    const uint32_t bits = *reinterpret_cast<const uint32_t*>(&value);
-    return {__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u)};
-}
-#endif
-
 // Model geometry
 static constexpr uint32_t kNumRoutes = 4;
 static constexpr uint32_t kNumHCOutputs = kNumRoutes * (kNumRoutes + 2);
@@ -29,6 +21,9 @@ static constexpr uint32_t BLOCK_N = kNumHCOutputs;
 static constexpr uint32_t BLOCK_K = 64;
 static constexpr uint32_t kSwizzleMode = 128;
 static constexpr uint32_t kFnAtomK = kSwizzleMode / sizeof(float);
+// UMMA_K is the per-route hidden width of one TF32 UMMA instruction.
+static constexpr uint32_t UMMA_K = 32 / sizeof(float);
+static constexpr uint32_t kNumTokenRowsPerLane = 2;
 static constexpr uint32_t kSwizzleAlignment = 8 * kSwizzleMode;
 static constexpr uint32_t kNumIOStages = 3;
 static constexpr uint32_t kNumFnStages = 2;
@@ -36,7 +31,11 @@ static constexpr uint32_t kNumAStages = 4;
 static constexpr uint32_t kNumAccumStages = 2;
 static constexpr uint32_t kNumCoeffStages = 2;
 static constexpr uint32_t kNumWarpsPerWG = 4;
+static constexpr uint32_t kNumTokensPerNormTask = 2;
 static constexpr uint32_t kNumThreads = 6 * kNumWarpsPerWG * 32;
+
+// Every warp-wide norm pack spans 256 hidden elements.
+static constexpr uint32_t kHiddenPerNormPack = 256;
 
 // Split-K workspace geometry
 static constexpr uint32_t kNumGemmPartialElementsPerTask = BLOCK_M * kNumHCOutputs;
@@ -44,17 +43,13 @@ static constexpr uint32_t kNumSqrSumPartialElementsPerTask = BLOCK_M;
 static constexpr uint32_t kDefaultNumSplits = 16;
 static constexpr uint32_t kNumMaxSplits = 64;
 static constexpr uint32_t kNumSplitBarriers = 2;
-static constexpr uint64_t kSplitBarrierLineBytes = 128;
+static constexpr uint32_t kSplitBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
+// Largest hidden size the Norm inputs reach with their 32-bit vector offsets at `kNumMaxTokens`
+static constexpr uint32_t kNumMaxHidden = (uint64_t(1) << 32) / kNumMaxTokens * 4;
 static constexpr uint32_t kNumMaxMBlocks = math::constexpr_ceil_div(kNumMaxTokens, BLOCK_M);
-// A barrier line holds one 8-byte state; the execution epoch, the exit count and the task queue counter
-// live in the unused tail of the buffer's first line, so the buffer is unchanged.
-// The task queue counter relies on the per-launch memset of the active barrier lines to start at zero.
-static constexpr uint64_t kSplitBarrierEpochOffset = kSplitBarrierLineBytes / 2;
-static constexpr uint64_t kSplitBarrierExitCountOffset = kSplitBarrierEpochOffset + sizeof(uint64_t);
-static constexpr uint64_t kSplitBarrierTaskCounterOffset = kSplitBarrierExitCountOffset + sizeof(uint64_t);
-DG_STATIC_ASSERT(kSplitBarrierTaskCounterOffset + sizeof(uint32_t) <= kSplitBarrierLineBytes,
-                 "Epoch, exit count and task counter must fit in the first barrier line");
+// The dynamic task queue counter lives in the unused tail of the buffer's first barrier line
+static constexpr uint32_t kSplitBarrierTaskCounterOffset = kSplitBarrierLineBytes / 2;
 
 // Host/device ABI payloads for the two consumer domains. Tensor maps remain
 // standalone kernel parameters so TMA descriptors keep direct grid-constant access.
@@ -71,12 +66,21 @@ struct MixArgs {
     uint32_t num_sinkhorn_iters;
 };
 
+// Extra per-token values only a training forward saves for the backward.
+struct MixSaveArgs {
+    float* hc_output;
+    float* hc_norm_sqr_sum;
+    float* rho;
+};
+
 struct NormArgs {
     uint32_t num_tokens;
-    const nv_bfloat16* weight;
-    const nv_bfloat16* new_residual;
+    // FP32 or BF16; the kernel casts to its input dtype.
+    const void* weight;
     float eps;
     float scale;
+    // Pre-norm X1 buffer: saved `x1` in training forward, or `y_bf16` scratch in inference.
+    const void* x1;
     nv_bfloat16* y_bf16;
     __nv_fp8_e4m3* y_fp8;
     uint32_t* y_primary_sf;
@@ -155,8 +159,6 @@ struct SharedStorage {
     // Post workers own independent partials reduced before the Mix/Norm barrier arrivals.
     alignas(kSwizzleMode) float hc_norm_sqr_sums[2][BLOCK_M];
     alignas(kSwizzleMode) float x1_sqr_sums[2][BLOCK_M];
-    // Fused Normal workers use dedicated scratch instead of aliasing Shifted statistics.
-    alignas(kSwizzleMode) float normal_scratch[BLOCK_M];
 
     // Full/empty pairs connect static roles without CTA-wide block-boundary synchronization.
     alignas(Barrier) Barrier full_io_barriers[kNumIOStages];
@@ -178,10 +180,10 @@ struct SharedStorage {
     alignas(Barrier) Barrier full_stats_barrier;
     alignas(Barrier) Barrier empty_stats_barrier;
 
-    // Gate each split's Mix arrival on all WG3 warps and, in Normal, the output-store worker.
+    // Gate each split's Mix arrival on all WG3 warps.
     alignas(Barrier) Barrier mix_arrival_barrier;
     alignas(uint32_t) uint32_t tmem_base;
-    // Shifted Norm and fused Normal workers share this mutually exclusive task queue.
+    // Norm workers share this task queue.
     alignas(uint32_t) uint32_t next_norm_task_ticket;
 };
 

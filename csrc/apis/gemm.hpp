@@ -18,7 +18,8 @@ namespace deep_gemm::gemm {
 
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::Tensor& d, const std::optional<torch::Tensor>& c,
-                         const std::optional<torch::Tensor>& sfd = std::nullopt) {
+                         const std::optional<torch::Tensor>& sfd = std::nullopt,
+                         const bool& allow_bias = false) {
     // Do nothing if the problem is empty
     if (m == 0 or n == 0)
         return true;
@@ -49,7 +50,7 @@ static bool early_return(const int& m, const int &n, const int& k,
     }
 
     // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
-    if (c.has_value() and not is_cd_same)
+    if (c.has_value() and not is_cd_same and not (allow_bias and c->dim() == 2 and c->size(0) == 1))
         d.copy_(c.value());
     return false;
 }
@@ -188,8 +189,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     // Early return for trivial cases
-    if (early_return(m, n, k, d, c))
+    if (early_return(m, n, k, d, c, std::nullopt, true))
         return;
+
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);
 
     // Dispatch into different arch implementations
     if (arch_major == 9 or arch_major == 10) {
@@ -214,7 +217,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
             sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                    major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
+                                    major_a, major_b, compiled_dims, resolved_epilogue_class);
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
         }
@@ -467,7 +470,8 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
-    if (early_return(m, n, sum_k, d, c))
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d);
+    if (early_return(m, n, sum_k, d, c, resolved_epilogue_class->output_sfd()))
         return;
 
     // Dispatch implementation
@@ -477,7 +481,7 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
         const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout, use_padded_sf_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout, use_padded_sf_layout,
-                                      resolve_epilogue_class(epilogue_class, c, d));
+                                      resolved_epilogue_class);
     } else if (arch_major == 12) {
         // TODO(sm120-port, stage 2): k-grouped GEMM needs adaptation to dev's psum SF-layout API
         DG_HOST_UNREACHABLE("SM120 k-grouped FP8 GEMM not yet ported");
@@ -591,7 +595,8 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
-    if (early_return(m, n, sum_k, d, c))
+    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d);
+    if (early_return(m, n, sum_k, d, c, resolved_epilogue_class->output_sfd()))
         return;
 
     // Transform SF with padding
@@ -602,7 +607,7 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     if (arch_major == 10) {
         sm100_k_grouped_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, sum_k, grouped_layout,
                                       k_alignment, major_a, major_b, compiled_dims, use_psum_layout,
-                                      resolve_epilogue_class(epilogue_class, c, d));
+                                      resolved_epilogue_class);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -631,7 +636,7 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     // Early return for trivial cases
-    if (early_return(m, n, k, d, c))
+    if (early_return(m, n, k, d, c, std::nullopt, true))
         return;
 
     const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);

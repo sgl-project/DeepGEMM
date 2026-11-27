@@ -3,7 +3,7 @@
 #include <format>
 #include <torch/torch.h>
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 #include "../../runtime/runtime.hpp"
@@ -133,7 +133,7 @@ static void sm100_bf16_mega_moe(
 
     // Compile
     const auto kernel = jit->compile("sm100_bf16_mega_moe", std::format(R"(
-#include <deep_gemm/impls/sm100_bf16_mega_moe.cuh>
+#include <deep_gemm/impls/sm100_bf16_mega_moe_inference.cuh>
 
 using namespace deep_gemm;
 

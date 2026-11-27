@@ -2,7 +2,7 @@
 
 #include <functional>
 
-#include "mega_moe.hpp"
+#include "mega_moe_inference.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 

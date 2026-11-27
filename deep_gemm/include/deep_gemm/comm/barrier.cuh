@@ -4,7 +4,6 @@
 
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
 
 namespace deep_gemm::comm {
 
@@ -30,8 +29,8 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     cute::cluster_wait();
 }
 
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename WorkspaceT, typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename workspace_t, typename sync_scope_t>
+CUTLASS_DEVICE void grid_sync(const workspace_t& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
@@ -62,8 +61,9 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
     sync_scope();
 }
 
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename WorkspaceT, typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag,
+          typename workspace_t, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_barrier(const workspace_t& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
@@ -84,10 +84,10 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
 
     // NVLink cross-rank barrier, only SM 0 signals
     if (sm_idx == 0 or (wait_on_all_sms and thread_idx == 0)) {
-        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto counter_ptr = workspace.get_nvl_barrier_counter_ptr();
         const auto status = (sm_idx == 0 ? *counter_ptr : *known_counter) & 3;
         const auto signal_phase = status & 1, signal_sign = status >> 1;
-        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+        const auto signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
 
         // Send signals to remote ranks
         if (sm_idx == 0) {
@@ -126,6 +126,8 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
             DG_TRAP_ONLY_DEVICE_ASSERT(not timed_out);
 #endif
         }
+        if (not sync_epilogue)
+            sync_scope();
     }
 
     // Grid sync after NVLink completion

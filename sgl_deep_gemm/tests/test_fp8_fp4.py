@@ -107,7 +107,7 @@ def test_gemm() -> None:
         cublas_t = 0
         if get_arch_major() != 12:
             cublas_func = make_cublas_gemm(a, b, d, c)
-            cublas_times = bench_kineto(cublas_func, ('nvjet', 'bstensorop', 'reduce'),
+            cublas_times = bench_kineto(cublas_func, ('nvjet', 'bstensorop', 'splitKreduce'),
                                         suppress_kineto_output=True, with_multiple_kernels=True)
             cublas_t = sum(cublas_times)
         if cublas_t > 0:

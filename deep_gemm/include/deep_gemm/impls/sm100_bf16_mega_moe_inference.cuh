@@ -9,9 +9,9 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/mma/sm100.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -693,10 +693,12 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (get_ring_wave_idx(pool_block_idx) + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = SHARED_L2_SHAPE_K / (BLOCK_N / 2);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
@@ -1311,6 +1313,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            asm volatile("fence.proxy.async.global;" ::: "memory");
 
             // Every lane joins each full-row reduction, two-chunk combine included.
             float slot_norm_scale = 1.0f;

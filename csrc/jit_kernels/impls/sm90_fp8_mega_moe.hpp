@@ -8,7 +8,7 @@
 #include "runtime_utils.hpp"
 #include "../../runtime/launch.hpp"
 
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 

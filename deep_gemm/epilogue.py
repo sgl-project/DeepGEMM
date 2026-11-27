@@ -49,5 +49,15 @@ class BF16StochasticRounding(Epilogue):
     _kind = 4
 
 
+class FP8StochasticRounding(Epilogue):
+    _kind = 5
+
+    def __init__(self, sfd: torch.Tensor) -> None:
+        self.sfd = sfd
+
+    def _encode(self):
+        return self._kind, None, self.sfd, None
+
+
 def encode(epilogue: Optional[Epilogue]) -> Tuple[int, Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
     return (0, None, None, None) if epilogue is None else epilogue._encode()

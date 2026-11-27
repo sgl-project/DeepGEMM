@@ -5,6 +5,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
+#include <deep_gemm/ptx/math.cuh>
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/ring_pipeline.cuh>
@@ -16,42 +17,32 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/mega_mhc.cuh>
-#include <deep_gemm/epilogue/sm100_mega_mhc.cuh>
+#include <deep_gemm/scheduler/mega_mhc_inference.cuh>
+#include <deep_gemm/epilogue/sm100_mega_mhc_forward.cuh>
 
-namespace deep_gemm {
+namespace deep_gemm::mega_mhc_inference {
 
 using namespace layout::mega_mhc;
 
-namespace mega_mhc {
-
-// A task is one (m-block, K-split) pair, subdivided into BLOCK_K blocks.
-// UMMA_K is the per-route hidden width of one TF32 UMMA instruction.
-constexpr uint32_t UMMA_K = 32 / sizeof(float);
-constexpr uint32_t kNumTokenRowsPerLane = 2;
-
-} // namespace mega_mhc
-
 // Persistent mHC with static grid-stride roles and TMA-native layouts.
-// Norm receives one arrival only after Shifted X1 stores and statistics are committed.
+// Norm receives one arrival only after X1 stores and statistics are committed.
 template <uint32_t kHidden, uint32_t kNumSplits, uint32_t kNumSMs,
-          bool kIsShifted, bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, bool kSwizzledPrimarySF,
-          bool kUseTaskQueue, bool kInCTANorm>
+          bool kStoreBF16, bool kStoreFP8, uint32_t SF_BLOCK_M, uint32_t kNormPartitions,
+          bool kSwizzledPrimarySF, bool kUseTaskQueue, bool kInCTANorm>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
-    sm100_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_x,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_fn,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_post_mix,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_comb_res_mix,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_shifted_prev_mix,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_new_residual,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_y_bf16,
-                        const __grid_constant__ MixArgs mix_args,
-                        const __grid_constant__ NormArgs norm_args,
-                        void* gmem_scratch,
-                        uint64_t* gmem_split_barriers) {
+sm100_mega_mhc_impl(const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_x,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_fn,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_post_mix,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_comb_res_mix,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_prev_mix,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_new_residual,
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_y_bf16,
+                    const __grid_constant__ MixArgs mix_args,
+                    const __grid_constant__ NormArgs norm_args,
+                    void* gmem_scratch,
+                    uint32_t* gmem_split_barriers) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
-    using namespace mega_mhc;
     using Allocator = ptx::Allocator1Sm;
     // Each Post worker occupies exactly one WG; the role dispatch hardwires two of them.
     constexpr uint32_t kNumPostWGs = 2;
@@ -60,7 +51,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     DG_STATIC_ASSERT(kHidden > 0 and kHidden % BLOCK_K == 0 and kNumSplits <= kHidden / BLOCK_K,
                      "Splits must contain nonempty, aligned K blocks");
     DG_STATIC_ASSERT(SF_BLOCK_M == 0 or kStoreFP8, "Shared SF requires FP8 output");
-    DG_STATIC_ASSERT(not kInCTANorm or kIsShifted, "In-CTA Norm needs Shifted X1");
     DG_STATIC_ASSERT(not kInCTANorm or (not kUseTaskQueue and kNumSplits <= kNumSMs), "In-CTA Norm needs grid-stride task ownership");
 #if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 1070)
     constexpr bool kIsSM107 = true;
@@ -94,17 +84,15 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
     // Register reconfigurations
     constexpr uint32_t kNumControlRegisters = 32;
-    constexpr uint32_t kNumPostRegisters = kIsShifted ? 136 : 112;
+    constexpr uint32_t kNumPostRegisters = 136;
     constexpr uint32_t kNumLightweightRegisters = 40;
-    constexpr uint32_t kNumShiftedNormRegisters = 96;
-    constexpr uint32_t kNumNormalRegisters = 80;
+    constexpr uint32_t kNumNormRegisters = 96;
 
     // WG3 epilogue and WG4 Mix use the same lightweight allocation.
-    constexpr uint32_t kStaticRoleRegisterBudget = kNumControlRegisters + kNumPostRegisters * kNumPostWGs +
-                                                   2 * kNumLightweightRegisters + kNumShiftedNormRegisters;
-    constexpr uint32_t kMaxRegisterBudget = cute::max(kStaticRoleRegisterBudget, kNumNormalRegisters * kNumWGsPerCTA);
-    DG_STATIC_ASSERT(kMaxRegisterBudget * 128 <= 64512, "Register reconfiguration exceeds the SM budget");
-    DG_STATIC_ASSERT(kMaxRegisterBudget <= 80 * kNumWGsPerCTA, "Register reconfiguration exceeds the CTA entry pool");
+    constexpr uint32_t kRegisterBudget = kNumControlRegisters + kNumPostRegisters * kNumPostWGs +
+                                         2 * kNumLightweightRegisters + kNumNormRegisters;
+    DG_STATIC_ASSERT(kRegisterBudget * 128 <= 64512, "Register reconfiguration exceeds the SM budget");
+    DG_STATIC_ASSERT(kRegisterBudget <= 80 * kNumWGsPerCTA, "Register reconfiguration exceeds the CTA entry pool");
 
     // Thread indices
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
@@ -164,10 +152,9 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     if (warp_idx == 0 and cute::elect_one_sync()) {
         smem.next_norm_task_ticket = 0;
 
-        // Normal aliases the shifted-only descriptors to valid maps, so prefetch unconditionally.
         for (const auto& tensor_map: {&tensor_map_residual, &tensor_map_x, &tensor_map_fn,
                                       &tensor_map_post_mix, &tensor_map_comb_res_mix,
-                                      &tensor_map_shifted_prev_mix, &tensor_map_new_residual,
+                                      &tensor_map_prev_mix, &tensor_map_new_residual,
                                       &tensor_map_y_bf16})
             cute::prefetch_tma_descriptor(tensor_map);
 
@@ -198,8 +185,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 full_x1_barriers[i].init(kNumPostWarps), empty_x1_barriers[i].init(1);
         }
         smem.full_stats_barrier.init(kNumPostWarps);
-        smem.empty_stats_barrier.init(kNumWarpsPerWG + (kIsShifted ? 1 : 0));
-        smem.mix_arrival_barrier.init(kNumWarpsPerWG + (kIsShifted ? 0 : 1));
+        smem.empty_stats_barrier.init(kNumWarpsPerWG + 1);
+        smem.mix_arrival_barrier.init(kNumWarpsPerWG);
         cutlass::arch::fence_barrier_init();
     }
 
@@ -209,15 +196,14 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
     // Local initialization can overlap the preceding grid, but persistent split barriers cannot.
     cudaGridDependencySynchronize();
-    if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG + 1 and cute::elect_one_sync()) {
-        for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
-            sched::mega_mhc::Mix::init(gmem_split_barriers, m_block_idx);
-    }
-    if constexpr (kIsShifted) {
-        if (warp_idx == kFirstPostWGIdx * kNumWarpsPerWG and cute::elect_one_sync()) {
-            for (uint32_t m_block_idx = blockIdx.x; m_block_idx < num_m_blocks; m_block_idx += kNumSMs)
-                sched::mega_mhc::Norm::init(gmem_split_barriers, m_block_idx);
-        }
+    sched::mega_mhc::Mix::prepare<kNumSplits, kNumSMs>(gmem_split_barriers, norm_args.num_tokens);
+    if constexpr (kInCTANorm) {
+        sched::mega_mhc::InCTANorm::prepare<kNumSplits, kNumSMs>(
+            gmem_split_barriers, norm_args.num_tokens, kNumWarpsPerWG * kNumSplits);
+    } else {
+        // Swizzled SF Norm tasks cover whole m-blocks
+        sched::mega_mhc::Norm::prepare<kNumSplits, kNumSMs>(
+            gmem_split_barriers, kSwizzledPrimarySF ? num_m_blocks * BLOCK_M : norm_args.num_tokens, kNormPartitions);
     }
 
     __syncthreads();
@@ -277,7 +263,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
         if (warp_idx == 0) {
             // Warp 0: residual and X TMA-load worker
-            run_tma_load_worker(smem.empty_io_barriers,
+            run_tma_load_worker(
+                smem.empty_io_barriers,
                 [&](const uint32_t& stage_idx, const uint32_t& k_idx, const uint32_t& m_idx) {
                     tma::copy<BLOCK_K, BLOCK_M, kSwizzleMode, nv_bfloat16, true>(
                         &tensor_map_residual, &smem.full_io_barriers[stage_idx],
@@ -289,9 +276,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 }, cute::true_type{});
         } else if (warp_idx == 1) {
             // Warp 1: Fn TMA-load worker
-            run_tma_load_worker(smem.empty_fn_barriers,
+            run_tma_load_worker(
+                smem.empty_fn_barriers,
                 [&](const uint32_t& stage_idx, const uint32_t& k_idx, const uint32_t&) {
-                    tma::copy<BLOCK_K, kNumRoutes * kNumHCOutputs, kSwizzleMode, float, true>(
+                    tma::copy<BLOCK_K, kNumRoutes * kNumHCOutputs, kSwizzleMode, float, true,
+                              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_LAST)>(
                         &tensor_map_fn, &smem.full_fn_barriers[stage_idx],
                         smem.fn[stage_idx][0][0], k_idx, 0u);
                     smem.full_fn_barriers[stage_idx].arrive_and_expect_tx(sizeof(smem.fn[0]));
@@ -300,8 +289,9 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             // Warp 2: HC MMA worker
             using umma_t = cute::SM100_MMA_TF32_TS<cutlass::tfloat32_t, cutlass::tfloat32_t, float, BLOCK_M, BLOCK_N,
                                                    cute::UMMA::Major::K, cute::UMMA::Major::K>;
-            const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc<cutlass::tfloat32_t, cutlass::tfloat32_t, float, BLOCK_M, BLOCK_N,
-                                                                                cute::UMMA::Major::K, cute::UMMA::Major::K>();
+            const auto runtime_instr_desc =
+                cute::UMMA::make_runtime_instr_desc<cutlass::tfloat32_t, cutlass::tfloat32_t, float, BLOCK_M, BLOCK_N,
+                                                    cute::UMMA::Major::K, cute::UMMA::Major::K>();
 
             RingPipeline<kNumFnStages> fn_pipeline;
             RingPipeline<kNumAStages> a_pipeline;
@@ -336,9 +326,10 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         // Hidden blocks, UMMA K atoms, and routes accumulate into one HC output block in fixed order.
                         #pragma unroll
                         for (uint32_t route_idx = 0; route_idx < kNumRoutes; ++ route_idx) {
-                            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, BLOCK_N, kFnAtomK, kSwizzleMode>(
-                                            smem.fn[fn_stage_idx][umma_k_idx * UMMA_K / kFnAtomK][route_idx],
-                                            0, umma_k_idx * UMMA_K % kFnAtomK);
+                            auto b_desc =
+                                mma::sm100::make_umma_desc<cute::UMMA::Major::K, BLOCK_N, kFnAtomK, kSwizzleMode>(
+                                    smem.fn[fn_stage_idx][umma_k_idx * UMMA_K / kFnAtomK][route_idx],
+                                    0, umma_k_idx * UMMA_K % kFnAtomK);
                             umma_t::fma(tmem_base + a_stage_idx * kNumTmemColumnsPerAStage + route_idx * UMMA_K,
                                         b_desc, tmem_base + kAccumTmemStartColumn + accum_stage_idx * BLOCK_N,
                                         k_block_idx > 0 or umma_k_idx > 0 or route_idx > 0, runtime_instr_desc);
@@ -359,14 +350,14 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 
             const auto issue_coeff_tma = [&](const uint32_t& m_idx, const uint32_t& stage_idx) {
                 tma::copy<kNumRoutes, BLOCK_M, 0, float>(&tensor_map_post_mix, &smem.full_coeff_barriers[stage_idx],
-                                                        smem.post_coeff[stage_idx][0], 0u, m_idx);
+                                                         smem.post_coeff[stage_idx][0], 0u, m_idx);
                 tma::copy<kNumRoutes * kNumRoutes, BLOCK_M, kSwizzleMode / 2, float>(
-                    &tensor_map_comb_res_mix, &smem.full_coeff_barriers[stage_idx], smem.comb_coeff[stage_idx][0], 0u, m_idx);
-                if constexpr (kIsShifted)
-                    tma::copy<kNumRoutes, BLOCK_M, 0, float>(&tensor_map_shifted_prev_mix, &smem.full_coeff_barriers[stage_idx],
-                                                             smem.pre_coeff[stage_idx][0], 0u, m_idx);
-                smem.full_coeff_barriers[stage_idx].arrive_and_expect_tx(sizeof(smem.post_coeff[0]) + sizeof(smem.comb_coeff[0]) +
-                                                                         (kIsShifted ? sizeof(smem.pre_coeff[0]) : 0));
+                    &tensor_map_comb_res_mix, &smem.full_coeff_barriers[stage_idx],
+                    smem.comb_coeff[stage_idx][0], 0u, m_idx);
+                tma::copy<kNumRoutes, BLOCK_M, 0, float>(&tensor_map_prev_mix, &smem.full_coeff_barriers[stage_idx],
+                                                         smem.pre_coeff[stage_idx][0], 0u, m_idx);
+                smem.full_coeff_barriers[stage_idx].arrive_and_expect_tx(
+                    sizeof(smem.post_coeff[0]) + sizeof(smem.comb_coeff[0]) + sizeof(smem.pre_coeff[0]));
             };
 
             // The coefficient ring advances once per task, independently of the per-block IO ring.
@@ -391,8 +382,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 const uint32_t split_idx = task_idx % kNumSplits;
                 const uint32_t num_task_k_blocks = get_num_task_k_blocks(split_idx);
                 const uint32_t m_block_idx = task_idx / kNumSplits;
-                if constexpr (kIsShifted)
-                    sched::mega_mhc::Norm::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
                 uint32_t next_coeff_stage_idx = 0;
                 const uint32_t next_task_idx = take_task(iter + 1);
 
@@ -412,13 +401,11 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         next_coeff_stage_idx = advance_coeff_pipeline();
 
                     if (cute::elect_one_sync()) {
-                        // New residual is re-read by the fused Normal workers, so it stays in L2
-                        // (EVICT_LAST); Shifted consumes it only in the next layer.
+                        // New residual is consumed by the next layer; X1 is re-read by Norm.
                         ptx::tma_store_3d(&tensor_map_new_residual, smem.residual[io_stage_idx][0],
                                           k_idx, m_idx, 0u,
-                                          kIsShifted ? cute::TMA::CacheHintSm100::EVICT_FIRST
-                                                     : cute::TMA::CacheHintSm100::EVICT_LAST);
-                        if constexpr (kIsShifted and not kInCTANorm)
+                                          cute::TMA::CacheHintSm100::EVICT_FIRST);
+                        if constexpr (not kInCTANorm)
                             ptx::tma_store_2d(&tensor_map_y_bf16, smem.x[io_stage_idx], k_idx,
                                               m_idx, cute::TMA::CacheHintSm100::EVICT_LAST);
 
@@ -432,26 +419,22 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     }
                 }
 
-                if constexpr (kIsShifted) {
-                    // Arrive at Norm only after both Post workers have committed their row statistics.
-                    smem.full_stats_barrier.wait(task_phase);
-                    const auto x1_sqr_sum_partial = workspace.get_x1_sqr_sum_partial_ptr(task_idx);
-                    float2 row_sqr_sums = {};
-                    #pragma unroll
-                    for (uint32_t post_worker_idx = 0; post_worker_idx < kNumPostWGs; ++ post_worker_idx) {
-                        row_sqr_sums.x += smem.x1_sqr_sums[post_worker_idx][lane_idx];
-                        row_sqr_sums.y += smem.x1_sqr_sums[post_worker_idx][lane_idx + 32];
-                    }
+                // Arrive at Norm only after both Post workers have committed their row statistics.
+                smem.full_stats_barrier.wait(task_phase);
+                const auto x1_sqr_sum_partial = workspace.get_x1_sqr_sum_partial_ptr(task_idx);
+                float2 row_sqr_sums = {};
+                #pragma unroll
+                for (uint32_t post_worker_idx = 0; post_worker_idx < kNumPostWGs; ++ post_worker_idx) {
+                    row_sqr_sums.x += smem.x1_sqr_sums[post_worker_idx][lane_idx];
+                    row_sqr_sums.y += smem.x1_sqr_sums[post_worker_idx][lane_idx + 32];
+                }
 
-                    x1_sqr_sum_partial[lane_idx] = row_sqr_sums.x;
-                    x1_sqr_sum_partial[lane_idx + 32] = row_sqr_sums.y;
-                    __syncwarp();
-                    if (cute::elect_one_sync()) {
-                        smem.empty_stats_barrier.arrive();
-                        sched::mega_mhc::Norm::arrive<kNumSplits>(gmem_split_barriers, m_block_idx);
-                    }
-                } else if (cute::elect_one_sync()) {
-                    smem.mix_arrival_barrier.arrive();
+                x1_sqr_sum_partial[lane_idx] = row_sqr_sums.x;
+                x1_sqr_sum_partial[lane_idx + 32] = row_sqr_sums.y;
+                __syncwarp();
+                if (cute::elect_one_sync()) {
+                    smem.empty_stats_barrier.arrive();
+                    sched::mega_mhc::Norm::arrive(gmem_split_barriers, m_block_idx);
                 }
             }
         }
@@ -496,18 +479,19 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 float2 row_post_coeff[kNumRoutes];
                 #pragma unroll
                 for (uint32_t route_idx = 0; route_idx < kNumRoutes; ++ route_idx) {
-                    if constexpr (kIsShifted)
-                        row_pre_coeff[route_idx] = {smem.pre_coeff[coeff_stage_idx][row_indices[0]][route_idx],
-                                                    smem.pre_coeff[coeff_stage_idx][row_indices[1]][route_idx]};
+                    row_pre_coeff[route_idx] = {smem.pre_coeff[coeff_stage_idx][row_indices[0]][route_idx],
+                                                smem.pre_coeff[coeff_stage_idx][row_indices[1]][route_idx]};
                     row_post_coeff[route_idx] = {smem.post_coeff[coeff_stage_idx][row_indices[0]][route_idx],
                                                  smem.post_coeff[coeff_stage_idx][row_indices[1]][route_idx]};
                 }
 
                 float2 row_comb_coeff[kNumRoutes * kNumRoutes];
                 #pragma unroll
-                for (uint32_t coeff_idx = 0; coeff_idx < kNumRoutes * kNumRoutes; ++ coeff_idx)
-                    row_comb_coeff[coeff_idx] = {load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[0]], row_indices[0], coeff_idx),
-                                                 load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[1]], row_indices[1], coeff_idx)};
+                for (uint32_t coeff_idx = 0; coeff_idx < kNumRoutes * kNumRoutes; ++ coeff_idx) {
+                    row_comb_coeff[coeff_idx] = {
+                        load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[0]], row_indices[0], coeff_idx),
+                        load_comb_coeff(smem.comb_coeff[coeff_stage_idx][row_indices[1]], row_indices[1], coeff_idx)};
+                }
 
                 __syncwarp();
                 if (cute::elect_one_sync()) {
@@ -535,12 +519,14 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                         float2 residual[kNumTokenRowsPerLane][kNumRoutes];
                         #pragma unroll
                         for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
-                            x[row_idx] = bf16x2_to_float2(
+                            x[row_idx] = ptx::cvt_bf16x2_to_fp32x2(
                                 smem.x[io_stage_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
                             #pragma unroll
-                            for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx)
-                                residual[row_idx][input_route_idx] = bf16x2_to_float2(
-                                    smem.residual[io_stage_idx][input_route_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
+                            for (uint32_t input_route_idx = 0; input_route_idx < kNumRoutes; ++ input_route_idx) {
+                                residual[row_idx][input_route_idx] = ptx::cvt_bf16x2_to_fp32x2(
+                                    smem.residual[io_stage_idx][input_route_idx][
+                                        get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)]);
+                            }
                         }
 
                         // Wait MMA release of this worker's next A stage
@@ -563,41 +549,40 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                                     const uint32_t comb_idx = input_route_idx * kNumRoutes + output_route_idx;
                                     const float2 comb = row_comb_coeff[comb_idx];
                                     const float coeff = row_idx == 0 ? comb.x : comb.y;
-                                    post_value = __ffma2_rn(residual[row_idx][input_route_idx], {coeff, coeff}, post_value);
+                                    post_value = __ffma2_rn(
+                                        residual[row_idx][input_route_idx], {coeff, coeff}, post_value);
                                 }
                                 // NOTES: this BF16 round is the shared numerical boundary for all consumers.
                                 const nv_bfloat162 post_value_bf16 = __float22bfloat162_rn(post_value);
-                                post_value = bf16x2_to_float2(post_value_bf16);
+                                post_value = ptx::cvt_bf16x2_to_fp32x2(post_value_bf16);
                                 smem.residual[io_stage_idx][output_route_idx][
                                     get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = post_value_bf16;
-                                hc_norm_sqr_sums[row_idx] = __ffma2_rn(post_value, post_value, hc_norm_sqr_sums[row_idx]);
-                                if constexpr (kIsShifted) {
-                                    const float2 pre = row_pre_coeff[output_route_idx];
-                                    const float coeff = row_idx == 0 ? pre.x : pre.y;
-                                    x1[row_idx] = __ffma2_rn(post_value, {coeff, coeff}, x1[row_idx]);
-                                }
+                                hc_norm_sqr_sums[row_idx] = __ffma2_rn(
+                                    post_value, post_value, hc_norm_sqr_sums[row_idx]);
+                                const float2 pre = row_pre_coeff[output_route_idx];
+                                const float coeff = row_idx == 0 ? pre.x : pre.y;
+                                x1[row_idx] = __ffma2_rn(post_value, {coeff, coeff}, x1[row_idx]);
                             }
                         }
 
                         const auto tmem_values = reinterpret_cast<const uint32_t(*)[4]>(post_values);
                         const uint32_t tmem_addr = tmem_base + a_stage_idx * kNumTmemColumnsPerAStage;
-                        cute::SM100_TMEM_STORE_16dp256b4x::copy(tmem_values[0][0], tmem_values[0][1], tmem_values[0][2], tmem_values[0][3],
-                                                                tmem_values[1][0], tmem_values[1][1], tmem_values[1][2], tmem_values[1][3],
-                                                                tmem_values[2][0], tmem_values[2][1], tmem_values[2][2], tmem_values[2][3],
-                                                                tmem_values[3][0], tmem_values[3][1], tmem_values[3][2], tmem_values[3][3], tmem_addr);
+                        cute::SM100_TMEM_STORE_16dp256b4x::copy(
+                            tmem_values[0][0], tmem_values[0][1], tmem_values[0][2], tmem_values[0][3],
+                            tmem_values[1][0], tmem_values[1][1], tmem_values[1][2], tmem_values[1][3],
+                            tmem_values[2][0], tmem_values[2][1], tmem_values[2][2], tmem_values[2][3],
+                            tmem_values[3][0], tmem_values[3][1], tmem_values[3][2], tmem_values[3][3], tmem_addr);
 
-                        if constexpr (kIsShifted) {
-                            #pragma unroll
-                            for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
-                                const nv_bfloat162 x1_bf16 = __float22bfloat162_rn(x1[row_idx]);
-                                // NOTES: X1 is already rounded to BF16; accumulate without unpacking it back to FP32.
-                                ptx::accumulate_square(x1_sqr_sums[row_idx], x1_bf16);
-                                if constexpr (kInCTANorm)
-                                    get_x1_task_tiles(iter)[k_block_idx * kNumX1PairsPerTile +
-                                                            get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
-                                else
-                                    smem.x[io_stage_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
-                            }
+                        #pragma unroll
+                        for (uint32_t row_idx = 0; row_idx < kNumTokenRowsPerLane; ++ row_idx) {
+                            const nv_bfloat162 x1_bf16 = __float22bfloat162_rn(x1[row_idx]);
+                            // NOTES: X1 is already rounded to BF16; accumulate without unpacking it back to FP32.
+                            ptx::accumulate_square(x1_sqr_sums[row_idx], x1_bf16);
+                            if constexpr (kInCTANorm)
+                                get_x1_task_tiles(iter)[k_block_idx * kNumX1PairsPerTile +
+                                                        get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
+                            else
+                                smem.x[io_stage_idx][get_swizzled_bf16x2_offset(row_indices[row_idx], hidden_pair_idx)] = x1_bf16;
                         }
 
                         // All four warps have issued their route stores before A becomes visible to the MMA warp.
@@ -624,20 +609,19 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 smem.empty_stats_barrier.wait(task_phase ^ 1u);
 
                 // Four lanes own both column pairs of a row, independent of token batch size and SM scheduling.
-                const float reduced_hc_norm_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(hc_norm_sqr_sums[0].x + hc_norm_sqr_sums[0].y);
-                const float reduced_hc_norm_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(hc_norm_sqr_sums[1].x + hc_norm_sqr_sums[1].y);
-                float reduced_x1_0, reduced_x1_1;
-                if constexpr (kIsShifted) {
-                    reduced_x1_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[0].x + x1_sqr_sums[0].y);
-                    reduced_x1_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(x1_sqr_sums[1].x + x1_sqr_sums[1].y);
-                }
+                const float reduced_hc_norm_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(
+                    hc_norm_sqr_sums[0].x + hc_norm_sqr_sums[0].y);
+                const float reduced_hc_norm_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(
+                    hc_norm_sqr_sums[1].x + hc_norm_sqr_sums[1].y);
+                const float reduced_x1_0 = math::warp_reduce_sum<kNumLanesPerRowGroup>(
+                    x1_sqr_sums[0].x + x1_sqr_sums[0].y);
+                const float reduced_x1_1 = math::warp_reduce_sum<kNumLanesPerRowGroup>(
+                    x1_sqr_sums[1].x + x1_sqr_sums[1].y);
 
                 smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_hc_norm_0;
                 smem.hc_norm_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_hc_norm_1;
-                if constexpr (kIsShifted) {
-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_x1_0;
-                    smem.x1_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_x1_1;
-                }
+                smem.x1_sqr_sums[kPostWorkerIdx][row_indices[0]] = reduced_x1_0;
+                smem.x1_sqr_sums[kPostWorkerIdx][row_indices[1]] = reduced_x1_1;
                 __syncwarp();
 
                 if (cute::elect_one_sync())
@@ -669,8 +653,6 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             if (task_idx >= num_tasks)
                 break;
             const uint32_t m_block_idx = task_idx / kNumSplits;
-            if (warp_idx_in_wg == 0)
-                sched::mega_mhc::Mix::wait_init<kNumSplits>(gmem_split_barriers, m_block_idx);
 
             const uint32_t token_indices[kNumTokenRowsPerLane] = {m_block_idx * BLOCK_M + row_indices[0],
                                                                   m_block_idx * BLOCK_M + row_indices[1]};
@@ -709,16 +691,18 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                 }
 
                 *reinterpret_cast<float2*>(
-                    gemm_partial + row_indices[0] * BLOCK_N + output_idx + col_pair_idx * kNumOutputValuesPerLane) = row_values[0];
+                    gemm_partial + row_indices[0] * BLOCK_N + output_idx +
+                    col_pair_idx * kNumOutputValuesPerLane) = row_values[0];
                 *reinterpret_cast<float2*>(
-                    gemm_partial + row_indices[1] * BLOCK_N + output_idx + col_pair_idx * kNumOutputValuesPerLane) = row_values[1];
+                    gemm_partial + row_indices[1] * BLOCK_N + output_idx +
+                    col_pair_idx * kNumOutputValuesPerLane) = row_values[1];
             }
 
             ptx::tcgen05_before_thread_sync();
             if (cute::elect_one_sync())
                 smem.empty_accum_barriers[accum_stage_idx].arrive();
 
-            // Gate this split's Mix arrival on all four epilogue warps and, in Normal, the output-store warp.
+            // Gate this split's Mix arrival on all four epilogue warps.
             smem.full_stats_barrier.wait(task_phase);
 
             if (lane_idx < kNumRowsPerWarp) {
@@ -740,85 +724,65 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
             if (warp_idx_in_wg == 0) {
                 smem.mix_arrival_barrier.wait(task_phase);
                 if (cute::elect_one_sync())
-                    sched::mega_mhc::Mix::arrive<kNumSplits>(gmem_split_barriers, m_block_idx);
+                    sched::mega_mhc::Mix::arrive(gmem_split_barriers, m_block_idx);
             }
         }
     } else if (warp_idx < kNormWGIdx * kNumWarpsPerWG) {
-        // WG4: four shifted Mix workers, one per warp
-        if constexpr (kIsShifted) {
-            cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
-            const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
-            for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
-                 token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG)
-                epilogue::mega_mhc::run_mix_task<kHidden, true>(
-                    workspace, gmem_split_barriers, mix_args, token_idx, lane_idx);
+        // WG4: four Mix workers, one per warp, one group of four tokens per CTA
+        cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
+        const uint32_t warp_idx_in_mix_wg = warp_idx - kMixWGIdx * kNumWarpsPerWG;
+        for (uint32_t token_idx = blockIdx.x * kNumWarpsPerWG + warp_idx_in_mix_wg;
+             token_idx < norm_args.num_tokens; token_idx += kNumSMs * kNumWarpsPerWG) {
+            epilogue::mega_mhc::run_mix_task<kHidden, kNumSplits>(
+                workspace, gmem_split_barriers, mix_args, MixSaveArgs{}, token_idx, lane_idx);
         }
     }
 
-    if constexpr (not kIsShifted) {
-        // Normal repurposes WG4-5 immediately and each producer WG as soon as its static role retires.
-        if (warp_idx >= kMixWGIdx * kNumWarpsPerWG)
-            cutlass::arch::warpgroup_reg_dealloc<kNumLightweightRegisters>();
-
-        const uint32_t wg_idx_in_cta = warp_idx / kNumWarpsPerWG;
-
-        // Each Normal worker owns a distinct named barrier.
-        cutlass::arch::NamedBarrier::sync(128, 1 + wg_idx_in_cta);
-        cutlass::arch::warpgroup_reg_alloc<kNumNormalRegisters>();
-
-        epilogue::mega_mhc::run_normal_worker<kHidden, kNumSMs, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
-            smem, workspace, wg_idx_in_cta, warp_idx % kNumWarpsPerWG, lane_idx,
-            gmem_split_barriers, mix_args, norm_args);
-        cutlass::arch::warpgroup_reg_dealloc<kNumControlRegisters>();
-    } else {
-        const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
-        if constexpr (kInCTANorm) {
-            // WG5 normalizes this CTA's tasks in Post order, straight from the X1 tiles
-            if (wg_idx == kNormWGIdx) {
-                cutlass::arch::warpgroup_reg_alloc<kNumShiftedNormRegisters>();
-                // Stage the RMSNorm weight once; WG5 is its only reader
-                const auto smem_weight = reinterpret_cast<nv_bfloat16*>(
-                    smem_buffer + get_x1_tiles_smem_offset() + get_x1_tiles_smem_size(kMaxNumKBlocksPerTask));
-                const uint32_t thread_idx_in_wg = threadIdx.x % (kNumWarpsPerWG * 32);
-                for (uint32_t i = thread_idx_in_wg * 8; i < kHidden; i += kNumWarpsPerWG * 32 * 8)
-                    *reinterpret_cast<uint4*>(smem_weight + i) = *reinterpret_cast<const uint4*>(norm_args.weight + i);
-                cutlass::arch::NamedBarrier::sync(kNumWarpsPerWG * 32, 1 + kNormWGIdx);
-                for (uint32_t iter = 0; ; ++ iter) {
-                    const uint32_t task_idx = take_task(iter);
-                    if (task_idx >= num_tasks)
-                        break;
-                    const uint32_t split_idx = task_idx % kNumSplits;
-                    full_x1_barriers[iter % kNumX1Buffers].wait((iter / kNumX1Buffers) & 1u);
-                    epilogue::mega_mhc::run_in_cta_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
-                        workspace, gmem_split_barriers, norm_args, get_x1_task_tiles(iter), smem_weight,
-                        &tensor_map_y_bf16, 1 + kNormWGIdx, task_idx / kNumSplits,
-                        get_task_k_begin(split_idx), get_num_task_k_blocks(split_idx), warp_idx % kNumWarpsPerWG, lane_idx);
-                    // Every Norm warp has passed the WG barrier after its last X1 read, and warp 0 has waited for the BF16 TMA reads
-                    if (warp_idx % kNumWarpsPerWG == 0 and cute::elect_one_sync())
-                        empty_x1_barriers[iter % kNumX1Buffers].arrive();
-                    __syncwarp();
-                }
+    const uint32_t wg_idx = warp_idx / kNumWarpsPerWG;
+    if constexpr (kInCTANorm) {
+        // WG5 normalizes this CTA's tasks in Post order, straight from the X1 tiles
+        if (wg_idx == kNormWGIdx) {
+            cutlass::arch::warpgroup_reg_alloc<kNumNormRegisters>();
+            // Stage the RMSNorm weight once; WG5 is its only reader
+            const auto smem_weight = reinterpret_cast<nv_bfloat16*>(
+                smem_buffer + get_x1_tiles_smem_offset() + get_x1_tiles_smem_size(kMaxNumKBlocksPerTask));
+            const auto weight = static_cast<const nv_bfloat16*>(norm_args.weight);
+            const uint32_t thread_idx_in_wg = threadIdx.x % (kNumWarpsPerWG * 32);
+            for (uint32_t i = thread_idx_in_wg * 8; i < kHidden; i += kNumWarpsPerWG * 32 * 8)
+                *reinterpret_cast<uint4*>(smem_weight + i) = *reinterpret_cast<const uint4*>(weight + i);
+            cutlass::arch::NamedBarrier::sync(kNumWarpsPerWG * 32, 1 + kNormWGIdx);
+            for (uint32_t iter = 0; ; ++ iter) {
+                const uint32_t task_idx = take_task(iter);
+                if (task_idx >= num_tasks)
+                    break;
+                const uint32_t split_idx = task_idx % kNumSplits;
+                full_x1_barriers[iter % kNumX1Buffers].wait((iter / kNumX1Buffers) & 1u);
+                epilogue::mega_mhc::run_in_cta_norm_task<kHidden, kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
+                    workspace, gmem_split_barriers, norm_args, get_x1_task_tiles(iter), smem_weight,
+                    &tensor_map_y_bf16, 1 + kNormWGIdx, task_idx / kNumSplits,
+                    get_task_k_begin(split_idx), get_num_task_k_blocks(split_idx), warp_idx % kNumWarpsPerWG, lane_idx);
+                // Every Norm warp has passed the WG barrier after its last X1 read, and warp 0 has waited for the BF16 TMA reads
+                if (warp_idx % kNumWarpsPerWG == 0 and cute::elect_one_sync())
+                    empty_x1_barriers[iter % kNumX1Buffers].arrive();
+                __syncwarp();
             }
-        } else if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
-            // WG5 starts immediately; retired Post workers join the same Norm task queue.
-            epilogue::mega_mhc::run_shifted_norm_worker<kHidden, kNumSMs, kNumShiftedNormRegisters,
-                                                        kStoreBF16, kStoreFP8, SF_BLOCK_M, kSwizzledPrimarySF>(
-                smem, workspace, gmem_split_barriers, norm_args, lane_idx);
         }
+    } else if ((wg_idx >= kFirstPostWGIdx and wg_idx < kWorkspaceEpilogueWGIdx) or wg_idx == kNormWGIdx) {
+        // WG5 starts immediately; retired Post workers join the same Norm task queue.
+        epilogue::mega_mhc::run_norm_worker<kHidden, kNumSMs, kNumNormRegisters, kStoreBF16,
+                                            kStoreFP8, SF_BLOCK_M, kNumSplits, kNormPartitions, false, kSwizzledPrimarySF>(
+            smem, workspace, gmem_split_barriers, norm_args, MixSaveArgs{}, lane_idx);
     }
 
     // All roles must retire before the allocating warp releases TMEM.
     __syncthreads();
     if (warp_idx == 3)
         Allocator().free(tmem_base, kNumTmemCols);
-    // Every barrier use of this CTA is complete; the last CTA advances the epoch.
-    if (threadIdx.x == 0)
-        sched::mega_mhc::Epoch::retire(gmem_split_barriers, gridDim.x);
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_100f");
 #endif
 }
 
-} // namespace deep_gemm
+} // namespace deep_gemm::mega_mhc_inference
 #pragma clang diagnostic pop

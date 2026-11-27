@@ -9,9 +9,9 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/mma/sm100.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/mega_moe/inference.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -1198,10 +1198,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
@@ -2694,6 +2696,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         is_lane_ready = ptx::ld_acq_sys(peer_ready_ptr) == grid_idx;
                     return (__ballot_sync(0xffffffff, is_lane_ready) >> slot_idx & 1) != 0;
                 }, print_peers_timeout);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
                 record_ready_ranks();
             };
             if constexpr (not kWaitPerSlot) {
@@ -2703,6 +2706,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             is_lane_ready = ptx::ld_acq_sys(peer_ready_ptr) == grid_idx;
                         return __all_sync(0xffffffff, is_lane_ready);
                     }, print_peers_timeout);
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
                     record_ready_ranks();
                 }
             }
