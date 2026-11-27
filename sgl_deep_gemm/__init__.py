@@ -342,6 +342,8 @@ from .mega import (
     bf16_mega_moe,
     mega_moe_pre_dispatch,
     mega_moe_pre_dispatch_sm90,
+    expand_mxfp4_mega_moe_weights,
+    build_mxfp4_mega_moe_expert_mask,
     get_block_m_for_mega_moe,
 )
 

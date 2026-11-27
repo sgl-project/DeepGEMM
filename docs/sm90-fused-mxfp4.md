@@ -69,6 +69,60 @@ covering the active row count on **every** rank; omitting it uses capacity.
 A rank's row count cannot by itself establish a valid peer bound. All ranks
 must use compatible allocation and schedule parameters.
 
+## Optional expanded-weight reuse
+
+Large-M calls can expand each local expert once before MegaMoE, then reuse its
+FP8 weights across M tiles. The packed MXFP4 weights remain resident. The caller
+provides two contiguous FP8 buffers with shapes `(*packed.shape[:3], 32768)`;
+the corresponding packed tiled buffer ends in `16384`. Expansion preserves the
+MXFP4 scale chain; it does not quantize the model to a different weight format.
+
+```python
+expanded = tuple(
+    torch.empty((*weights[0].shape[:3], 32768),
+                dtype=torch.float8_e4m3fn, device=weights[0].device)
+    for weights in (w1, w2)
+)
+# Repeat for each layer invocation, including inside CUDA Graph capture.
+deep_gemm.expand_mxfp4_mega_moe_weights(w1, w2, expanded)
+deep_gemm.fp8_mxfp4_mega_moe(
+    y, w1, w2, buf, num_tokens_bound=common_rows_bound,
+    preexpanded_weights=expanded)
+```
+
+This is opt-in and currently requires the tiled split-M M128/N256/K128 path,
+two math warpgroups, and per-K128 L2 activation scales. Unsupported schedules
+are rejected. Omitting `preexpanded_weights` retains the packed path.
+
+To skip inactive experts, allocate an int32 mask of `num_experts` entries.
+`build_mxfp4_mega_moe_expert_mask(topk_ids, mask)` clears and rebuilds it from
+contiguous int32 **physical** expert IDs; negative and out-of-range IDs are
+ignored. Union the mask with `torch.distributed.all_reduce(..., op=MAX)` on the
+same EP group before calling `expand_mxfp4_mega_moe_weights` with
+`active_mask=mask, expert_offset=rank * local_experts`. Unmarked output remains
+untouched and must not be consumed by the current routes.
+
+The caller owns the outputs and must order expansion before consumption, and
+consumption before any overwrite. One pair of buffers can serve sequential
+layers on the same stream; cross-stream reuse needs explicit dependencies.
+For H4096/I2048 and 72 local experts, the pair occupies 1.6875 GiB per GPU.
+Masking reduces expansion traffic, not this reserved capacity.
+
+Reproduce a four-rank 32K-input comparison with random weights and fixed routes:
+
+```bash
+for reuse in none full mask; do
+  python sgl_deep_gemm/tests/bench_sm90_fused_mega_moe.py \
+    --impl pr440_mxfp4 --np 4 --m 8192 --epr 72 --topk 8 \
+    --layout tiled --bound --graph --include-pre-dispatch \
+    --reuse "$reuse" --iters 20 --reps 3
+done
+```
+
+This timing includes BF16 input preparation, mask construction and EP union
+when requested, expansion, and fused MegaMoE. Weight transformation and buffer
+allocation stay outside capture. Compare `max_rank_us` across implementations.
+
 The optional keyword `split_k=True` is a performance hint for one global decode
 token, applied consistently on every rank. The kernel checks routing-dependent
 eligibility. Leave it off for other workloads.

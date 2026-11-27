@@ -5,6 +5,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <ATen/MemoryOverlap.h>
 #ifndef DG_USE_TORCH_LIBRARY
 #include <pybind11/functional.h>
 #endif
@@ -332,12 +333,15 @@ static void sm90_fused_fp8_mxfp4_mega_moe(
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
 
-    // Packed weights: int8 [E, N, K/2], K-major, contiguous; or the tiled layout [E, N / 256, K / 128, 16384] (both or neither)
+    // Both weights use the same layout: packed int8 [E, N, K/2], tiled int8
+    // [E, N/256, K/128, 16384], or preexpanded FP8 [E, N/256, K/128, 32768].
     const bool tiled = l1_weights.dim() == 4;
+    const bool preexpanded = l1_weights.scalar_type() == torch::kFloat8_e4m3fn;
+    DG_HOST_ASSERT(not preexpanded or tiled);
     for (const auto* w: {&l1_weights, &l2_weights}) {
         DG_HOST_ASSERT(w->is_cuda() and w->device() == y.device());
-        DG_HOST_ASSERT(w->scalar_type() == kPackedFP4 and w->dim() == (tiled ? 4 : 3) and w->is_contiguous());
-        DG_HOST_ASSERT(not tiled or (w->size(3) == 256 * 64 and reinterpret_cast<uintptr_t>(w->data_ptr()) % 16 == 0));
+        DG_HOST_ASSERT(w->scalar_type() == (preexpanded ? torch::kFloat8_e4m3fn : kPackedFP4) and w->dim() == (tiled ? 4 : 3) and w->is_contiguous());
+        DG_HOST_ASSERT(not tiled or (w->size(3) == 256 * (preexpanded ? 128 : 64) and reinterpret_cast<uintptr_t>(w->data_ptr()) % 16 == 0));
     }
     const auto logical_shape = [&](const torch::Tensor& w) {
         return tiled ? std::make_tuple(w.size(0), w.size(1) * 256, w.size(2) * 64)
@@ -410,10 +414,68 @@ static void sm90_fused_fp8_mxfp4_mega_moe(
                             num_ring_tokens, l2_act_sf_gran_k,
                             activation_clamp, fast_math,
                             num_tokens_bound, l2_lag_encoded,
-                            std::make_tuple(l1_sfb, l1_secondary, l2_sfb, l2_secondary), split_k_hint);
+                            std::make_tuple(l1_sfb, l1_secondary, l2_sfb, l2_secondary), split_k_hint, preexpanded);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
+}
+
+static void build_mxfp4_mega_moe_expert_mask(const torch::Tensor& ids, const torch::Tensor& mask) {
+    DG_HOST_ASSERT(ids.is_cuda() and mask.device() == ids.device());
+    DG_HOST_ASSERT(ids.is_contiguous() and mask.is_contiguous());
+    DG_HOST_ASSERT(ids.scalar_type() == torch::kInt32 and mask.scalar_type() == torch::kInt32);
+    DG_HOST_ASSERT(mask.dim() == 1 and mask.numel() > 0 and mask.numel() <= 4096);
+    at::assert_no_overlap(ids, mask);
+    DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(mask.data_ptr(), 0, mask.nbytes(), c10::cuda::getCurrentCUDAStream()));
+    if (ids.numel() == 0)
+        return;
+    const auto kernel = jit->compile("sm90_mxfp4_active_experts", R"(
+#include <deep_gemm/impls/sm90_mxfp4_expand.cuh>
+using namespace deep_gemm;
+static void __instantiate_kernel() { auto ptr = reinterpret_cast<void*>(&sm90_mxfp4_mark_active_experts<>); }
+)");
+    jit->launch(kernel, deep_jit::cuda::LaunchOptions{
+        .num_smem_bytes = static_cast<int>(mask.nbytes()),
+        .grid_dim = dim3(std::min<int64_t>((ids.numel() + 255) / 256, 64), 1, 1),
+        .block_dim = dim3(256, 1, 1),
+        .enable_pdl = false,
+    }, ids.data_ptr(), mask.data_ptr(), ids.numel(), static_cast<int>(mask.numel()));
+}
+
+static void expand_mxfp4_mega_moe_weight(const torch::Tensor& packed, const torch::Tensor& sf,
+                                        const torch::Tensor& output,
+                                        const std::optional<torch::Tensor>& mask = std::nullopt,
+                                        int64_t expert_offset = 0) {
+    DG_HOST_ASSERT(packed.is_cuda() and sf.device() == packed.device() and output.device() == packed.device());
+    DG_HOST_ASSERT(packed.is_contiguous() and sf.is_contiguous() and output.is_contiguous());
+    DG_HOST_ASSERT(packed.dim() == 4 and sf.dim() == 3 and output.dim() == 4);
+    DG_HOST_ASSERT(packed.scalar_type() == kPackedFP4 and sf.scalar_type() == torch::kUInt8 and
+                   output.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(packed.size(3) == 16384 and output.size(3) == 32768);
+    for (int i = 0; i < 3; ++ i)
+        DG_HOST_ASSERT(packed.size(i) == output.size(i));
+    const int n = packed.size(1) * 256, k = packed.size(2) * 128;
+    DG_HOST_ASSERT(sf.size(0) == packed.size(0) and sf.size(1) == n and sf.size(2) == k / 32);
+    DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 == 0 and
+                   reinterpret_cast<uintptr_t>(sf.data_ptr()) % 4 == 0 and
+                   reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0);
+    if (mask.has_value()) {
+        DG_HOST_ASSERT(mask->device() == packed.device() and mask->is_contiguous());
+        DG_HOST_ASSERT(mask->scalar_type() == torch::kInt32 and mask->dim() == 1);
+        DG_HOST_ASSERT(expert_offset >= 0 and expert_offset + packed.size(0) <= mask->numel());
+        at::assert_no_overlap(*mask, output);
+    }
+    const auto code = std::string("#include <deep_gemm/impls/sm90_mxfp4_expand.cuh>\n") +
+        "using namespace deep_gemm;\nstatic void __instantiate_kernel() { auto ptr = "
+        "reinterpret_cast<void*>(&sm90_mxfp4_expand_tiled<" +
+        (mask.has_value() ? "true" : "false") + ">); }";
+    const auto kernel = jit->compile("sm90_mxfp4_expand", code);
+    jit->launch(kernel, deep_jit::cuda::LaunchOptions{
+        .grid_dim = dim3(packed.size(1) * packed.size(2), packed.size(0), 1),
+        .block_dim = dim3(256, 1, 1),
+        .enable_pdl = false,
+    }, packed.data_ptr(), sf.data_ptr(), output.data_ptr(),
+       mask.has_value() ? mask->data_ptr() : nullptr, static_cast<int>(expert_offset), n, k);
 }
 
 #ifndef DG_USE_TORCH_LIBRARY
@@ -422,6 +484,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_sm90_fused_mega_moe", &get_symm_buffer_size_for_sm90_fused_mega_moe);
     m.def("sm90_fused_fp8_mega_moe", &sm90_fused_fp8_mega_moe);
     m.def("sm90_fused_fp8_mxfp4_mega_moe", &sm90_fused_fp8_mxfp4_mega_moe);
+    m.def("build_mxfp4_mega_moe_expert_mask", &build_mxfp4_mega_moe_expert_mask);
+    m.def("expand_mxfp4_mega_moe_weight", &expand_mxfp4_mega_moe_weight,
+          pybind11::arg("packed"), pybind11::arg("sf"), pybind11::arg("output"),
+          pybind11::arg("mask") = std::nullopt, pybind11::arg("expert_offset") = 0);
 }
 
 #endif

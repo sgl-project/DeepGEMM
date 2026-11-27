@@ -135,6 +135,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -178,7 +179,8 @@ static void __instantiate_kernel() {{
     args.config.mxfp4_decode_mode,
     args.config.mxfp4_swap_ab ? "true" : "false",
     args.config.split_k_max_tokens,
-    args.config.split_k_half1_sixteenths);
+    args.config.split_k_half1_sixteenths,
+    args.config.mxfp4_preexpanded ? "true" : "false");
         // Metadata collection by CTA0 is validated for this bounded EP8 Flash shape.
         // num_tokens_bound must cover the local row count on every peer.
         const int dispatch_cta_rows = (args.config.num_dispatch_threads / 32) * (32 / args.num_topk);
@@ -246,7 +248,8 @@ static void sm90_fp8_fused_mega_moe(
     // MXFP4 routed weights: l1/l2_weights are packed int8 [E, N, K/2] and the *_weights_sf arguments are ignored
     const std::optional<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>& mxfp4_scales = std::nullopt,
     // MXFP4: the caller's split-K hint (one global token; heuristics get_mega_moe_config_sm90_fused)
-    const bool& split_k_hint = false
+    const bool& split_k_hint = false,
+    const bool& mxfp4_preexpanded = false
 ) {
     const bool mxfp4_weights = mxfp4_scales.has_value();
     // tiled MXFP4 weights (4D [E, N / 256, K / 128, 16384]) select decode modes 3..5; row-major [E, N, K / 2] keeps modes 0..2
@@ -268,7 +271,12 @@ static void sm90_fp8_fused_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens, l2_act_sf_gran_k,
-        num_ring_tokens, num_tokens_bound, l2_lag_encoded, mxfp4_weights, mxfp4_tiled, split_k_hint);
+        num_ring_tokens, num_tokens_bound, l2_lag_encoded, mxfp4_weights, mxfp4_tiled, split_k_hint, mxfp4_preexpanded);
+    DG_HOST_ASSERT(not mxfp4_preexpanded or (mxfp4_weights and mxfp4_tiled and
+        config.block_m == 128 and config.block_n == 256 and config.block_k == 128 and
+        config.num_epilogue_threads == 256 and config.cluster_size == 1 and
+        config.mxfp4_decode_mode == 3 and config.mxfp4_expanded_buffers == 2 and
+        not config.mxfp4_swap_ab and l2_act_sf_gran_k == 128));
     // a BLOCK_M outside the SM90 candidate set would index SF rows past the pool sized above
     DG_HOST_ASSERT(is_candidate_block_m_sm90_fused(config.block_m) and
                    config.num_padded_sf_pool_tokens >= (num_data_pool_tokens / config.block_m) * align(config.block_m, 128));
@@ -458,7 +466,7 @@ static void sm90_fp8_fused_mega_moe(
         .l2_mxfp4_secondary = mxfp4_weights ? std::get<3>(*mxfp4_scales).data_ptr<float>() : nullptr,
         .l1_mxfp4_tiled_w = mxfp4_tiled ? static_cast<const uint8_t*>(l1_weights.data_ptr()) : nullptr,
         .l2_mxfp4_tiled_w = mxfp4_tiled ? static_cast<const uint8_t*>(l2_weights.data_ptr()) : nullptr,
-        // kernel 自己带 griddepcontrol wait/trigger 的调用必须以 PDL 启动（见上面 pdl 的推导）
+        // Match the launch attribute to the kernel's griddepcontrol instructions.
         .options = deep_jit::cuda::LaunchOptions{
             .num_smem_bytes = config.smem_size,
             .grid_dim = dim3(num_sms, 1, 1),

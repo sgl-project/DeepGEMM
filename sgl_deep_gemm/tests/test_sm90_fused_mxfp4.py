@@ -94,8 +94,9 @@ def run_case(name, m, fm, args, rank, nr, group, seed):
     l1q = quantize_mxfp4(torch.randn(epr, 2 * ih, hidden, dtype=torch.bfloat16, device='cuda') * 0.05)
     l2q = quantize_mxfp4(torch.randn(epr, hidden, ih, dtype=torch.bfloat16, device='cuda') * 0.05)
     scores = torch.randn(m, num_experts, device='cuda')
-    if args.route == 'skew':   # concentrate traffic: half the tokens go to experts 0..topk-1 -> odd/long tile streams
-        scores[: m // 2, :topk] += 100.0
+    if args.route in ('skew', 'concentrated'):
+        rows = m // 2 if args.route == 'skew' else m
+        scores[:rows, :topk] += 100.0
     topk_w, topk_idx = torch.topk(scores, topk, dim=-1, sorted=False)
     if args.masked > 0:
         msk = torch.rand_like(topk_w) < args.masked
@@ -141,20 +142,38 @@ def run_case(name, m, fm, args, rank, nr, group, seed):
     buf.x[:m].copy_(x_fp8); buf.x_sf[:m].copy_(x_sf)
     buf.topk_idx[:m].copy_(topk_idx); buf.topk_weights[:m].copy_(topk_w)
     stats = torch.zeros(epr, dtype=torch.int, device='cuda')
+    expanded = None
+    mask = None
+    if args.reuse != 'none':
+        if args.layout != 'tiled':
+            raise ValueError('Weight reuse requires --layout tiled')
+        expanded = tuple(torch.empty((*w.shape[:3], 32768), device='cuda',
+                                     dtype=torch.float8_e4m3fn) for w, _, _ in (tl1, tl2))
+        if args.reuse == 'mask':
+            mask = torch.empty(num_experts, device='cuda', dtype=torch.int32)
+
+    def launch(y, recv_stats):
+        if expanded is not None:
+            if mask is not None:
+                deep_gemm.build_mxfp4_mega_moe_expert_mask(buf.topk_idx[:m].to(torch.int32), mask)
+                dist.all_reduce(mask, op=dist.ReduceOp.MAX, group=group)
+            deep_gemm.expand_mxfp4_mega_moe_weights(
+                tl1, tl2, expanded, active_mask=mask, expert_offset=rank * epr)
+        deep_gemm.fp8_mxfp4_mega_moe(
+            y, tl1, tl2, buf, cumulative_local_expert_recv_stats=recv_stats,
+            activation_clamp=args.clamp, fast_math=bool(fm),
+            preexpanded_weights=expanded,
+            **(dict(num_tokens_bound=m) if args.bound else {}),
+            **(dict(split_k=True) if args.split_k else {}))
+
     outs = []
     if args.graph:
         y = torch.empty(m, hidden, dtype=torch.bfloat16, device='cuda')
-        deep_gemm.fp8_mxfp4_mega_moe(y, tl1, tl2, buf, cumulative_local_expert_recv_stats=None,
-                                     activation_clamp=args.clamp, fast_math=bool(fm),
-                                     **(dict(num_tokens_bound=m) if args.bound else {}),
-                                     **(dict(split_k=True) if args.split_k else {}))
+        launch(y, None)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            deep_gemm.fp8_mxfp4_mega_moe(y, tl1, tl2, buf, cumulative_local_expert_recv_stats=stats,
-                                         activation_clamp=args.clamp, fast_math=bool(fm),
-                                         **(dict(num_tokens_bound=m) if args.bound else {}),
-                                         **(dict(split_k=True) if args.split_k else {}))
+            launch(y, stats)
         for _ in range(args.repeat):
             graph.replay()
             outs.append(y.clone())
@@ -162,10 +181,7 @@ def run_case(name, m, fm, args, rank, nr, group, seed):
     else:
         for _ in range(args.repeat):
             y = torch.empty(m, hidden, dtype=torch.bfloat16, device='cuda')
-            deep_gemm.fp8_mxfp4_mega_moe(y, tl1, tl2, buf, cumulative_local_expert_recv_stats=stats,
-                                         activation_clamp=args.clamp, fast_math=bool(fm),
-                                         **(dict(num_tokens_bound=m) if args.bound else {}),
-                                         **(dict(split_k=True) if args.split_k else {}))
+            launch(y, stats)
             torch.cuda.synchronize()
             outs.append(y)
 
@@ -215,7 +231,8 @@ if __name__ == '__main__':
     p.add_argument('--experts-per-rank', type=int, default=32)
     p.add_argument('--topk', type=int, default=6)
     p.add_argument('--gran', type=int, default=0)
-    p.add_argument('--route', default='rand', choices=['rand', 'skew'])
+    p.add_argument('--route', default='rand', choices=['rand', 'skew', 'concentrated'])
+    p.add_argument('--reuse', default='none', choices=['none', 'full', 'mask'])
     p.add_argument('--layout', default='tiled', choices=['row', 'tiled'])
     p.add_argument('--masked', type=float, default=0.0)
     p.add_argument('--clamp', type=float, default=10.0)

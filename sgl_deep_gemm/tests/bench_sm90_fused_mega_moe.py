@@ -74,19 +74,41 @@ def worker(local_rank, num_local_ranks, a):
             x, xs = per_token_cast_to_fp8(xb, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
         else:
             torch.manual_seed(1000003 * m + rank + a.seed * 1009)
-            x, xs = per_token_cast_to_fp8(torch.randn(m, H, dtype=torch.bfloat16, device='cuda'), use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
-            tw, ti = torch.topk(torch.randn(m, E * nr, device='cuda'), K, dim=-1, sorted=False)
             xb = torch.randn(m, H, dtype=torch.bfloat16, device='cuda')
+            x, xs = per_token_cast_to_fp8(xb, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+            tw, ti = torch.topk(torch.randn(m, E * nr, device='cuda'), K, dim=-1, sorted=False)
         if a.mask_all:   # every row masked on every rank (topk -1, weight 0): the kernel skeleton without any tile (single-token decode)
             ti = torch.full_like(ti, -1); tw = torch.zeros_like(tw)
         buf.x[:m].copy_(x); buf.x_sf[:m].copy_(xs); buf.topk_idx[:m].copy_(ti); buf.topk_weights[:m].copy_(tw)
         y = torch.empty(m, H, dtype=torch.bfloat16, device='cuda')
         kw = dict(num_tokens_bound=m) if (a.bound and fused) else {}
+        expanded = None
+        mask = None
+        ids32 = ti.to(torch.int32)
+        if a.reuse != 'none':
+            if a.impl != 'pr440_mxfp4' or a.layout != 'tiled':
+                raise ValueError('Weight reuse requires --impl pr440_mxfp4 --layout tiled')
+            expanded = tuple(torch.empty((*w.shape[:3], 32768), device='cuda',
+                                         dtype=torch.float8_e4m3fn) for w, _, _ in (w1, w2))
+            kw['preexpanded_weights'] = expanded
+            if a.reuse == 'mask':
+                mask = torch.empty(E * nr, device='cuda', dtype=torch.int32)
         if a.split_k and a.impl == 'pr440_mxfp4' and mg == 1:   # split-K hint: one global token (vLLM decode b1; single-token decode)
             kw['split_k'] = True
         k = (lambda: deep_gemm.fp8_mega_moe(y, w1, w2, buf, activation_clamp=10.0, **kw)) if fp8 else \
             (lambda: deep_gemm.fp8_mxfp4_mega_moe(y, w1, w2, buf, activation_clamp=10.0, **kw))
-        f = k
+        def f():
+            if a.include_pre_dispatch:
+                deep_gemm.mega_moe_pre_dispatch_sm90(
+                    xb, ids32, tw, buf.x, buf.x_sf, buf.topk_idx, buf.topk_weights,
+                    num_tokens=m, group_size=128, routed_scaling_factor=1.0)
+            if expanded is not None:
+                if mask is not None:
+                    deep_gemm.build_mxfp4_mega_moe_expert_mask(ids32, mask)
+                    dist.all_reduce(mask, op=dist.ReduceOp.MAX, group=group)
+                deep_gemm.expand_mxfp4_mega_moe_weights(
+                    w1, w2, expanded, active_mask=mask, expert_offset=rank * E)
+            k()
         for _ in range(3):
             f()
         torch.cuda.synchronize(); dist.barrier(group=group)
@@ -126,7 +148,7 @@ def worker(local_rank, num_local_ranks, a):
           dist.all_gather_object(cpus, cpu, group=group)
           if rank == 0:
               hmax = HT.max(0).values
-              print(f'RESULT impl={a.impl} np={nr} mi={mi} m={mg} rows={m} rep={rep} buf=0x{buf.buffer.data_ptr():x} median_us={statistics.median(mn):.1f} max_rank_us={statistics.median(mx):.1f} '
+              print(f'RESULT impl={a.impl} reuse={a.reuse} pre_dispatch={a.include_pre_dispatch} np={nr} mi={mi} m={mg} rows={m} rep={rep} buf=0x{buf.buffer.data_ptr():x} median_us={statistics.median(mn):.1f} max_rank_us={statistics.median(mx):.1f} '
                     f'rank0_us={statistics.median(G[0].tolist()):.1f} p10={mn[len(mn) // 10]:.1f} p90={mn[len(mn) * 9 // 10]:.1f} n={len(mn)} '
                     f'host_med_us={hmax.median().item():.1f} host_max_us={hmax.max().item():.1f} '
                     f'pad_us={LT.median().item():.1f} cpus={",".join(map(str, cpus))}', flush=True)
@@ -148,6 +170,9 @@ if __name__ == '__main__':
     p.add_argument('--epr', type=int, default=32); p.add_argument('--topk', type=int, default=6)
     p.add_argument('--cap', type=int, default=0)   # symm buffer capacity (tokens per rank); 0 = max(128, align(m, 128))
     p.add_argument('--layout', default='row', choices=['row', 'tiled'])
+    p.add_argument('--reuse', default='none', choices=['none', 'full', 'mask'])
+    p.add_argument('--include-pre-dispatch', action='store_true',
+                   help='Include BF16 input quantization and buffer staging in each timed call')
     p.add_argument('--pad-cycles', type=int, default=2000000)   # torch.cuda._sleep before the timed launch (~1 ms); 0 = off (ep8b used 400000)
     p.add_argument('--reps', type=int, default=1)   # timing windows per buffer (each M entry allocates a new buffer)
     p.add_argument('--global-m', action='store_true')   # --m are global token counts; cdiv(B, np) rows per rank, the tail masked

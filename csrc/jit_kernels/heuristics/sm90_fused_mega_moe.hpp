@@ -61,6 +61,7 @@ struct MegaMoESM90FusedConfig {
     int split_k_max_tokens;
     // split-K: K range of half 1 in sixteenths (kernel kSplitKHalf1Sixteenths; 8 = even split)
     int split_k_half1_sixteenths;
+    bool mxfp4_preexpanded;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoESM90FusedConfig& config) {
         os << "MegaMoESM90FusedConfig("
@@ -82,6 +83,7 @@ struct MegaMoESM90FusedConfig {
            << ", l2_stage_mode=" << config.l2_stage_mode
            << ", early_combine=" << config.early_combine
            << ", pull_publish_batch=" << config.pull_publish_batch
+           << ", mxfp4_preexpanded=" << config.mxfp4_preexpanded
            << ", mxfp4_weights=" << config.mxfp4_weights
            << ", mxfp4_expanded_buffers=" << config.mxfp4_expanded_buffers
            << ", mxfp4_decode_mode=" << config.mxfp4_decode_mode
@@ -495,7 +497,8 @@ static std::pair<int, int> get_pipeline_config_sm90_fused(
     const bool& early_combine = false,
     const int& pull_publish_batch = 1,
     const bool& mxfp4_weights = false,
-    const int& mxfp4_expanded_buffers = 1) {
+    const int& mxfp4_expanded_buffers = 1,
+    const bool& mxfp4_preexpanded = false) {
     constexpr int kSmemAlignment = 1024;
     const int num_l2_cd_passes = l2_cd_passes != 0 ? l2_cd_passes : (half_l2_cd ? 2 : 1);
 
@@ -519,9 +522,9 @@ static std::pair<int, int> get_pipeline_config_sm90_fused(
         align((l2_act_sf_gran_k == block_k ? 1 : 2) * block_m * static_cast<int>(sizeof(float)), 128);
     // MXFP4 (kernel kMXFP4Weights): a B stage holds the packed K/2 bytes plus one u32 SFB word per row, and one expanded E4M3
     // B tile lives outside the ring
-    const int smem_b_per_stage = mxfp4_weights ? block_n * block_k / 2 : block_n * block_k;
-    const int smem_sfb_per_stage = mxfp4_weights ? block_n * (block_k / 32) : 0;
-    const int smem_expanded_b = mxfp4_weights ? mxfp4_expanded_buffers * block_n * block_k : 0;
+    const int smem_b_per_stage = mxfp4_weights and not mxfp4_preexpanded ? block_n * block_k / 2 : block_n * block_k;
+    const int smem_sfb_per_stage = mxfp4_weights and not mxfp4_preexpanded ? block_n * (block_k / 32) : 0;
+    const int smem_expanded_b = mxfp4_weights and not mxfp4_preexpanded ? mxfp4_expanded_buffers * block_n * block_k : 0;
     const int smem_per_stage = block_m * block_k + smem_b_per_stage +
                                smem_sfa_per_stage + smem_sfb_per_stage;
 
@@ -568,8 +571,8 @@ static uint32_t get_sm90_fused_pre_barrier_smem_size_for_combine(
             (static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(uint8_t))) : 0;
     const int smem_cd = align(
         std::max(std::max(smem_cd_l1, smem_cd_l2), smem_cd_swap_l1), kSmemAlignment);
-    const int smem_b_per_stage = config.mxfp4_weights ? config.block_n * config.block_k / 2 : config.block_n * config.block_k;
-    const int smem_expanded_b = config.mxfp4_weights ? config.mxfp4_expanded_buffers * config.block_n * config.block_k : 0;
+    const int smem_b_per_stage = config.mxfp4_weights and not config.mxfp4_preexpanded ? config.block_n * config.block_k / 2 : config.block_n * config.block_k;
+    const int smem_expanded_b = config.mxfp4_weights and not config.mxfp4_preexpanded ? config.mxfp4_expanded_buffers * config.block_n * config.block_k : 0;
     const int smem_gemm = config.num_stages *
         (config.block_m * config.block_k + smem_b_per_stage);
     return static_cast<uint32_t>(smem_send_buffers + smem_cd + smem_expanded_b + smem_gemm);
@@ -590,7 +593,8 @@ static MegaMoESM90FusedConfig get_mega_moe_config_sm90_fused(
     // MXFP4 weights preprocessed into the tiled layout: decode modes 3..5 are the mappings that read it
     const bool& mxfp4_tiled = false,
     // caller hint for the MXFP4 small-B split-K instance (see split_k_max_tokens below)
-    const bool& split_k_hint = false) {
+    const bool& split_k_hint = false,
+    const bool& mxfp4_preexpanded = false) {
     const auto [block_m, block_n, num_epilogue_threads, use_swap_ab] = get_block_mn_config_sm90_fused(
         num_ranks, num_experts, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden, l2_act_sf_gran_k, mxfp4_weights, mxfp4_tiled);
@@ -746,7 +750,7 @@ static MegaMoESM90FusedConfig get_mega_moe_config_sm90_fused(
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         use_swap_ab, /*half_l2_cd=*/false,
         0, tile_table_entries, l2_act_sf_gran_k, early_combine_fits_smem != 0, pull_publish_batch, mxfp4_weights,
-        mxfp4_expanded_buffers);
+        mxfp4_expanded_buffers, mxfp4_preexpanded);
 
     const bool split_phase_prefill =
         block_m == 128 and block_n == 256 and hidden >= 4096;
@@ -766,7 +770,7 @@ static MegaMoESM90FusedConfig get_mega_moe_config_sm90_fused(
             num_dispatch_threads / 32, num_epilogue_threads / 32,
             use_swap_ab, /*half_l2_cd=*/true,
             l2_cd_passes, tile_table_entries, l2_act_sf_gran_k, early_combine_fits_smem != 0, pull_publish_batch,
-            mxfp4_weights, mxfp4_expanded_buffers);
+            mxfp4_weights, mxfp4_expanded_buffers, mxfp4_preexpanded);
         half_l2_cd = true;
         num_stages = ns_half;
         smem_size = sz_half;
@@ -831,7 +835,8 @@ static MegaMoESM90FusedConfig get_mega_moe_config_sm90_fused(
         mxfp4_decode_mode,
         mxfp4_swap_ab,
         split_k_max_tokens,
-        split_k_half1_sixteenths
+        split_k_half1_sixteenths,
+        mxfp4_preexpanded
     };
 
 

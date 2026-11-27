@@ -97,7 +97,8 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        fast_math: bool = True,
                        *,
                        num_tokens_bound: Optional[int] = None,
-                       split_k: bool = False):
+                       split_k: bool = False,
+                       preexpanded_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
     """SM90 fused MegaMoE with packed MXFP4 routed weights (opt-in).
 
     ``split_k`` is a hint that the call is a decode step of ONE global token (the same value on every rank); it selects the instance
@@ -109,6 +110,10 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     :func:`transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90`. The buffer must come from
     ``get_symm_buffer_for_sm90_mega_moe(..., fused=True)``; the FP8 entry point
     :func:`fp8_mega_moe` is unchanged.
+
+    ``preexpanded_weights`` optionally supplies caller-owned FP8 tiles produced
+    by :func:`expand_mxfp4_mega_moe_weights`. Refresh them on the same stream
+    before each layer call. MXFP4 activation and secondary-scale rules still apply.
     """
     if not isinstance(sym_buffer, SM90FusedSymmBuffer):
         raise TypeError('fp8_mxfp4_mega_moe requires an SM90FusedSymmBuffer (fused=True)')
@@ -124,6 +129,10 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
         raise ValueError(
             f'SM90 MXFP4 weights do not match the buffer: expected {expected_l1_shape} and {expected_l2_shape}, '
             f'got {tuple(l1_weights[0].shape)} and {tuple(l2_weights[0].shape)}')
+    if preexpanded_weights is not None:
+        _validate_preexpanded_weights(l1_weights, l2_weights, preexpanded_weights)
+        l1_weights = (preexpanded_weights[0], *l1_weights[1:])
+        l2_weights = (preexpanded_weights[1], *l2_weights[1:])
     _C.sm90_fused_fp8_mxfp4_mega_moe(
         y,
         *l1_weights, *l2_weights,
@@ -140,3 +149,49 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
         sym_buffer.l2_lag_encoded, sym_buffer.l2_act_sf_gran_k,
         bool(split_k)
     )
+
+
+def _validate_preexpanded_weights(l1_weights, l2_weights, output):
+    if len(output) != 2:
+        raise ValueError('Expected L1 and L2 preexpanded output buffers')
+    ranges = []
+    for (packed, _, _), expanded in zip((l1_weights, l2_weights), output):
+        expected = (*packed.shape[:3], 32768)
+        if (packed.ndim != 4 or packed.shape[-1] != 16384 or
+                expanded.shape != expected or expanded.dtype != torch.float8_e4m3fn or
+                expanded.device != packed.device or not expanded.is_contiguous()):
+            raise ValueError(f'Expected a contiguous FP8 tiled buffer {expected} on {packed.device}')
+        if expanded.data_ptr() % 16:
+            raise ValueError('Preexpanded weights require 16-byte alignment')
+        ranges.append((expanded.data_ptr(), expanded.data_ptr() + expanded.nbytes))
+    if max(ranges[0][0], ranges[1][0]) < min(ranges[0][1], ranges[1][1]):
+        raise ValueError('L1 and L2 preexpanded buffers must not overlap')
+    for start, end in ranges:
+        for triple in (l1_weights, l2_weights):
+            for source in triple:
+                if max(start, source.data_ptr()) < min(end, source.data_ptr() + source.nbytes):
+                    raise ValueError('Preexpanded buffers must not overwrite source weights or scales')
+
+
+def build_mxfp4_mega_moe_expert_mask(topk_ids, mask):
+    """Refresh a rank-local physical-expert mask, including during Graph replay.
+
+    The caller must union the mask across the EP group before masked expansion.
+    The mask must not overlap the input IDs.
+    """
+    _C.build_mxfp4_mega_moe_expert_mask(topk_ids, mask)
+
+
+def expand_mxfp4_mega_moe_weights(l1_weights, l2_weights, output, *, active_mask=None, expert_offset=0):
+    """Expand tiled MXFP4 into caller-owned FP8 buffers on the current stream.
+
+    Refresh both buffers for every layer invocation, including Graph replay.
+    The caller must serialize users of the output storage and keep it alive.
+    With a mask, only marked experts are written. It must cover the EP-wide
+    physical routes for this invocation; unmarked storage remains untouched.
+    The mask must not overlap either output buffer.
+    """
+    _validate_processed_mxfp4_kernel_weights(l1_weights, l2_weights)
+    _validate_preexpanded_weights(l1_weights, l2_weights, output)
+    for (packed, scale, _), expanded in zip((l1_weights, l2_weights), output):
+        _C.expand_mxfp4_mega_moe_weight(packed, scale, expanded, active_mask, expert_offset)

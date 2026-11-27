@@ -322,6 +322,9 @@ else
     --accuracy --layers 1 2 3 4 5 --num-correctness-tests 32
   run_test test_sm90_fused_fp8.py --np "${NPROC}" --fused
   run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --graph --bound
+  run_test test_sm90_mxfp4_expand.py
+  run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --m 1024 --fm 1 --graph --bound --reuse full
+  run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --m 1024 --fm 1 --graph --bound --reuse mask --route concentrated
 fi
 
 if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then

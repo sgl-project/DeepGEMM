@@ -153,6 +153,7 @@ template <
     uint32_t kSplitKMaxTokens = 0,
     // split-K K-range of half 1 in sixteenths (scheduler kSplitKHalf1Sixteenths; 8 = even split)
     uint32_t kSplitKHalf1Sixteenths = 8,
+    bool kMXFP4Preexpanded = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -501,6 +502,8 @@ sm90_fp8_fused_mega_moe_impl(void* y,
     // MXFP4 swap tiles: the epilogue runs on the swap accumulator layout (weight row x token) instead of transposing the tile back to
     // the regular 64-row layout: SwiGLU / amax / quantize / bf16 cast only for the tile's tokens, no transpose (notes §28)
     constexpr bool kMXFP4DirectSwapEpi = kMXFP4Weights and kMXFP4SwapAB;
+    DG_STATIC_ASSERT(not kMXFP4Preexpanded or (kMXFP4SplitM and BLOCK_N == 256 and BLOCK_K == 128),
+                     "Preexpanded MXFP4 requires the split-M tiled path");
     constexpr bool kMXFP4Tiled = kMXFP4Weights and kMXFP4DecodeMode >= 3;
     DG_STATIC_ASSERT(kMXFP4DecodeMode <= 7, "MXFP4 decode mode 0..7");
     DG_STATIC_ASSERT(not kMXFP4SplitM or (kMXFP4DecodeMode == 3 and kMXFP4ExpandedBuffers == 2 and not kMXFP4SwapAB and kL2ActSFPerBlockK),
@@ -541,18 +544,18 @@ sm90_fp8_fused_mega_moe_impl(void* y,
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     // MXFP4: a B stage holds the packed E2M1 bytes (K/2 per row, TMA SWIZZLE_64B); the FP8 path keeps the full E4M3 tile
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = kMXFP4Weights ? LOAD_BLOCK_N * BLOCK_K / 2 : LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = kMXFP4Weights and not kMXFP4Preexpanded ? LOAD_BLOCK_N * BLOCK_K / 2 : LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // MXFP4 expanded E4M3 B tile (SWIZZLE_128B, the layout the FP8 TMA writes): one per CTA, each split-N warpgroup decodes and
     // reads only its own WG_BLOCK_N rows, so the tile is warpgroup-private storage, not a pipeline stage
     constexpr uint32_t SMEM_EXPANDED_B_TILE_SIZE = BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
-    constexpr uint32_t SMEM_EXPANDED_B_SIZE = kMXFP4Weights ? kMXFP4ExpandedBuffers * SMEM_EXPANDED_B_TILE_SIZE : 0u;
+    constexpr uint32_t SMEM_EXPANDED_B_SIZE = kMXFP4Weights and not kMXFP4Preexpanded ? kMXFP4ExpandedBuffers * SMEM_EXPANDED_B_TILE_SIZE : 0u;
     // SFA per stage: BLOCK_M floats for L1 and for the per-128 L2 act SF (one (BLOCK_M, 1) TMA per k-block), 2*BLOCK_M
     // floats (lo/hi halves) with the per-64 L2 act SF
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>((kL2ActSFPerBlockK ? 1u : 2u) * BLOCK_M * sizeof(float), 128u);
     // MXFP4 SFB per stage: one u32 (four K32 UE8M0 bytes) per B row; a bulk copy of the contiguous [N] slice of [E, K/128, N, 4]
     constexpr uint32_t kMXFP4GranK = 32;
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kMXFP4Weights ? BLOCK_N * (BLOCK_K / kMXFP4GranK) : 0u;
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kMXFP4Weights and not kMXFP4Preexpanded ? BLOCK_N * (BLOCK_K / kMXFP4GranK) : 0u;
     constexpr uint32_t kNumL1WeightSFFloatsPerWG = 2 * (kHidden / 128);
     constexpr uint32_t kNumL2WeightSFFloatsPerWG = kNumSFGroupsPerWG * (kIntermediateHidden / 128);
     constexpr uint32_t kNumWeightSFFloatsPerWG =
@@ -693,7 +696,7 @@ sm90_fp8_fused_mega_moe_impl(void* y,
 
     // Release a pipeline stage toward every CTA whose producer writes into it.
     auto release_empty_stage = [&](const uint32_t& stage_idx) {
-        if constexpr (kMXFP4Weights) {
+        if constexpr (kMXFP4Weights and not kMXFP4Preexpanded) {
             // the decode reads the stage's packed B and SFB through the generic proxy; the producer's next TMA write is in the
             // async proxy, which the mbarrier does not order against those reads (notes/pr411-sm90-stage-release-proxy-race.md)
             cutlass::arch::fence_view_async_shared();
@@ -1660,15 +1663,17 @@ sm90_fp8_fused_mega_moe_impl(void* y,
                                 tensor_map_b_ptr, full_barriers[stage_idx], reinterpret_cast<uint8_t*>(smem_b[stage_idx]),
                                 k_idx / 2, n_idx, 1);
                         }
-                        const uint8_t* sfb_base = block_phase == sched::BlockPhase::Linear2 ? l2_mxfp4_sfb : l1_mxfp4_sfb;
-                        const uint32_t sfb_k_stride = (block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K) / kMXFP4GranK;
-                        // (expert * shape_n + n) rows of sfb_k_stride bytes per expert, re-laid out as [K/128][N][4] per expert
-                        const uint8_t* sfb_src = sfb_base +
-                            static_cast<uint64_t>(local_expert_idx) * shape_n * sfb_k_stride +
-                            static_cast<uint64_t>(k_block_base + k_block_idx) * shape_n * (BLOCK_K / kMXFP4GranK) +
-                            static_cast<uint64_t>(n_block_idx) * BLOCK_N * (BLOCK_K / kMXFP4GranK);
-                        ptx::tma_load_1d(smem_sfb[stage_idx], sfb_src, full_barriers[stage_idx], SMEM_SFB_SIZE_PER_STAGE,
-                                         cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        if constexpr (not kMXFP4Preexpanded) {
+                            const uint8_t* sfb_base = block_phase == sched::BlockPhase::Linear2 ? l2_mxfp4_sfb : l1_mxfp4_sfb;
+                            const uint32_t sfb_k_stride = (block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K) / kMXFP4GranK;
+                            // (expert * shape_n + n) rows of sfb_k_stride bytes per expert, re-laid out as [K/128][N][4] per expert
+                            const uint8_t* sfb_src = sfb_base +
+                                static_cast<uint64_t>(local_expert_idx) * shape_n * sfb_k_stride +
+                                static_cast<uint64_t>(k_block_base + k_block_idx) * shape_n * (BLOCK_K / kMXFP4GranK) +
+                                static_cast<uint64_t>(n_block_idx) * BLOCK_N * (BLOCK_K / kMXFP4GranK);
+                            ptx::tma_load_1d(smem_sfb[stage_idx], sfb_src, full_barriers[stage_idx], SMEM_SFB_SIZE_PER_STAGE,
+                                             cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        }
                     } else if constexpr (LOAD_BLOCK_N <= 256) {
                         tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                             tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
@@ -1956,12 +1961,17 @@ sm90_fp8_fused_mega_moe_impl(void* y,
             DG_STATIC_ASSERT(SMEM_A_SIZE_PER_STAGE % 16 == 0 and SMEM_B_SIZE_PER_STAGE % 16 == 0,
                              "Descriptor folding needs 16B-aligned stage strides");
             const auto desc_a_stage0 = mma::sm90::make_smem_desc(smem_a[0], 1);
-            const auto desc_b_stage0 = mma::sm90::make_smem_desc(kMXFP4Weights ? smem_expanded_b : smem_b[0], 1);
+            const auto desc_b_stage0 = [&] {
+                if constexpr (kMXFP4Preexpanded)
+                    return mma::sm90::make_smem_desc(smem_b[0], 0, 128, 1024);
+                else
+                    return mma::sm90::make_smem_desc(kMXFP4Weights ? smem_expanded_b : smem_b[0], 1);
+            }();
             auto smem_desc_a = [&](const uint32_t& stage, const uint32_t& byte_offset) {
                 return mma::sm90::advance_smem_desc(desc_a_stage0, stage * SMEM_A_SIZE_PER_STAGE + byte_offset);
             };
             auto smem_desc_b = [&](const uint32_t& stage, const uint32_t& byte_offset) {
-                if constexpr (kMXFP4Weights)
+                if constexpr (kMXFP4Weights and not kMXFP4Preexpanded)
                     return mma::sm90::advance_smem_desc(desc_b_stage0, byte_offset);
                 else
                     return mma::sm90::advance_smem_desc(desc_b_stage0, stage * SMEM_B_SIZE_PER_STAGE + byte_offset);
@@ -3219,11 +3229,62 @@ sm90_fp8_fused_mega_moe_impl(void* y,
                 }
             };
 
+
+            const auto preexpanded_mainloop = [&](float* accum) CUTLASS_LAMBDA_FUNC_INLINE {
+                float prev0 = 1.0f, prev1 = 1.0f;
+                // Unlike the native pre-decoded path, no first-stage-ready
+                // proof exists. Publish before any wait that could depend on it.
+                mxfp4_flush_pub();
+                for (uint32_t k = 0; k < num_k_blocks; advance_pipeline(k)) {
+                    full_barriers[stage_idx]->wait(phase);
+                    const float a0 = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
+                    const float a1 = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
+                    if (k) {
+                        const float r0 = prev0 * math::fast_rcp(a0);
+                        const float r1 = prev1 * math::fast_rcp(a1);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            accum[4 * i] *= r0; accum[4 * i + 1] *= r0;
+                            accum[4 * i + 2] *= r1; accum[4 * i + 3] *= r1;
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                        ptx::warpgroup_fence_operand(accum[i]);
+                    ptx::warpgroup_arrive();
+                    #pragma unroll
+                    for (uint32_t part = 0; part < 4; ++part) {
+                        auto a = smem_desc_a(stage_idx, smem_a_wg_offset + part * 32);
+                        auto b = smem_desc_b(stage_idx, part * 32 * 8);
+                        WGMMA::wgmma(a, b, accum, true);
+                    }
+                    ptx::warpgroup_commit_batch();
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                        ptx::warpgroup_fence_operand(accum[i]);
+                    ptx::warpgroup_wait<0>();
+                    release_empty_stage(stage_idx);
+                    prev0 = a0; prev1 = a1;
+                }
+                const bool compensate = mxfp4_weight_scale <= kMaxSecondaryBeforeX64;
+                const float ws = compensate ? mxfp4_weight_scale * 64.0f : mxfp4_weight_scale;
+                const float am = compensate ? 1.0f : 64.0f;
+                const float s0 = (prev0 * am) * ws, s1 = (prev1 * am) * ws;
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                    accum[4 * i] *= s0; accum[4 * i + 1] *= s0;
+                    accum[4 * i + 2] *= s1; accum[4 * i + 3] *= s1;
+                }
+            };
+
             float final_accum[kAccumPerThread] = {};
 
             if constexpr (kReuseAccumAsFinal) {
                 if constexpr (kMXFP4SplitM) {
-                    mxfp4_splitm_mainloop(final_accum);
+                    if constexpr (kMXFP4Preexpanded)
+                        preexpanded_mainloop(final_accum);
+                    else
+                        mxfp4_splitm_mainloop(final_accum);
                 } else {
                 auto prescale_l1_final = [&](const float& scale_a_0, const float& scale_a_1,
                                              const float& gate_sf, const float& up_sf) {

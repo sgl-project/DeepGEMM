@@ -980,6 +980,9 @@ TORCH_LIBRARY(deep_gemm, m) {
           "int rank, int capacity, int experts, int topk, int[] recipe, str activation, float? clamp, "
           "bool fast_math, int ring, int bound, int lag, int l2_gran, bool split_k) -> ()");
 
+    m.def("build_mxfp4_mega_moe_expert_mask(Tensor ids, Tensor(a!) mask) -> ()");
+    m.def("expand_mxfp4_mega_moe_weight(Tensor packed, Tensor sf, Tensor(a!) output, Tensor? mask=None, int expert_offset=0) -> ()");
+
     // Mega mHC / Mega Gate
     m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, "
           "Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, "
@@ -997,6 +1000,8 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("slice_symm_buffer_for_sm90_fused_mega_moe", &dg_slice_sm90_fused_buffer);
     m.impl("sm90_fused_fp8_mega_moe", &dg_sm90_fused_fp8_mega_moe);
     m.impl("sm90_fused_fp8_mxfp4_mega_moe", &dg_sm90_fused_mxfp4_mega_moe);
+    m.impl("expand_mxfp4_mega_moe_weight", &sm90_fused_mega::expand_mxfp4_mega_moe_weight);
+    m.impl("build_mxfp4_mega_moe_expert_mask", &sm90_fused_mega::build_mxfp4_mega_moe_expert_mask);
     m.impl("is_localized", &dg_is_localized);
 
     m.impl("preprocess_sf", &dg_preprocess_sf);
