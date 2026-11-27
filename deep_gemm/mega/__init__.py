@@ -14,6 +14,8 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+from .sm90_fused import SM90FusedSymmBuffer, fp8_mxfp4_mega_moe
+from .mxfp4 import transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90
 
 
 def _check_legacy_fp4_acts_env() -> None:

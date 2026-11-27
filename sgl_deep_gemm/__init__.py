@@ -397,16 +397,25 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
-                                      activation: str = 'swiglu') -> SM90SymmBuffer:
+                                      activation: str = 'swiglu',
+                                      fused: bool = False,
+                                      num_experts_per_wave: Optional[int] = None,
+                                      l2_act_sf_gran_k: Optional[int] = None) -> Union[SM90SymmBuffer, SM90FusedSymmBuffer]:
     from .utils.math import align
-
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
+    if fused:
+        num_max_tokens_per_rank = align(
+            num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_fused_mega_moe())
+        return SM90FusedSymmBuffer(
+            group, num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, use_fp8_dispatch, activation,
+            num_experts_per_wave, l2_act_sf_gran_k)
+    if num_experts_per_wave is not None or l2_act_sf_gran_k is not None:
+        raise ValueError('Wave and L2 SF options require fused=True')
+    num_max_tokens_per_rank = align(
+        num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
     return SM90SymmBuffer(
-        group, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
-    )
+        group, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, use_fp8_dispatch, activation)
 
 
 def get_symm_buffer_for_mega_moe(group,
@@ -470,6 +479,15 @@ def fp8_mega_moe(y: torch.Tensor,
     """`num_tokens_bound`: upper bound on this call's per-rank token count on every rank (e.g. the maximum over a DP step);
     lets the launch pick its schedule by the call instead of by the buffer capacity. None = the buffer capacity, and a
     bound above it is rejected."""
+    if isinstance(sym_buffer, SM90FusedSymmBuffer):
+        _C.sm90_fused_fp8_mega_moe(
+            y, *l1_weights, *l2_weights, cumulative_local_expert_recv_stats,
+            sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank, sym_buffer.num_experts, sym_buffer.num_topk,
+            recipe, activation, activation_clamp, fast_math, sym_buffer.num_ring_tokens,
+            0 if num_tokens_bound is None else num_tokens_bound,
+            sym_buffer.l2_lag_encoded, sym_buffer.l2_act_sf_gran_k)
+        return
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_mega_moe(
@@ -503,6 +521,12 @@ def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
         num_tokens, group_size, float(routed_scaling_factor),
     )
+
+from .mega import (
+    SM90FusedSymmBuffer,
+    fp8_mxfp4_mega_moe,
+    transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90,
+)
 
 # Locality domain helpers
 from . import locality_domain
