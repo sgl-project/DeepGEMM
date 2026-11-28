@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cuda.h>
 #include <cute/numeric/math.hpp>
 
 #include <deep_gemm/common/math.cuh>
@@ -15,6 +16,13 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;
+
+// Routed L1/L2 activation maps with fewer rows than `LOAD_BLOCK_M`, indexed `[phase - 1][rows / kRowStep - 1]`
+struct MegaMoEPartialActMaps {
+    static constexpr uint32_t kRowStep = 8;
+    static constexpr uint32_t kNumMaps = (kMaxCandidateBlockM / 2 - 1) / kRowStep;
+    CUtensorMap maps[2][kNumMaps];
+};
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -69,13 +77,13 @@ struct alignas(128) MegaMoESignals {
     uint32_t shared_l1_task_count[kNumDeviceLocalityDomains];
     uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
 
-    // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
-    // rank are done. Dispatch clears readiness before its NVLink barrier because graph replays reuse grid IDs.
-    alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
-    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
-    // Broadcast output readiness: `output_ready_grid_idx[peer] == own grid index` means the peer's combined rows
-    // are written into this rank's gathered `y`. Cleared with `combine_ready_grid_idx`.
-    alignas(128) uint64_t output_ready_grid_idx[kNumMaxRanks];
+    // Combine readiness: each launch subtracts one per peer and the peer adds one back once its L2 writes into
+    // this rank are done, so a peer is ready at zero and graph replays need no reset
+    alignas(128) uint64_t combine_ready_count[kNumMaxRanks];
+    // Broadcast output readiness, counted the same way for the peer's rows in this rank's gathered `y`
+    alignas(128) uint64_t output_ready_count[kNumMaxRanks];
+    // Dispatch SM arrivals; the last SM publishes the expert counts and resets it
+    alignas(128) uint32_t dispatch_arrival_count;
 
     // Expert token counts
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
@@ -92,7 +100,7 @@ struct alignas(128) MegaMoESignals {
     // Shared-expert signals
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
 };
-DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
+DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_count) == 128, "Invalid control signal layout");
 
 struct Workspace {
     MegaMoESignals* signals;
@@ -176,18 +184,18 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_combine_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
-        return signals->combine_ready_grid_idx + peer_rank_idx;
+    uint64_t* get_combine_ready_count_ptr(const uint32_t& peer_rank_idx = 0) const {
+        return signals->combine_ready_count + peer_rank_idx;
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_output_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
-        return signals->output_ready_grid_idx + peer_rank_idx;
+    uint64_t* get_output_ready_count_ptr(const uint32_t& peer_rank_idx = 0) const {
+        return signals->output_ready_count + peer_rank_idx;
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_peer_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
-        return signals->peer_grid_idx + peer_rank_idx;
+    uint32_t* get_dispatch_arrival_count_ptr() const {
+        return &signals->dispatch_arrival_count;
     }
 
     CUTLASS_DEVICE

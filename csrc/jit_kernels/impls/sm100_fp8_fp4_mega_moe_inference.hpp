@@ -181,7 +181,9 @@ static void sm100_fp8_fp4_mega_moe(
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
     const float& situ_beta = 4.0f,
     const float& situ_linear_beta = 25.0f,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const void* rms_weights = nullptr,
+    const float& rms_eps = 0.0f
 ) {
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     const bool use_up_gate_block16 = weight_layout == MegaMoEWeightLayout::UpGateBlock16;
@@ -199,7 +201,7 @@ static void sm100_fp8_fp4_mega_moe(
         num_ring_tokens, num_sf_ring_tokens,
         mma_kind, global_num_tokens,
         l1_weights.scalar_type() == kPackedFP4,
-        gran_k);
+        gran_k, num_shared_experts > 0);
 
     if (use_shuffled_weights or use_interleaved_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
@@ -272,6 +274,16 @@ static void sm100_fp8_fp4_mega_moe(
                                                      block_k_inner, config.load_block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
+    auto partial_act_maps = layout::MegaMoEPartialActMaps();
+    constexpr auto kPartialRowStep = static_cast<int>(layout::MegaMoEPartialActMaps::kRowStep);
+    for (int rows = kPartialRowStep; rows < config.load_block_m; rows += kPartialRowStep) {
+        partial_act_maps.maps[0][rows / kPartialRowStep - 1] = make_tma_2d_desc(
+            l1_acts, to_inner(hidden), config.num_ring_tokens, block_k_inner, rows,
+            static_cast<int>(l1_acts.stride(-2)), config.swizzle_acts_mode);
+        partial_act_maps.maps[1][rows / kPartialRowStep - 1] = make_tma_2d_desc(
+            l2_acts, to_inner(intermediate_hidden), config.num_ring_tokens, block_k_inner, rows,
+            static_cast<int>(l2_acts.stride(-2)), config.swizzle_acts_mode);
+    }
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_sf_ring_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
@@ -374,7 +386,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -408,7 +420,10 @@ static void __instantiate_kernel() {{
     to_mainloop_name(config.mainloop),
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
-    broadcast_y ? "true" : "false"));
+    broadcast_y ? "true" : "false",
+    config.num_pull_tokens,
+    rms_weights != nullptr ? "true" : "false",
+    y.scalar_type() == torch::kFloat ? "true" : "false"));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {
@@ -441,7 +456,9 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_acts_sf,
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
-        sm_locality_domains.data_ptr<uint8_t>());
+        sm_locality_domains.data_ptr<uint8_t>(),
+        partial_act_maps,
+        rms_weights, rms_eps);
 }
 
 } // namespace deep_gemm

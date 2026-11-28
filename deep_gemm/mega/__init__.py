@@ -311,8 +311,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      post_expert_norm_weight: Optional[torch.Tensor] = None,
                      post_expert_norm_eps: float = 1e-6,
                      post_expert_norm_weight_first: bool = False,
-                     broadcast_y: bool = False):
+                     broadcast_y: bool = False,
+                     rms_weights: Optional[torch.Tensor] = None,
+                     rms_eps: Optional[float] = None):
     # `broadcast_y`: `y` is `sym_buffer.gathered_y[:num_ranks * num_tokens]`; every rank gets all ranks' rows, rank-major
+    # `y` is BF16 or FP32 (not with `broadcast_y`); `rms_weights` (`y.dtype`, with an explicit `rms_eps`) applies an
+    # RMSNorm to the combined output, computed in FP32 over the BF16-rounded output when `y` is BF16
     weight_layout = _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
     if broadcast_y:
         # NOTES: an empty `y` has a null `data_ptr()`, so compare storage and offset
@@ -363,7 +367,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight,
         post_expert_norm_eps, post_expert_norm_weight_first,
-        weight_layout, global_num_tokens, broadcast_y
+        weight_layout, global_num_tokens, broadcast_y,
+        rms_weights, rms_eps
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,

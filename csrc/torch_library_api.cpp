@@ -621,7 +621,8 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
                          bool post_expert_norm, const OptTensor& post_expert_norm_weight,
                          double post_expert_norm_eps, bool post_expert_norm_weight_first,
                          const std::string& weight_layout,
-                         std::optional<int64_t> global_num_tokens, bool broadcast_y) {
+                         std::optional<int64_t> global_num_tokens, bool broadcast_y,
+                         const OptTensor& rms_weights, std::optional<double> rms_eps) {
     DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l1_weights_sf.has_value());
     DG_HOST_ASSERT(shared_l2_weights.has_value() == shared_l2_weights_sf.has_value());
     const auto shared_l1 = shared_l1_weights.has_value()
@@ -637,7 +638,8 @@ void dg_fp8_fp4_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor
         mma_type, activation, to_optional_float(activation_clamp), fast_math, use_x_scales,
         l1_alphas, l2_alphas, l2_act_scales,
         post_expert_norm, post_expert_norm_weight, static_cast<float>(post_expert_norm_eps),
-        post_expert_norm_weight_first, weight_layout, global_num_tokens, broadcast_y);
+        post_expert_norm_weight_first, weight_layout, global_num_tokens, broadcast_y,
+        rms_weights, to_optional_float(rms_eps));
 }
 
 void dg_bf16_mega_moe(const Tensor& y, const Tensor& l1_weights, const Tensor& l2_weights,
@@ -883,7 +885,7 @@ TORCH_LIBRARY(deep_gemm, m) {
           "Tensor? l1_alphas, Tensor? l2_alphas, Tensor? l2_act_scales, "
           "bool post_expert_norm, Tensor? post_expert_norm_weight, float post_expert_norm_eps, "
           "bool post_expert_norm_weight_first, str weight_layout, "
-          "int? global_num_tokens, bool broadcast_y) -> ()");
+          "int? global_num_tokens, bool broadcast_y, Tensor? rms_weights, float? rms_eps) -> ()");
     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights, "
           "Tensor? shared_l2_weights, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, "
           "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, "

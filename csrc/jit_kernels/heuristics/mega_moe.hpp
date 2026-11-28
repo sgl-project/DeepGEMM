@@ -59,6 +59,7 @@ struct MegaMoEConfig {
 
     // Dispatch pull config
     int num_bytes_per_pull;
+    int num_pull_tokens;
 
     // MMA mainloop and dispatch pull (`get_mega_moe_arch_policy`)
     MegaMoEMainloop mainloop;
@@ -78,7 +79,7 @@ struct MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ", num_pull_tokens=" << config.num_pull_tokens
            << ", mainloop=" << to_mainloop_name(config.mainloop)
            << ", use_simt_pull=" << config.use_simt_pull << ")";
         return os;
@@ -321,7 +322,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const MmaKind& mma_kind,
-    const bool& use_packed_fp4_k64 = false, const bool& use_simt_pull = false) {
+    const bool& use_packed_fp4_k64 = false, const bool& use_simt_pull = false, const int& num_pull_tokens = 1) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -335,7 +336,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
     // NOTES: the SIMT pull goes through registers, and the kernel keeps 16 bytes per warp
     const int smem_send_buffers_size = align(use_simt_pull ? 16 * num_dispatch_warps :
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
+        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, num_pull_tokens).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = std::max(smem_expert_count_size, smem_send_buffers_size);
 
@@ -403,7 +404,8 @@ static MegaMoEConfig get_mega_moe_config(
     const MmaKind& mma_kind,
     const std::optional<int64_t>& global_num_tokens,
     const bool& fp4_weights = false,
-    const int& gran_k = 32) {
+    const int& gran_k = 32,
+    const bool& has_shared = false) {
 
     // Block config
     auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
@@ -440,6 +442,16 @@ static MegaMoEConfig get_mega_moe_config(
         store_block_m_l1, store_block_m_l2, has_tile_override,
         is_mma_with_sf(mma_kind) and num_token_bytes % 512 == 0);
 
+    // Whole tokens of one pull chunk batch into one TMA transaction (not the SIMT pull, nor the one-shot full-pool pull)
+    const bool is_full_pool_pull = not has_shared and num_token_bytes == num_bytes_per_pull and intermediate_hidden / block_k <= 32 and
+        num_ring_tokens >= layout::get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    int num_pull_tokens = 1;
+    if (mma_kind != MmaKind::BF16 and not policy.use_simt_pull and not is_full_pool_pull and num_token_bytes == num_bytes_per_pull) {
+        num_pull_tokens = num_token_bytes == 768 ? 5 : num_token_bytes == 1536 ? 3 : num_token_bytes == 2304 ? 2 :
+                          std::max(1, 4096 / num_token_bytes);
+        num_pull_tokens = std::clamp(deep_jit::get_env<int>("DG_MEGA_MOE_PULL_TOKENS", num_pull_tokens), 1, 32);
+    }
+
     // Pipeline
     auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         policy.smem_capacity,
@@ -448,7 +460,7 @@ static MegaMoEConfig get_mega_moe_config(
         policy.store_block_m_l1, policy.store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind, uses_packed_fp4_weights(policy.mainloop), policy.use_simt_pull);
+        mma_kind, uses_packed_fp4_weights(policy.mainloop), policy.use_simt_pull, num_pull_tokens);
 
     // Fall back to `Default` if the pipeline has too few stages for the selected mainloop (e.g. `DG_MEGA_MOE_TILES`
     // with large store tiles on SM103 K=96, which groups 3 stages at a time)
@@ -467,7 +479,7 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull,
+        num_bytes_per_pull, num_pull_tokens,
         policy.mainloop, policy.use_simt_pull
     };
 
