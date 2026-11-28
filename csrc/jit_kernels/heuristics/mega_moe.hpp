@@ -86,6 +86,20 @@ struct MegaMoEConfig {
 };
 
 // Architecture-specific MegaMoE policy (SM100 / SM103 / SM107)
+
+static int get_decode_block_m_for_mega_moe(const SM10xArch& arch, const MmaKind& mma_kind) {
+    if (mma_kind != MmaKind::NVFP4)
+        return 64;
+    switch (arch) {
+        case SM10xArch::SM103:
+        case SM10xArch::SM107:
+            return 128;
+        case SM10xArch::SM100:
+            return 64;
+    }
+    DG_HOST_UNREACHABLE("Unknown SM10x arch");
+}
+
 // What the arch picks once the tile is known: the MMA mainloop, its store tiles, the dispatch pull, and the SMEM budget that
 // pull allows. `can_simt_pull` says whether the token layout supports the SIMT pull; `DG_MEGA_MOE_SIMT_PULL=0/1` overrides the
 // arch default, and `DG_MEGA_MOE_SM107_K64=0`, `DG_MEGA_MOE_SM107_K128=0` and `DG_MEGA_MOE_SM103_K96=0` disable the arch mainloops.
@@ -130,7 +144,7 @@ static MegaMoEArchPolicy get_mega_moe_arch_policy(
             const bool small_stores = use_k96 and block_m == 192 and not has_tile_override;
             return {use_k96 ? MegaMoEMainloop::SM103UltraK96 : MegaMoEMainloop::Default,
                     small_stores ? 32 : store_block_m_l1, small_stores ? 8 : store_block_m_l2,
-                    simt_pull(false), SM100ArchSpec::smem_capacity};
+                    simt_pull(mma_kind == MmaKind::NVFP4 and block_m <= 128), SM100ArchSpec::smem_capacity};
         }
         case SM10xArch::SM100:
             return {MegaMoEMainloop::Default, store_block_m_l1, store_block_m_l2, simt_pull(false), SM100ArchSpec::smem_capacity};
@@ -260,14 +274,16 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows
     // (NVFP4 caps them at 192 rows). A single 240-row block per expert only pays off with many local experts
     // (about 14 or more blocks per rank).
-    // Decode-sized loads use 64 rows: real routing concentrates on a few hot experts, which smaller tiles split
-    // into several M blocks. At most 2 expected tokens keep 16, where 64 rows lose under any routing.
-    int block_m = num_expected_tokens <= 2 ? 16 : 64;
+    // Decode-sized loads use 128 rows for NVFP4 on SM103/SM107 and 64 otherwise; at most 2 expected tokens use 16.
+    const int decode_block_m = get_decode_block_m_for_mega_moe(get_sm10x_arch(), mma_kind);
+    int block_m = num_expected_tokens <= 2 ? 16 : decode_block_m;
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
             num_blocks = 2;
         for (const int& candidate: {64, 128, 192, 240}) {
+            if (candidate < decode_block_m)
+                continue;
             block_m = candidate;
             if (num_blocks * candidate >= num_covered_tokens)
                 break;
