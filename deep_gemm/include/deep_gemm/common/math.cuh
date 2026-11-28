@@ -198,6 +198,7 @@ CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
 // Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`: 0-ULP bit-identical
 // to `__frcp_rn` across all finite non-negative E4M3 values, without a shared-memory LUT.
 CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv, uint2& sf_bits) {
@@ -236,6 +237,7 @@ CUTLASS_DEVICE void get_nvfp4_sf_inv_from_lut(const float2& amax, const float* l
     sf_bits = {qx.__x, qy.__x};
     sf_inv = {lut[qx.__x], lut[qy.__x]};
 }
+#endif
 
 CUTLASS_DEVICE uint32_t cast_into_e2m1x2_pairs(const float2& lower, const float2& upper) {
     uint32_t packed;

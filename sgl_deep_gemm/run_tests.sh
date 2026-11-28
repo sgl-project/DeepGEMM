@@ -169,6 +169,7 @@ DEFAULT_SINGLE_GPU_TESTS=(
   test_attention.py
   test_attention_legacy.py
   test_legacy.py
+  test_sm90_mxfp4_weights.py
 )
 SM120_SINGLE_GPU_TESTS=(
   test_bf16.py
@@ -319,6 +320,11 @@ else
   done
   run_test test_mega_moe_hopper.py --num-processes "${NPROC}" \
     --accuracy --layers 1 2 3 4 5 --num-correctness-tests 32
+  run_test test_sm90_fused_fp8.py --np "${NPROC}" --fused
+  run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --graph --bound
+  run_test test_sm90_mxfp4_expand.py
+  run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --m 1024 --fm 1 --graph --bound --reuse full
+  run_test test_sm90_fused_mxfp4.py --np "${NPROC}" --m 1024 --fm 1 --graph --bound --reuse mask --route concentrated
 fi
 
 if [ -f "${TESTS_DIR}/test_sanitizer.py" ]; then

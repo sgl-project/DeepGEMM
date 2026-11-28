@@ -31,4 +31,6 @@ To release a new set of wheels, please contact SGLang team and run the [release 
 
 For each major version release (0.X.Y -> 0.(X+1).0), a new branch should be created (release/v0.(X+1).0) for stability purpose.
 
+SM90 fused MXFP4 MegaMoE is opt-in through `get_symm_buffer_for_sm90_mega_moe(..., fused=True)` and `fp8_mxfp4_mega_moe`. The default FP8 entry point and buffer remain unchanged. See [the SM90 MXFP4 guide](../docs/sm90-fused-mxfp4.md) for weight layouts, numerical checks, and reproduction commands.
+
 For any incoming pull requests, it should be rebased upon `dev` branch. Any newly added or modified tests should be put under `sgl_deep_gemm/tests`

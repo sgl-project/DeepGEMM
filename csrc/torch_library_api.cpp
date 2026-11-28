@@ -25,6 +25,7 @@
 #include "apis/mega_gate.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/sm90_mega.hpp"
+#include "apis/sm90_fused_mega.hpp"
 
 using namespace deep_gemm;
 using torch::Tensor;
@@ -744,6 +745,71 @@ std::tuple<Tensor, Tensor> dg_bf16_mega_gate(const Tensor& x, const Tensor& weig
 #define DG_CUBLASLT_GEMM_SCHEMA "(Tensor a, Tensor b, Tensor(a!) d, Tensor? c) -> ()"
 #define DG_K_GROUPED_FP8_GEMM_SCHEMA "(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, int[]? ks, Tensor grouped_layout, Tensor? c, int[] recipe, str compiled_dims, bool use_psum_layout, bool use_padded_sf_layout, int epilogue_kind, float? epilogue_scalar, Tensor(z!)? epilogue_sfd, Tensor(y!)? epilogue_count) -> ()"
 #define DG_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts=0, int[]? recipe=None, int[]? recipe_a=None, int[]? recipe_b=None"
+
+// PR473's pybind slicer closure is represented by separate sizing and aliasing
+// slice ops, as for the fork's existing symmetric-buffer APIs.
+auto fused_sm90_buffer_layout(int64_t ranks, int64_t experts, int64_t capacity,
+                             int64_t topk, int64_t hidden, int64_t intermediate,
+                             bool fp8_dispatch, const std::string& activation,
+                             int64_t wave, int64_t l2_gran) {
+    return sm90_fused_mega::get_symm_buffer_size_for_sm90_fused_mega_moe(
+        static_cast<int>(ranks), static_cast<int>(experts), static_cast<int>(capacity),
+        static_cast<int>(topk), static_cast<int>(hidden), static_cast<int>(intermediate),
+        fp8_dispatch, activation, static_cast<int>(wave), static_cast<int>(l2_gran));
+}
+
+std::tuple<int64_t, int64_t, int64_t> dg_get_sm90_fused_buffer_size(
+    int64_t ranks, int64_t experts, int64_t capacity, int64_t topk,
+    int64_t hidden, int64_t intermediate, bool fp8_dispatch,
+    const std::string& activation, int64_t wave, int64_t l2_gran) {
+    const auto [bytes, slice, ring, lag] = fused_sm90_buffer_layout(
+        ranks, experts, capacity, topk, hidden, intermediate, fp8_dispatch,
+        activation, wave, l2_gran);
+    return {bytes, ring, lag};
+}
+
+std::vector<Tensor> dg_slice_sm90_fused_buffer(
+    const Tensor& buffer, int64_t ranks, int64_t experts, int64_t capacity,
+    int64_t topk, int64_t hidden, int64_t intermediate, bool fp8_dispatch,
+    const std::string& activation, int64_t ring, int64_t l2_gran) {
+    const auto [bytes, slice] = sm90_fused_mega::get_symm_buffer_layout_for_sm90_fused_mega_moe(
+        static_cast<int>(ranks), static_cast<int>(experts), static_cast<int>(capacity),
+        static_cast<int>(topk), static_cast<int>(hidden), static_cast<int>(intermediate),
+        fp8_dispatch, activation, static_cast<int>(ring), static_cast<int>(l2_gran));
+    DG_HOST_ASSERT(buffer.nbytes() >= static_cast<size_t>(bytes));
+    return std::apply([](const auto&... t) { return std::vector<Tensor>{t...}; }, slice(buffer));
+}
+
+void dg_sm90_fused_fp8_mega_moe(
+    const Tensor& y, const Tensor& l1, const Tensor& l1_sf,
+    const Tensor& l2, const Tensor& l2_sf, const OptTensor& stats,
+    const Tensor& buffer, at::IntArrayRef pointers, int64_t rank,
+    int64_t capacity, int64_t experts, int64_t topk, at::IntArrayRef recipe,
+    const std::string& activation, std::optional<double> clamp, bool fast_math,
+    int64_t ring, int64_t bound, int64_t lag, int64_t l2_gran) {
+    sm90_fused_mega::sm90_fused_fp8_mega_moe(
+        y, std::make_tuple(l1, l1_sf), std::make_tuple(l2, l2_sf), stats,
+        buffer, pointers.vec(), static_cast<int>(rank), static_cast<int>(capacity),
+        static_cast<int>(experts), static_cast<int>(topk), to_tuple3(recipe),
+        activation, to_optional_float(clamp), fast_math, static_cast<int>(ring),
+        static_cast<int>(bound), static_cast<int>(lag), static_cast<int>(l2_gran));
+}
+
+void dg_sm90_fused_mxfp4_mega_moe(
+    const Tensor& y, const Tensor& l1, const Tensor& l1_sf, const Tensor& l1_secondary,
+    const Tensor& l2, const Tensor& l2_sf, const Tensor& l2_secondary,
+    const OptTensor& stats, const Tensor& buffer, at::IntArrayRef pointers,
+    int64_t rank, int64_t capacity, int64_t experts, int64_t topk,
+    at::IntArrayRef recipe, const std::string& activation, std::optional<double> clamp,
+    bool fast_math, int64_t ring, int64_t bound, int64_t lag, int64_t l2_gran, bool split_k) {
+    sm90_fused_mega::sm90_fused_fp8_mxfp4_mega_moe(
+        y, std::make_tuple(l1, l1_sf, l1_secondary), std::make_tuple(l2, l2_sf, l2_secondary),
+        stats, buffer, pointers.vec(), static_cast<int>(rank), static_cast<int>(capacity),
+        static_cast<int>(experts), static_cast<int>(topk), to_tuple3(recipe),
+        activation, to_optional_float(clamp), fast_math, static_cast<int>(ring),
+        static_cast<int>(bound), static_cast<int>(lag), static_cast<int>(l2_gran), split_k);
+}
+
 #define DG_SM90_SYMM_BUFFER_ARGS "int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, bool use_fp8_dispatch, str activation"
 
 TORCH_LIBRARY(deep_gemm, m) {
@@ -898,6 +964,25 @@ TORCH_LIBRARY(deep_gemm, m) {
           "Tensor(b!) buf_x_sf, Tensor(c!) buf_topk_idx, Tensor(d!) buf_topk_weights, int num_tokens, int group_size, "
           "float routed_scaling_factor) -> ()");
 
+
+    m.def("get_token_alignment_for_sm90_fused_mega_moe() -> int", []() -> int64_t {
+        return sm90_fused_mega::get_token_alignment_for_sm90_fused_mega_moe();
+    });
+    m.def("get_symm_buffer_size_for_sm90_fused_mega_moe(" DG_SM90_SYMM_BUFFER_ARGS
+          ", int wave, int l2_gran) -> (int, int, int)", &dg_get_sm90_fused_buffer_size);
+    m.def("slice_symm_buffer_for_sm90_fused_mega_moe(Tensor(a) buffer, " DG_SM90_SYMM_BUFFER_ARGS
+          ", int ring, int l2_gran) -> Tensor(a)[]");
+    m.def("sm90_fused_fp8_mega_moe(Tensor(a!) y, Tensor l1, Tensor l1_sf, Tensor l2, Tensor l2_sf, "
+          "Tensor(b!)? stats, Tensor(c!) buffer, int[] pointers, int rank, int capacity, int experts, int topk, "
+          "int[] recipe, str activation, float? clamp, bool fast_math, int ring, int bound, int lag, int l2_gran) -> ()");
+    m.def("sm90_fused_fp8_mxfp4_mega_moe(Tensor(a!) y, Tensor l1, Tensor l1_sf, Tensor l1_secondary, "
+          "Tensor l2, Tensor l2_sf, Tensor l2_secondary, Tensor(b!)? stats, Tensor(c!) buffer, int[] pointers, "
+          "int rank, int capacity, int experts, int topk, int[] recipe, str activation, float? clamp, "
+          "bool fast_math, int ring, int bound, int lag, int l2_gran, bool split_k) -> ()");
+
+    m.def("build_mxfp4_mega_moe_expert_mask(Tensor ids, Tensor(a!) mask) -> ()");
+    m.def("expand_mxfp4_mega_moe_weight(Tensor packed, Tensor sf, Tensor(a!) output, Tensor? mask=None, int expert_offset=0) -> ()");
+
     // Mega mHC / Mega Gate
     m.def("mega_mhc(Tensor x, Tensor residual, Tensor? shifted_prev_mix, Tensor post_mix, Tensor comb_res_mix, "
           "Tensor fn, Tensor mix_scales, Tensor mix_bases, int hc_mult, float hc_norm_eps, float hc_pre_eps, "
@@ -912,6 +997,11 @@ TORCH_LIBRARY(deep_gemm, m) {
 }
 
 TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    m.impl("slice_symm_buffer_for_sm90_fused_mega_moe", &dg_slice_sm90_fused_buffer);
+    m.impl("sm90_fused_fp8_mega_moe", &dg_sm90_fused_fp8_mega_moe);
+    m.impl("sm90_fused_fp8_mxfp4_mega_moe", &dg_sm90_fused_mxfp4_mega_moe);
+    m.impl("expand_mxfp4_mega_moe_weight", &sm90_fused_mega::expand_mxfp4_mega_moe_weight);
+    m.impl("build_mxfp4_mega_moe_expert_mask", &sm90_fused_mega::build_mxfp4_mega_moe_expert_mask);
     m.impl("is_localized", &dg_is_localized);
 
     m.impl("preprocess_sf", &dg_preprocess_sf);
