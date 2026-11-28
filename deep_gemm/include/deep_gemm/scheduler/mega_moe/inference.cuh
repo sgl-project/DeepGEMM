@@ -324,18 +324,6 @@ struct MegaMoEScheduler {
         return ptx::exchange(valid_value, slot_idx % 32);
     }
 
-    // An expert's tokens spread evenly over its M blocks, in 16-row steps
-    static CUTLASS_DEVICE uint32_t get_balanced_block_m(const uint32_t& num_tokens) {
-        if constexpr (BLOCK_M < 32)
-            return BLOCK_M;
-        const uint32_t num_m_blocks = cute::max(math::ceil_div(num_tokens, BLOCK_M), 1u);
-        return cute::max(math::align(math::ceil_div(num_tokens, num_m_blocks), 16u), 16u);
-    }
-
-    CUTLASS_DEVICE uint32_t get_expert_block_m(const uint32_t& slot_idx) const {
-        return get_balanced_block_m(get_num_tokens(slot_idx));
-    }
-
     // Get pool block offset for a given slot index from the per-lane token count array.
     CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& slot_idx) const {
         uint32_t num_blocks = 0;
@@ -503,8 +491,7 @@ struct MegaMoEScheduler {
                     owner_pool_block_idx = lane_pool_block_offset + owner_m_block_idx;
                     owner_chunk_end = lane_pool_block_offset + chunk_m_start + chunk_m_size;
                 }
-                const uint32_t block_m = get_balanced_block_m(num_tokens);
-                const uint32_t owner_valid_m = is_owner ? cute::min(num_tokens - owner_m_block_idx * block_m, block_m) : 0u;
+                const uint32_t owner_valid_m = is_owner ? cute::min(num_tokens - owner_m_block_idx * BLOCK_M, BLOCK_M) : 0u;
                 const uint32_t phys_expert = kEnableLPTSwizzle ? stored_expert_id[i] : slot_idx;
                 result.local_expert_idx = ptx::exchange(phys_expert, owner_lane_idx);
                 result.m_block_idx = static_cast<uint16_t>(ptx::exchange(owner_m_block_idx, owner_lane_idx));

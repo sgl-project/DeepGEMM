@@ -899,7 +899,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         int current_expert_idx = -1;
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
-        uint32_t expert_pool_block_offset = 0, expert_block_m = BLOCK_M;
+        uint32_t expert_pool_block_offset = 0;
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
@@ -918,7 +918,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Move start and end to the next expert
                 expert_start_idx = expert_end_idx;
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
-                expert_block_m = scheduler.get_expert_block_m(current_expert_idx);
             }
 
             // Finish all tokens
@@ -1008,11 +1007,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Hidden bytes are divided into chunks
             constexpr uint32_t kNumChunks = kNumHiddenTokenBytes / kNumBytesPerPull;
             DG_STATIC_ASSERT(kNumChunks * kNumBytesPerPull == kNumHiddenTokenBytes, "kNumBytesPerPull must divide the token bytes");
-            const uint32_t token_idx_in_block = token_idx_in_expert % expert_block_m;
-            const uint32_t pool_token_idx = (expert_pool_block_offset + token_idx_in_expert / expert_block_m) * BLOCK_M + token_idx_in_block;
+            const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+            const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
             // A block's last token also accounts for its padding rows
-            const uint32_t num_l1_full_arrivals = (token_idx_in_block + 1 == expert_block_m or token_idx + 1 == expert_end_idx) ?
+            const uint32_t num_l1_full_arrivals = token_idx + 1 == expert_end_idx ?
                 BLOCK_M - token_idx_in_block : 1u;
 
             if constexpr (kBatchedPull) {
