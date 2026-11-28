@@ -508,6 +508,15 @@ from . import testing
 from . import utils
 from .utils import *
 
+# Upstream `*_inference` names
+SymmetricBuffer = SymmBuffer
+MegaMoEInferenceSymmetricBuffer = SymmBuffer
+get_symm_buffer_for_mega_moe_inference = get_symm_buffer_for_mega_moe
+transform_weights_for_mega_moe_inference = transform_weights_for_mega_moe
+fp8_fp4_mega_moe_inference = fp8_fp4_mega_moe
+bf16_mega_moe_inference = bf16_mega_moe
+get_block_m_for_mega_moe_inference = get_block_m_for_mega_moe
+
 # Legacy Triton kernels remain available from the source package.
 try:
     from . import legacy
@@ -520,4 +529,4 @@ _C.init(os.path.dirname(os.path.abspath(__file__)), os.environ.get('CUDA_HOME', 
 # Release handles and workspaces while Python, PyTorch and CUDA are still available.
 atexit.register(shutdown)
 
-__version__ = '2.8.2'
+__version__ = '2.9.4'

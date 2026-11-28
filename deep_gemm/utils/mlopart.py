@@ -97,7 +97,8 @@ def serve(sock: socket.socket) -> None:
     num_devices = ctypes.c_int()
     check(cuda.cuDeviceGetCount(ctypes.byref(num_devices)))
     if num_devices.value != NUM_LOCALITY_DOMAINS:
-        sys.exit(f'{num_devices.value} MLOPart devices')
+        warnings.warn(f'{num_devices.value} MLOPart devices; expected {NUM_LOCALITY_DOMAINS}')
+        return
     sock.sendall(READY)
 
     while request := sock.recv(REQUEST.size, socket.MSG_WAITALL):

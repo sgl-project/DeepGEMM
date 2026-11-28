@@ -16,7 +16,7 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/scheduler/sm90_mega_moe.cuh>
@@ -108,7 +108,7 @@ template <
     // 2-CTA cluster with TMA multicast on A, or on B (the weights) with kMulticastOnB (host: always B at cluster size 2)
     uint32_t kClusterSize = 1,
     bool kMulticastOnB = false,
-    // L2-lag interleaved schedule (scheduler/mega_moe.cuh); 0 = wave schedule
+    // L2-lag interleaved schedule (scheduler/mega_moe/inference.cuh); 0 = wave schedule
     uint32_t kL2LagUnits = 0,
     // L2 BF16 staging passes per tile (0 = 2 with kHalfL2CD, else 1); 4 = quarter-width buffer
     uint32_t kL2CDPasses = 0,

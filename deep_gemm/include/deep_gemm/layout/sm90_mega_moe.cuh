@@ -2,7 +2,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 
 namespace deep_gemm::layout {
 
