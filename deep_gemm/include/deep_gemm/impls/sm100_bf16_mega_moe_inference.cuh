@@ -318,8 +318,7 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
 
     // NVLink barrier tags
-    constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
-    constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
+    constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 1;
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
@@ -378,56 +377,44 @@ sm100_bf16_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Write source indices (~2 us with 512 tokens)
+        // The last SM to arrive publishes every expert's count to its owner rank; no SM waits for the others
+        if (warp_idx == 0) {
+            const auto arrival_ptr = workspace.get_dispatch_arrival_count_ptr();
+            bool is_last_sm = false;
+            if (lane_idx == 0) {
+                __threadfence();
+                is_last_sm = ptx::atomic_add(arrival_ptr, 1u) == kNumSMs - 1;
+                if (is_last_sm) {
+                    *arrival_ptr = 0;
+                    __threadfence();
+                }
+            }
+            __syncwarp();
+            if (__shfl_sync(0xffffffff, is_last_sm, 0)) {
+                for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
+                    ptx::st_relaxed_sys(sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, i % kNumExpertsPerRank), i / kNumExpertsPerRank),
+                        *workspace.get_expert_send_count_ptr(i) & 0xffffffff);
+                }
+                // Every per-rank count lands before its sum, which the receiver acquires
+                __threadfence_system();
+                for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
+                    ptx::red_add_relaxed_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(i % kNumExpertsPerRank), i / kNumExpertsPerRank),
+                        *workspace.get_expert_send_count_ptr(i));
+                }
+            }
+            __syncwarp();
+        }
+
+        // Write source indices (~2 us with 512 tokens); a slot holds `token_topk_idx + 1`, so zero means not yet written
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            ptx::st_relaxed_sys(sym_buffer.map(dst_ptr, dst_rank_idx), token_topk_idx + 1);
         });
-
-        // Grid sync
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
-
-        // Write expert count
-        if (sm_idx == 0) {
-            // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
-            DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks) {
-                // Graph replays reuse grid IDs. Clear local readiness before the
-                // dispatch NVLink barrier permits this launch's peer notifications.
-                *workspace.get_combine_ready_grid_idx_ptr(thread_idx) = 0;
-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
-            }
-            __syncwarp();
-
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
-            }
-        }
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-        // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -529,9 +516,11 @@ sm100_bf16_mega_moe_impl(void* y,
                     remaining[i] -= cute::min(remaining[i], length);
             }
 
-            // Read source token-topk index (written by remote dispatch via NVLink)
-            const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
-                current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+            // Read source token-topk index (written by remote dispatch via NVLink, possibly after the counts)
+            uint32_t src_token_topk_slot;
+            while ((src_token_topk_slot = ptx::ld_volatile(workspace.get_src_token_topk_idx_ptr(
+                current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank))) == 0);
+            const uint32_t src_token_topk_idx = src_token_topk_slot - 1;
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -648,10 +637,17 @@ sm100_bf16_mega_moe_impl(void* y,
                     __syncwarp();
                 }
 
-                // Clean per-rank token count
-                for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
-                __syncwarp();
+                // Clean the used source slots, then the per-rank token count
+                for (uint32_t j = warp_idx; j < kNumRanks; j += kNumDispatchWarps) {
+                    const auto count_ptr = workspace.get_expert_recv_count_ptr(j, i);
+                    const auto num_source_tokens = static_cast<uint32_t>(*count_ptr);
+                    for (uint32_t k = lane_idx; k < num_source_tokens; k += 32)
+                        *workspace.get_src_token_topk_idx_ptr(i, j, k) = 0;
+                    __syncwarp();
+                    if (lane_idx == 0)
+                        *count_ptr = 0;
+                    __syncwarp();
+                }
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
@@ -930,6 +926,10 @@ sm100_bf16_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+
+        // Subtract one per peer; the peer's completion adds it back
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+            ptx::red_add_rel_sys(workspace.get_combine_ready_count_ptr(epilogue_thread_idx), uint64_t(-1));
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1278,11 +1278,7 @@ sm100_bf16_mega_moe_impl(void* y,
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
 
-        // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
-        uint64_t peer_grid_idx = 0;
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1292,13 +1288,12 @@ sm100_bf16_mega_moe_impl(void* y,
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+            ptx::red_add_rel_sys(sym_buffer.map(workspace.get_combine_ready_count_ptr(sym_buffer.rank_idx), epilogue_thread_idx), uint64_t(1));
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-        const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1311,9 +1306,9 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Wait for the ranks of the selected experts to finish their L2 writes
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
-            const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+            const auto peer_ready_ptr = workspace.get_combine_ready_count_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == 0); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
             asm volatile("fence.proxy.async.global;" ::: "memory");
 
