@@ -740,10 +740,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
             if (__shfl_sync(0xffffffff, is_last_sm, 0)) {
+                // Load every count before the first remote write, which would otherwise serialize each load behind it
+                constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExperts, 32u);
+                uint32_t send_counts[kNumExpertsPerLane];
+                #pragma unroll
+                for (uint32_t k = 0; k < kNumExpertsPerLane; ++ k) {
+                    const uint32_t i = k * 32 + lane_idx;
+                    send_counts[k] = i < kNumExperts ? static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i)) : 0;
+                }
                 const auto for_each_expert = [&](const auto& process) {
-                    for (uint32_t i = lane_idx; i < kNumExperts; i += 32)
-                        process(i, i / kNumExpertsPerRank, i % kNumExpertsPerRank,
-                                static_cast<uint32_t>(*workspace.get_expert_send_count_ptr(i)));
+                    #pragma unroll
+                    for (uint32_t k = 0; k < kNumExpertsPerLane; ++ k) {
+                        const uint32_t i = k * 32 + lane_idx;
+                        if (i < kNumExperts)
+                            process(i, i / kNumExpertsPerRank, i % kNumExpertsPerRank, send_counts[k]);
+                    }
                 };
                 // A per-rank count carries its own arrival word, so it needs no ordering against the sum
                 // The post-expert norm zeroes its sums before this push; peers add into them once they see it

@@ -388,16 +388,32 @@ sm100_bf16_mega_moe_impl(void* y,
             }
             __syncwarp();
             if (__shfl_sync(0xffffffff, is_last_sm, 0)) {
-                // A per-rank count carries its own arrival word, so it needs no ordering against the sum
-                for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
-                    ptx::st_relaxed_sys(sym_buffer.map(
-                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, i % kNumExpertsPerRank), i / kNumExpertsPerRank),
-                        (1ull << 32) | (*workspace.get_expert_send_count_ptr(i) & 0xffffffff));
+                // Load every count before the first remote write, which would otherwise serialize each load behind it
+                constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExperts, 32u);
+                uint64_t send_counts[kNumExpertsPerLane];
+                #pragma unroll
+                for (uint32_t k = 0; k < kNumExpertsPerLane; ++ k) {
+                    const uint32_t i = k * 32 + lane_idx;
+                    send_counts[k] = i < kNumExperts ? *workspace.get_expert_send_count_ptr(i) : 0;
                 }
-                for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
-                    ptx::red_add_relaxed_sys(
-                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(i % kNumExpertsPerRank), i / kNumExpertsPerRank),
-                        *workspace.get_expert_send_count_ptr(i));
+                // A per-rank count carries its own arrival word, so it needs no ordering against the sum
+                #pragma unroll
+                for (uint32_t k = 0; k < kNumExpertsPerLane; ++ k) {
+                    const uint32_t i = k * 32 + lane_idx;
+                    if (i < kNumExperts) {
+                        ptx::st_relaxed_sys(sym_buffer.map(
+                            workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, i % kNumExpertsPerRank), i / kNumExpertsPerRank),
+                            (1ull << 32) | (send_counts[k] & 0xffffffff));
+                    }
+                }
+                #pragma unroll
+                for (uint32_t k = 0; k < kNumExpertsPerLane; ++ k) {
+                    const uint32_t i = k * 32 + lane_idx;
+                    if (i < kNumExperts) {
+                        ptx::red_add_relaxed_sys(
+                            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(i % kNumExpertsPerRank), i / kNumExpertsPerRank),
+                            send_counts[k]);
+                    }
                 }
             }
             __syncwarp();
