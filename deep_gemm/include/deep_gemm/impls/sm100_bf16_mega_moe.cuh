@@ -201,8 +201,10 @@ sm100_bf16_mega_moe_impl(void* y,
 
     // Assign shared memory
     struct SharedStorage {
-        alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+        union alignas(kSharedMemoryAlignment) {
+            uint32_t expert_token_count[kNumExperts];
+            uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+        };
         union {
             alignas(kSharedMemoryAlignment) d_dtype_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) d_dtype_t l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
