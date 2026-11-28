@@ -207,6 +207,7 @@ template <
     bool kUseSimtPull = false,
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kBroadcastY = false,
+    uint32_t kNumPullTokens = 1,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -341,6 +342,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kUseFullPoolFP8FP4Path =
         not kHasShared and kRingCoversFullPool and kNumHiddenTokenBytes == kNumBytesPerPull and
         (L2_SHAPE_K / BLOCK_K) <= 32;
+    // The TMA pull batches whole tokens, one per lane, into a single transaction
+    constexpr bool kBatchedPull = kNumPullTokens > 1 and not kUseSimtPull and not kUseFullPoolFP8FP4Path;
+    DG_STATIC_ASSERT(kNumPullTokens <= 32 and (not kBatchedPull or kNumHiddenTokenBytes == kNumBytesPerPull),
+                     "A pull batch holds whole tokens");
     const auto get_ring_block_idx = [](const uint32_t& pool_block_idx) {
         if constexpr (kRingCoversFullPool)
             return pool_block_idx;
@@ -481,7 +486,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         union alignas(kSharedMemoryAlignment) {
             uint32_t expert_token_count[kNumExperts];
             // NOTES: the SIMT pull goes through registers, so it needs no send buffer
-            uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull];
+            uint8_t dispatch_send_buffer[kNumDispatchWarps][kUseSimtPull ? 16 : kNumBytesPerPull * kNumPullTokens];
         };
         union {
             alignas(kSharedMemoryAlignment) uint8_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M_L1 * L1_OUT_BLOCK_N_BYTES];
@@ -514,7 +519,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Send buffers
     constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
     const auto smem_send_buffers = layout::Buffer(
-        pull_layout, kNumDispatchWarps, 1,
+        pull_layout, kNumDispatchWarps, kUseSimtPull ? 1 : kNumPullTokens,
         static_cast<void*>(shared_storage.dispatch_send_buffer));
 
     // Tensor memory plan of the host-selected mainloop:
@@ -769,6 +774,108 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
 
+        // Batched pull: lane `t` holds token `t` of the batch until the batch is full or the pull ends
+        uint32_t num_pending_pulls = 0;
+        uint32_t stored_rank_idx = 0, stored_src_token_topk_idx = 0, stored_pool_token_idx = 0, stored_num_l1_full_arrivals = 0;
+        const auto flush_batched_pulls = [&]() {
+            const uint32_t num_pulls = num_pending_pulls;
+            const bool is_active = lane_idx < num_pulls;
+            const uint32_t src_token_idx = stored_src_token_topk_idx / kNumTopk;
+            const auto src_base_ptr = sym_buffer.map(
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), stored_rank_idx);
+            #pragma unroll
+            for (uint32_t t = 0; t < kNumPullTokens; ++ t) {
+                const auto src_ptr = ptx::exchange(src_base_ptr, t);
+                if (t < num_pulls and cute::elect_one_sync()) {
+                    ptx::tma_load_1d(smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(t).get_base_ptr(),
+                                     src_ptr, pull_mbarrier, kNumBytesPerPull);
+                }
+                __syncwarp();
+            }
+            if (cute::elect_one_sync())
+                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, num_pulls * kNumBytesPerPull);
+            __syncwarp();
+
+            // A token's ring slot must be free before its SF, metadata and data land
+            if constexpr (not kRingCoversFullPool) {
+                const uint32_t pool_block_idx = stored_pool_token_idx / BLOCK_M;
+                const auto l1_empty_count_target = get_ring_wave_idx(pool_block_idx) * (L1_SHAPE_N / BLOCK_N);
+                if (is_active and l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(get_ring_block_idx(pool_block_idx));
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
+                __syncwarp();
+            }
+
+            // Issue every remote load (weight, x_scale, SF) before any local store
+            const float weight = is_active ? *sym_buffer.map(
+                buffer.input_topk_weights_buffer.get_base_ptr<float>() + stored_src_token_topk_idx, stored_rank_idx) : 0.0f;
+            float x_scale = 0.0f;
+            if constexpr (kUseXScales) {
+                if (is_active)
+                    x_scale = *sym_buffer.map(buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx, stored_rank_idx);
+            }
+            constexpr uint32_t kNumSFUint32 = kHidden / kSFChunkK;
+            constexpr uint32_t kNumSFIters = math::constexpr_ceil_div(kNumPullTokens * kNumSFUint32, 32u);
+            uint32_t pulled_sf[kNumSFIters];
+            uint64_t sf_dst_idx[kNumSFIters];
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumSFIters; ++ i) {
+                const uint32_t sf_idx = i * 32 + lane_idx;
+                const uint32_t t = cute::min(sf_idx / kNumSFUint32, kNumPullTokens - 1);
+                const uint32_t sf_col_idx = sf_idx % kNumSFUint32;
+                const uint32_t rank_idx = ptx::exchange(stored_rank_idx, t);
+                const uint32_t token_idx = ptx::exchange(src_token_idx, t);
+                const uint32_t pool_token_idx = ptx::exchange(stored_pool_token_idx, t);
+                pulled_sf[i] = 0, sf_dst_idx[i] = ~0ull;
+                if (sf_idx < num_pulls * kNumSFUint32) {
+                    pulled_sf[i] = sym_buffer.map(
+                        buffer.input_sf_buffer.get_data_buffer(token_idx).get_base_ptr<uint32_t>(), rank_idx)[sf_col_idx];
+                    sf_dst_idx[i] = static_cast<uint64_t>(sf_col_idx) * kNumSFRingTokens + get_ring_block_idx(pool_token_idx / BLOCK_M) * SF_BLOCK_M +
+                        transform_sf_token_idx(pool_token_idx % BLOCK_M);
+                }
+            }
+            const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumSFIters; ++ i) {
+                if (sf_dst_idx[i] != ~0ull)
+                    __stcg(local_sf_ptr + sf_dst_idx[i], pulled_sf[i]);
+            }
+            if (is_active) {
+                const uint32_t ring_token_idx = get_ring_token_idx(stored_pool_token_idx);
+                *buffer.l1_topk_weights_buffer.get_data_buffer(ring_token_idx).template get_base_ptr<float>() = weight;
+                if constexpr (kUseXScales)
+                    *buffer.l1_x_scales_buffer.get_data_buffer(ring_token_idx).template get_base_ptr<float>() = x_scale;
+                *workspace.get_token_src_metadata_ptr(stored_pool_token_idx) =
+                    {stored_rank_idx, src_token_idx, stored_src_token_topk_idx % kNumTopk};
+            }
+            __syncwarp();
+
+            // Store every token of the batch into its ring slot once the batch lands
+            ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(get_ring_token_idx(stored_pool_token_idx)).get_base_ptr();
+            #pragma unroll
+            for (uint32_t t = 0; t < kNumPullTokens; ++ t) {
+                const auto dst_ptr = ptx::exchange(dst_base_ptr, t);
+                if (t < num_pulls and cute::elect_one_sync()) {
+                    ptx::tma_store_1d(dst_ptr, smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(t).get_base_ptr(),
+                                      kNumBytesPerPull);
+                }
+                __syncwarp();
+            }
+            if (cute::elect_one_sync()) {
+                cute::tma_store_arrive();
+                ptx::tma_store_wait<0>();
+            }
+            __syncwarp();
+            if (is_active) {
+                ptx::red_add_rel(workspace.get_l1_full_count_ptr(get_ring_block_idx(stored_pool_token_idx / BLOCK_M)),
+                                 stored_num_l1_full_arrivals);
+            }
+            __syncwarp();
+            num_pending_pulls = 0;
+        };
+
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
@@ -797,8 +904,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
 
             // Finish all tokens
-            if (current_expert_idx >= kNumExpertsPerRank)
+            if (current_expert_idx >= kNumExpertsPerRank) {
+                if constexpr (kBatchedPull) {
+                    if (num_pending_pulls > 0)
+                        flush_batched_pulls();
+                }
                 break;
+            }
 
             const uint32_t phys_expert_idx = scheduler.get_expert_id(current_expert_idx);
             // Load per-rank counts when expert changes
@@ -881,6 +993,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // A block's last token also accounts for its padding rows
             const uint32_t num_l1_full_arrivals = (token_idx_in_block + 1 == expert_block_m or token_idx + 1 == expert_end_idx) ?
                 BLOCK_M - token_idx_in_block : 1u;
+
+            if constexpr (kBatchedPull) {
+                if (lane_idx == num_pending_pulls) {
+                    stored_rank_idx = current_rank_in_expert_idx;
+                    stored_src_token_topk_idx = src_token_topk_idx;
+                    stored_pool_token_idx = pool_token_idx;
+                    stored_num_l1_full_arrivals = num_l1_full_arrivals;
+                }
+                __syncwarp();
+                if (++ num_pending_pulls == kNumPullTokens)
+                    flush_batched_pulls();
+                continue;
+            }
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;

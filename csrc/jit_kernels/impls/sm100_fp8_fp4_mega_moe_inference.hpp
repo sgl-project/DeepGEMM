@@ -199,7 +199,7 @@ static void sm100_fp8_fp4_mega_moe(
         num_ring_tokens, num_sf_ring_tokens,
         mma_kind, global_num_tokens,
         l1_weights.scalar_type() == kPackedFP4,
-        gran_k);
+        gran_k, num_shared_experts > 0);
 
     if (use_shuffled_weights or use_interleaved_weights) {
         DG_HOST_ASSERT(num_shared_experts == 0);
@@ -384,7 +384,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -418,7 +418,8 @@ static void __instantiate_kernel() {{
     to_mainloop_name(config.mainloop),
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
-    broadcast_y ? "true" : "false"));
+    broadcast_y ? "true" : "false",
+    config.num_pull_tokens));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {
