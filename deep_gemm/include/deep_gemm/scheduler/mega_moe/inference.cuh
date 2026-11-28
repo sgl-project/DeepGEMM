@@ -452,6 +452,11 @@ struct MegaMoEScheduler {
         const bool is_l1_first = num_total_m_blocks <= kNumRingBlocks and
             num_total_l1_waves <= min_l1_warmup_waves + kMaxL1FirstExtraWaves;
         num_sched_l1_waves = is_l1_first ? num_total_l1_waves : cute::min(min_l1_warmup_waves, num_total_l1_waves);
+
+        // Past the L1-first cap, still advance a short resident L1 tail, leaving a wave for L1/L2 overlap
+        if (not is_l1_first and num_total_m_blocks <= kNumRingBlocks and num_total_l1_waves > 1 and
+                num_total_l1_waves <= min_l1_warmup_waves + kNumScheduleStages)
+            num_sched_l1_waves = cute::max(num_sched_l1_waves, cute::min(kNumScheduleStages + 1, num_total_l1_waves - 1));
     }
 
     template <uint32_t kNumClusters>
