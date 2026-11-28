@@ -361,9 +361,8 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + lane_idx;
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                // Acquire: the per-rank counts pushed before this sum are read after it, with no barrier between
                 do {
-                    value = ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             raw_tokens[i] = static_cast<uint32_t>(value);

@@ -382,22 +382,18 @@ sm100_bf16_mega_moe_impl(void* y,
             const auto arrival_ptr = workspace.get_dispatch_arrival_count_ptr();
             bool is_last_sm = false;
             if (lane_idx == 0) {
-                __threadfence();
-                is_last_sm = ptx::atomic_add(arrival_ptr, 1u) == kNumSMs - 1;
-                if (is_last_sm) {
+                is_last_sm = ptx::atomic_add_acq_rel(arrival_ptr, 1u) == kNumSMs - 1;
+                if (is_last_sm)
                     *arrival_ptr = 0;
-                    __threadfence();
-                }
             }
             __syncwarp();
             if (__shfl_sync(0xffffffff, is_last_sm, 0)) {
+                // A per-rank count carries its own arrival word, so it needs no ordering against the sum
                 for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
                     ptx::st_relaxed_sys(sym_buffer.map(
                         workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, i % kNumExpertsPerRank), i / kNumExpertsPerRank),
-                        *workspace.get_expert_send_count_ptr(i) & 0xffffffff);
+                        (1ull << 32) | (*workspace.get_expert_send_count_ptr(i) & 0xffffffff));
                 }
-                // Every per-rank count lands before its sum, which the receiver acquires
-                __threadfence_system();
                 for (uint32_t i = lane_idx; i < kNumExperts; i += 32) {
                     ptx::red_add_relaxed_sys(
                         sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(i % kNumExpertsPerRank), i / kNumExpertsPerRank),
@@ -462,8 +458,9 @@ sm100_bf16_mega_moe_impl(void* y,
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
-                    stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                    uint64_t value = 0;
+                    while (j < kNumRanks and ((value = ptx::ld_volatile(workspace.get_expert_recv_count_ptr(j, current_expert_idx))) >> 32) != 1);
+                    stored_rank_count[i] = static_cast<uint32_t>(value);
                 }
             }
 
@@ -643,7 +640,9 @@ sm100_bf16_mega_moe_impl(void* y,
                 // Clean the used source slots, then the per-rank token count
                 for (uint32_t j = warp_idx; j < kNumRanks; j += kNumDispatchWarps) {
                     const auto count_ptr = workspace.get_expert_recv_count_ptr(j, i);
-                    const auto num_source_tokens = static_cast<uint32_t>(*count_ptr);
+                    uint64_t count;
+                    while (((count = ptx::ld_volatile(count_ptr)) >> 32) != 1);
+                    const auto num_source_tokens = static_cast<uint32_t>(count);
                     for (uint32_t k = lane_idx; k < num_source_tokens; k += 32)
                         *workspace.get_src_token_topk_idx_ptr(i, j, k) = 0;
                     __syncwarp();
