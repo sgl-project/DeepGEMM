@@ -7,8 +7,9 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import align, per_block_cast_to_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
+from deep_gemm.utils.math import ceil_to_ue8m0
 from deep_gemm.testing import bench_kineto, calc_diff
 
 
@@ -50,8 +51,8 @@ def _to_shared_mega_moe_sf_layout(sf: torch.Tensor, block_m: int, num_max_sf_tok
     return result
 
 
-def _cast_fp8_for_mega_moe(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+def _cast_fp8_for_mega_moe(x: torch.Tensor, gran_k: int = 32) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=gran_k, use_packed_ue8m0=True)
     mn, packed_sf_k = x_sf.shape
     x_sf_tma = torch.empty_strided(
         (mn, packed_sf_k), (1, align(mn, 4)), dtype=x_sf.dtype, device=x_sf.device)
@@ -80,6 +81,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    # Blockwise-128: 1x128 activation and 128x128 weight SFs (FP8xFP8 only)
+    gran_k = args.gran_k
+    assert gran_k == 32 or args.mma_type == 'fp8xfp8'
+    no_shared = [False]
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -96,7 +101,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        **({} if gran_k == 32 else {'recipe': (1, 1, gran_k)})
     )
 
     # Cast routed weights into FP4 or FP8
@@ -118,12 +124,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
+    def _cast_weights_to_fp8_blockwise(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
+        w_sf = torch.empty((num_groups, n // 128, k // 128), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_block_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=128)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (128, 128), num_groups)
+        return w, w_sf
+
     # Create inputs
     # noinspection PyGlobalUndefined
     def create_inputs():
         global x, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
         global transformed_l1_weights, transformed_l2_weights
         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
+        global shared_ref_weights
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -156,15 +172,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
+            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x, gran_k)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
             cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
+            if gran_k == 128:
+                cast_weights = _cast_weights_to_fp8_blockwise
             l1_weights = cast_weights(l1_weights)
             l2_weights = cast_weights(l2_weights)
-            if num_shared_experts > 0:
+            if num_shared_experts > 0 and gran_k == 128:
+                sq1, sb1 = per_block_cast_to_fp8(shared_l1_weights, use_ue8m0=True, gran_k=128)
+                sq2, sb2 = per_block_cast_to_fp8(shared_l2_weights, use_ue8m0=True, gran_k=128)
+                shared_ref_weights = (sq1, sb1, sq2, sb2)
+                shared_l1_weights = (sq1, deep_gemm.transform_sf_into_required_layout(
+                    sb1, sq1.shape[0], sq1.shape[1], (128, 128)))
+                shared_l2_weights = (sq2, deep_gemm.transform_sf_into_required_layout(
+                    sb2, sq2.shape[0], sq2.shape[1], (128, 128)))
+            elif num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
 
@@ -209,7 +235,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
-        if num_shared_experts > 0:
+        if num_shared_experts > 0 and not no_shared[0]:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
                 shared_l2_weights=transformed_shared_l2_weights
@@ -219,6 +245,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > SF K granularity: {gran_k}', once_in_node=True)
     dist_print(f' > Localized weights: {args.use_localization}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
@@ -244,6 +271,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    # The legacy baseline runs per-32 SFs only; blockwise-128 checks the shared expert against an FP32 reference below
+    is_legacy_loaded = is_legacy_loaded and gran_k == 32
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
@@ -350,6 +379,44 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     else:
         create_inputs()
 
+    if gran_k == 128 and num_shared_experts > 0:
+        def shared_ref() -> torch.Tensor:
+            # FP32 shared expert with the kernel's quantization: 1x128 inputs, 128x128 weights, the L1 output rounded
+            # to BF16 and clamped, the SwiGLU output re-quantized per 1x128 with UE8M0 scales
+            sq1, sb1, sq2, sb2 = shared_ref_weights
+            x_fp8, x_sf = x
+            x_scales = (x_sf.contiguous().view(torch.uint8)[:, :hidden // 128].float() - 127).exp2()
+            x_deq = x_fp8.float() * x_scales.repeat_interleave(128, 1)
+            w1 = sq1.float() * sb1.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            w2 = sq2.float() * sb2.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            l1 = (x_deq @ w1.T).bfloat16().float()
+            gate, up = l1[:, :shared_intermediate_hidden], l1[:, shared_intermediate_hidden:]
+            gate = gate.clamp(max=args.activation_clamp)
+            up = up.clamp(-args.activation_clamp, args.activation_clamp)
+            act = (torch.nn.functional.silu(gate) * up).view(num_tokens, -1, 128)
+            sf = ceil_to_ue8m0(act.abs().amax(-1, keepdim=True).clamp(1e-10) / 448.0)
+            act = ((act / sf).to(torch.float8_e4m3fn).float() * sf).view(num_tokens, -1)
+            return act @ w2.T
+
+        # Routed experts are unaffected by the shared expert: the fused output minus a routed-only run is the shared output
+        num_shared_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
+        worst_diff = 0.0
+        for i in range(num_shared_tests):
+            if i > 0:
+                create_inputs()
+            y_with_shared = run_fused()[0].clone()
+            no_shared[0] = True
+            y_routed = run_fused()[0].clone()
+            no_shared[0] = False
+            if num_tokens == 0:
+                continue
+            diff = calc_diff(y_with_shared.float() - y_routed.float(), shared_ref())
+            worst_diff = max(worst_diff, float(diff))
+            assert diff < 1e-3, f'Blockwise-128 shared expert vs FP32 reference: calc_diff={diff}'
+        dist_print(f' > Blockwise-128 shared expert matches the FP32 reference '
+                   f'(worst calc_diff {worst_diff:.2e}, {num_shared_tests} inputs)', once_in_node=True)
+        dist_print(once_in_node=True)
+
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
@@ -447,6 +514,8 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
+    parser.add_argument('--gran-k', type=int, default=32, choices=(32, 128),
+                        help='SF K granularity: 32 (MX) or 128 (blockwise-128 FP8, `fp8xfp8` only)')
     parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires MLOPart)')
 
     # Test settings
