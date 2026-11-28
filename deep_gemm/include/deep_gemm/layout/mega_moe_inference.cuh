@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cuda.h>
 #include <cute/numeric/math.hpp>
 
 #include <deep_gemm/common/math.cuh>
@@ -15,6 +16,13 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;
+
+// Routed L1/L2 activation maps with fewer rows than `LOAD_BLOCK_M`, indexed `[phase - 1][rows / kRowStep - 1]`
+struct MegaMoEPartialActMaps {
+    static constexpr uint32_t kRowStep = 8;
+    static constexpr uint32_t kNumMaps = (kMaxCandidateBlockM / 2 - 1) / kRowStep;
+    CUtensorMap maps[2][kNumMaps];
+};
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>

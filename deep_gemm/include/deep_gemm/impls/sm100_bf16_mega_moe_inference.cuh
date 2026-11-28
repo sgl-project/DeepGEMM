@@ -429,7 +429,7 @@ sm100_bf16_mega_moe_impl(void* y,
         int current_expert_idx = -1;
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
-        uint32_t expert_pool_block_offset = 0;
+        uint32_t expert_pool_block_offset = 0, expert_block_m = BLOCK_M;
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
@@ -448,6 +448,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 // Move start and end to the next expert
                 expert_start_idx = expert_end_idx;
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+                expert_block_m = scheduler.get_expert_block_m(current_expert_idx);
             }
 
             // Finish all tokens
@@ -530,7 +531,8 @@ sm100_bf16_mega_moe_impl(void* y,
             DG_STATIC_ASSERT(kHiddenBytes % kNumBytesPerPull == 0, "Invalid hidden");
 
             // TMA load token from remote rank and store into local
-            const auto pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            const uint32_t token_idx_in_block = token_idx_in_expert % expert_block_m;
+            const auto pool_token_idx = (expert_pool_block_offset + token_idx_in_expert / expert_block_m) * BLOCK_M + token_idx_in_block;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
@@ -583,10 +585,11 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Wait for token TMA store to complete
                 issue_and_wait_pull_store(kNumChunks - 1);
-                const bool is_last_token = (token_idx == expert_end_idx - 1);
+                // A block's last token also accounts for its padding rows
+                const bool is_last_token_in_block = token_idx_in_block + 1 == expert_block_m or token_idx + 1 == expert_end_idx;
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(get_ring_block_idx(pool_block_idx)),
-                    is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+                    is_last_token_in_block ? BLOCK_M - token_idx_in_block : 1u
                 );
             }
             __syncwarp();
