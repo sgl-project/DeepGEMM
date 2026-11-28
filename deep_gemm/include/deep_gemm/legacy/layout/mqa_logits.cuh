@@ -67,4 +67,27 @@ struct MQALogitsSharedStorage {
     uint32_t tmem_ptr_in_smem;
 };
 
+// Localized paged schedule: [slot (start, end) pairs: 4 * kNumSlots][tail sentinel: 4][claim counter: 2]
+//                           [num domain-0 slots][flags][request domain bits: ceil(num_requests / 32)]
+struct PagedMQALogitsLocalizedSchedule {
+    // The schedule is the stock partition, with slot `i` for CTA `i`
+    static constexpr uint32_t kFlagStatic = 1u;
+    // Only a hint: any slot can be walked either way
+    static constexpr uint32_t kSlotFlagStatic = 1u << 31;
+    static constexpr uint32_t kSlotFlagDomain = 1u << 30;
+    // The slot holds requests of both domains (stock partition)
+    static constexpr uint32_t kSlotFlagAllDomains = 1u << 29;
+    static constexpr uint32_t kSlotSplitMask = kSlotFlagAllDomains - 1;
+
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_sentinel_offset(const uint32_t& num_slots) { return 4 * num_slots; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_counter_offset(const uint32_t& num_slots) { return 4 * num_slots + 4; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_num_local_slots_offset(const uint32_t& num_slots) { return 4 * num_slots + 6; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_flags_offset(const uint32_t& num_slots) { return 4 * num_slots + 7; }
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_request_domains_offset(const uint32_t& num_slots) { return 4 * num_slots + 8; }
+    // The buffer is an `(n, 2)` tensor of words, like the stock one
+    CUTLASS_HOST_DEVICE static constexpr uint32_t get_num_rows(const uint32_t& num_slots, const uint32_t& num_requests) {
+        return (get_request_domains_offset(num_slots) + (num_requests + 31) / 32 + 1) / 2;
+    }
+};
+
 } // namespace deep_gemm::legacy::layout

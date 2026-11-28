@@ -1,4 +1,5 @@
 import ctypes
+import math
 
 import torch
 
@@ -99,6 +100,12 @@ def localize_rows(t: torch.Tensor) -> torch.Tensor:
     localized = empty_split_rows(t.shape, t.dtype)
     localized.copy_(t)
     return localized
+
+
+def empty_paged(num_pages: int, page_shape, dtype: torch.dtype) -> torch.Tensor:
+    """`torch.empty((num_pages, *page_shape), dtype=dtype)`, with the pages' slice `d` in domain `d`"""
+    num_page_bytes = math.prod(page_shape) * torch.empty((), dtype=dtype).element_size()
+    return empty_split_rows((num_pages, num_page_bytes), torch.uint8).view(dtype).view(num_pages, *page_shape)
 
 
 def destroy_localizer() -> None:

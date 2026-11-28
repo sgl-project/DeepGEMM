@@ -198,6 +198,9 @@ try:
     def get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices=None):
         return _C.get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, indices)
 
+    def get_paged_mqa_logits_localized_metadata(context_lens, block_table, kv_cache, num_sms, min_num_localized_splits=None):
+        return _C.get_paged_mqa_logits_localized_metadata(context_lens, block_table, kv_cache, num_sms, min_num_localized_splits)
+
     def get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads):
         return _C.get_mqa_logits_metadata_legacy(cu_seq_len_k_start, cu_seq_len_k_end, num_kv_tokens, num_heads)
 

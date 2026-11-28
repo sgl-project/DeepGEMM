@@ -729,4 +729,75 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
         make_scheduler);
 }
 
+// Paged entry for a localized schedule; a separate entry preserves the default paged kernel's symbol and codegen
+template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
+          uint32_t kHeadDim, uint32_t PAGE_KV,
+          bool kIsMXSF, bool kIsContextLens2D,
+          uint32_t kNumQStages, uint32_t kNumKVStages,
+          uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
+          uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
+          typename qk_dtype_t, typename logits_dtype_t, typename reduce_dtype_t = float,
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
+void sm100_paged_mqa_logits_localized(const uint32_t num_q_tokens_total,
+                                      const uint32_t logits_stride, const uint32_t block_table_stride,
+                                      const uint32_t* context_lens, logits_dtype_t* logits,
+                                      const uint32_t* block_table,
+                                      const uint32_t* schedule_meta,
+                                      const uint8_t* sm_locality_domains,
+                                      const __grid_constant__ cute::TmaDescriptor tensor_map_q,
+                                      const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
+                                      const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
+                                      const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
+                                      const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+    static constexpr uint32_t BLOCK_Q = 128 / kNumHeads;
+    static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
+    DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
+
+    using walk_t = sched::SM100PagedMQALogitsScheduler<kTokensPerRequest, kIsContextLens2D, false,
+                                                      kNumHeads, SPLIT_KV, PAGE_KV, kSplitsPerChunk, true>;
+    using Layout = layout::PagedMQALogitsLocalizedSchedule;
+
+    // NOTES: read before the grid dependency, which may be the schedule's writer, has completed; the flag is only a hint
+    const bool is_static = (schedule_meta[blockIdx.x * 4 + 1] & Layout::kSlotFlagStatic) != 0;
+
+    if (is_static) {
+        const auto make_scheduler = [&](const uint32_t& cta_idx) {
+            return walk_t(cta_idx * 2, context_lens, schedule_meta, nullptr,
+                          block_table, block_table_stride, num_q_tokens_total);
+        };
+        sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false,
+                                   BLOCK_Q, SPLIT_KV,
+                                   kNumQStages, kNumKVStages, 0,
+                                   kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
+                                   reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
+            logits_stride, logits,
+            tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
+            make_scheduler);
+        return;
+    }
+
+    // The claimer (the KV loader warp) is at most the KV stages and the TMEM stages ahead of the last warp that follows it
+    constexpr uint32_t kNumSlotsPerRing = 32;
+    DG_STATIC_ASSERT(kNumKVStages + 8 <= kNumSlotsPerRing, "The slot ring is too short for the KV pipeline");
+    using scheduler_t = sched::SM100PagedMQALogitsClaimingScheduler<walk_t, kNumSlotsPerRing, kNumMathWarpGroups * 4 + 1>;
+
+    __shared__ volatile int slot_ring[scheduler_t::kNumRingWords];
+    // The first claim is made here, during the CTA's setup, so the schedule has to be complete
+    cudaGridDependencySynchronize();
+    scheduler_t::init_ring(schedule_meta, slot_ring, sm_locality_domains[ptx::get_sm_idx()] != 0 ? 1u : 0u, num_q_tokens_total);
+
+    const auto make_scheduler = [&](const uint32_t& cta_idx) {
+        return scheduler_t(cta_idx, context_lens, schedule_meta, block_table, block_table_stride, num_q_tokens_total, slot_ring);
+    };
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false,
+                               BLOCK_Q, SPLIT_KV,
+                               kNumQStages, kNumKVStages, 0,
+                               kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
+                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
+        logits_stride, logits,
+        tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
+        make_scheduler);
+}
+
 } // namespace deep_gemm::legacy

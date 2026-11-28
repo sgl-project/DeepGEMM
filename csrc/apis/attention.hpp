@@ -17,6 +17,7 @@
 #include "../jit_kernels/impls/legacy/smxx_clean_logits.hpp"
 
 #include "layout.hpp"
+#include "locality_domain.hpp"
 
 namespace deep_gemm::attention {
 
@@ -698,6 +699,54 @@ static torch::Tensor get_paged_mqa_logits_metadata_legacy(const torch::Tensor& c
     return schedule_metadata;
 }
 
+// Minimum KV splits (256 tokens each, summed over the requests) and requests for a localized schedule to claim; 0 splits always claims
+static constexpr int kMinNumPagedMQALogitsLocalizedSplits = 8192;
+static constexpr int kMinNumPagedMQALogitsLocalizedRequests = 16;
+
+// Whether the first half of the pages is homed in domain 0 and the second half in domain 1
+static bool is_paged_kv_cache_localized(const torch::Tensor& fused_kv_cache) {
+    if (jit->device.get_arch_major() != 10 or locality_domain::get_num_locality_domains() != 2 or
+        not locality_domain::is_localization_available())
+        return false;
+    if (fused_kv_cache.dim() != 4 or fused_kv_cache.size(0) < 2 or fused_kv_cache.size(0) % 2 != 0 or fused_kv_cache.stride(0) <= 0)
+        return false;
+    const auto ptr = static_cast<const char*>(fused_kv_cache.data_ptr());
+    const size_t num_half_bytes = static_cast<size_t>(fused_kv_cache.size(0) / 2) * fused_kv_cache.stride(0) * fused_kv_cache.element_size();
+    return locality_domain_allocator.get_locality_domain(ptr, num_half_bytes) == 0 and
+           locality_domain_allocator.get_locality_domain(ptr + num_half_bytes, num_half_bytes) == 1;
+}
+
+// Localized schedule for a homed KV cache; the stock schedule for any other KV cache, device, or SM count
+static torch::Tensor get_paged_mqa_logits_localized_metadata(const torch::Tensor& context_lens,
+                                                             const torch::Tensor& block_table,
+                                                             const torch::Tensor& fused_kv_cache,
+                                                             int num_sms,
+                                                             const std::optional<int>& min_num_localized_splits = std::nullopt) {
+    const int block_kv = fused_kv_cache.dim() == 4 ? static_cast<int>(fused_kv_cache.size(1)) : 0;
+    // One slot per SM of the device: the kernel maps its SMs to domains
+    if (num_sms != jit->device.get_num_sms() or not is_paged_kv_cache_localized(fused_kv_cache))
+        return get_paged_mqa_logits_metadata_legacy(context_lens, block_kv, num_sms, std::nullopt);
+
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+    DG_HOST_ASSERT(context_lens.dim() == 2 and context_lens.scalar_type() == torch::kInt and context_lens.is_contiguous());
+    const int batch_size = context_lens.size(0);
+    const int next_n = context_lens.size(1);
+    DG_HOST_ASSERT(block_table.dim() == 2 and block_table.size(0) == batch_size and block_table.stride(1) == 1);
+    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt and block_table.device() == context_lens.device());
+    const int min_splits = min_num_localized_splits.value_or(kMinNumPagedMQALogitsLocalizedSplits);
+    DG_HOST_ASSERT(min_splits >= 0);
+    // NOTES: probe the SM domains here, not at the first launch, which may be under CUDA graph capture
+    locality_domain::get_balanced_sm_locality_domains();
+
+    auto schedule_metadata = torch::empty({legacy::get_paged_mqa_logits_localized_metadata_num_rows(num_sms, batch_size), 2},
+                                          context_lens.options());
+    legacy::sm100_paged_mqa_logits_localized_metadata(context_lens, block_table, schedule_metadata,
+                                                      batch_size, next_n, block_kv,
+                                                      static_cast<int>(fused_kv_cache.size(0) / 2), num_sms, min_splits,
+                                                      kMinNumPagedMQALogitsLocalizedRequests);
+    return schedule_metadata;
+}
+
 static torch::Tensor fp8_fp4_paged_mqa_logits_legacy(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
                                                      const torch::Tensor& fused_kv_cache,
                                                      const torch::Tensor& weights,
@@ -792,7 +841,12 @@ static torch::Tensor fp8_fp4_paged_mqa_logits_legacy(const std::tuple<torch::Ten
 
     // Check schedule metadata
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
-    DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
+    // NOTES: a localized schedule (`get_paged_mqa_logits_localized_metadata`) has its own number of rows
+    const bool is_localized = arch_major == 10 and not is_varlen and num_sms == jit->device.get_num_sms() and
+        _schedule_meta_size == legacy::get_paged_mqa_logits_localized_metadata_num_rows(num_sms, batch_size);
+    DG_HOST_ASSERT((is_localized or _schedule_meta_size == num_sms + 1) and _meta_info_size == 2);
+    // NOTES: claims are only worth their cost on a homed cache
+    DG_HOST_ASSERT(not is_localized or is_paged_kv_cache_localized(fused_kv_cache));
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 
@@ -821,7 +875,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits_legacy(const std::tuple<torch::Ten
         legacy::sm100_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                        logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                        is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk,
-                                       is_mx_sf, qk_dtype);
+                                       is_mx_sf, qk_dtype,
+                                       is_localized ? std::make_optional(locality_domain::get_balanced_sm_locality_domains()) : std::nullopt);
     } else if (arch_major == 12) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
         DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
@@ -889,6 +944,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_paged_mqa_logits_metadata_legacy", &get_paged_mqa_logits_metadata_legacy,
           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
           py::arg("indices") = std::nullopt);
+    m.def("get_paged_mqa_logits_localized_metadata", &get_paged_mqa_logits_localized_metadata,
+          py::arg("context_lens"), py::arg("block_table"), py::arg("kv_cache"), py::arg("num_sms"),
+          py::arg("min_num_localized_splits") = std::nullopt);
     m.def("fp8_fp4_paged_mqa_logits_legacy", &fp8_fp4_paged_mqa_logits_legacy,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
