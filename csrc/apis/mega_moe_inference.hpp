@@ -241,9 +241,20 @@ static void fp8_fp4_mega_moe(
     const bool& post_expert_norm_weight_first = false,
     const std::string& weight_layout_str = "gate_up_block8",
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const std::optional<torch::Tensor>& rms_weights = std::nullopt,
+    const std::optional<float>& rms_eps = std::nullopt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    // `y` is BF16 or FP32; RMSNorm weights match `y` and need an explicit epsilon
+    DG_HOST_ASSERT((y.scalar_type() == torch::kBFloat16 or y.scalar_type() == torch::kFloat) and y.is_contiguous());
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 or not broadcast_y);
+    DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(y.data_ptr()) % (y.scalar_type() == torch::kFloat ? 32 : 16) == 0);
+    if (rms_weights.has_value()) {
+        DG_HOST_ASSERT(rms_weights->dim() == 1 and rms_weights->size(0) == y.size(-1));
+        DG_HOST_ASSERT(rms_weights->scalar_type() == y.scalar_type() and rms_weights->is_contiguous());
+        DG_HOST_ASSERT(rms_eps.has_value() and std::isfinite(rms_eps.value()) and rms_eps.value() > 0);
+    }
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
     const auto weight_layout = parse_weight_layout(weight_layout_str);
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
@@ -454,7 +465,9 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_eps,
                                mma_kind,
                                use_fp8_combine, gran_k, weight_layout, global_num_tokens,
-                               situ_beta, situ_linear_beta, broadcast_y);
+                               situ_beta, situ_linear_beta, broadcast_y,
+                               rms_weights.has_value() ? rms_weights->data_ptr() : nullptr,
+                               rms_eps.value_or(0.0f));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

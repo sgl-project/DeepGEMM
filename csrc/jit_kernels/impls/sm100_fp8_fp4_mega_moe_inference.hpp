@@ -181,7 +181,9 @@ static void sm100_fp8_fp4_mega_moe(
     const std::optional<int64_t>& global_num_tokens = std::nullopt,
     const float& situ_beta = 4.0f,
     const float& situ_linear_beta = 25.0f,
-    const bool& broadcast_y = false
+    const bool& broadcast_y = false,
+    const void* rms_weights = nullptr,
+    const float& rms_eps = 0.0f
 ) {
     const bool use_shuffled_weights = weight_layout == MegaMoEWeightLayout::RowShuffled;
     const bool use_up_gate_block16 = weight_layout == MegaMoEWeightLayout::UpGateBlock16;
@@ -384,7 +386,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {},
         {}, {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -419,7 +421,9 @@ static void __instantiate_kernel() {{
     config.use_simt_pull ? "true" : "false",
     config.gran_k,
     broadcast_y ? "true" : "false",
-    config.num_pull_tokens));
+    config.num_pull_tokens,
+    rms_weights != nullptr ? "true" : "false",
+    y.scalar_type() == torch::kFloat ? "true" : "false"));
     // Launch
     launch_with_shared_memory_mode(
         get_smem_mode_for_mega_moe(config.smem_size), kernel, {
@@ -453,7 +457,8 @@ static void __instantiate_kernel() {{
         tensor_map_shared_l2_weights,
         tensor_map_shared_l2_weights_sf,
         sm_locality_domains.data_ptr<uint8_t>(),
-        partial_act_maps);
+        partial_act_maps,
+        rms_weights, rms_eps);
 }
 
 } // namespace deep_gemm

@@ -208,6 +208,9 @@ template <
     uint32_t kGranK = get_sf_gran_k(kMmaKind),
     bool kBroadcastY = false,
     uint32_t kNumPullTokens = 1,
+    // RMSNorm of the combined output (over the BF16-rounded output when `y` is BF16), and FP32 `y`
+    bool kWithRMSNorm = false,
+    bool kIsOutputFP32 = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -253,7 +256,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
                             const uint8_t* sm_locality_domains,
-                            const __grid_constant__ layout::MegaMoEPartialActMaps partial_act_maps) {
+                            const __grid_constant__ layout::MegaMoEPartialActMaps partial_act_maps,
+                            const void* rms_weights,
+                            const float rms_eps) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     constexpr bool kUseShuffledWeights = kWeightLayout == MegaMoEWeightLayout::RowShuffled;
     constexpr bool kUseUpGateBlock16 = kWeightLayout == MegaMoEWeightLayout::UpGateBlock16;
@@ -634,6 +639,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
+    constexpr uint32_t kRMSNormBarrierStartIdx = kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
+    DG_STATIC_ASSERT(kRMSNormBarrierStartIdx + kNumEpilogueWarps / 2 <= 16, "Too many named barriers");
+    DG_STATIC_ASSERT(not kIsOutputFP32 or not kBroadcastY, "A broadcast `y` is BF16");
 
     // NVLink barrier tags
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 1;
@@ -2750,6 +2758,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumChunkBytes);
         });
         const auto combine_store_buffer  = math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumChunkBytes);
+        // Two stages of per-warp RMSNorm partial sums, for the two warps of a two-chunk token
+        const auto rms_sum_sq = math::advance_ptr<float>(smem_buffer, kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes);
+        DG_STATIC_ASSERT(not kWithRMSNorm or
+                         kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes + 2 * kNumEpilogueWarps * sizeof(float) <= kNumReusableSmemBytes,
+                         "No shared memory for the RMSNorm sums");
+        uint32_t rms_stage_idx = 0;
 
         // Per-warp barriers
         auto combine_load_barriers = utils::PatternVisitor([&](const uint32_t& i) {
@@ -2776,7 +2790,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         uint64_t known_ready_ranks = 0;
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        // RMSNorm keeps a token's two chunks in adjacent warps of one CTA
+        constexpr uint32_t kNumWarpsPerCombineGroup = kWithRMSNorm ? kNumChunks : 1;
+        DG_STATIC_ASSERT((kNumSMs * kNumEpilogueWarps) % kNumChunks == 0, "The combine stride must keep the chunk index");
+        const uint32_t first_token_chunk_idx =
+            (epilogue_warp_idx / kNumWarpsPerCombineGroup * kNumSMs + sm_idx) * kNumWarpsPerCombineGroup +
+            epilogue_warp_idx % kNumWarpsPerCombineGroup;
+        for (uint32_t token_chunk_idx = first_token_chunk_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
@@ -3047,6 +3067,56 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 post_expert_norm_weight + base_elem_idx + l * 2)));
                         }
                     }
+                }
+
+                if constexpr (kWithRMSNorm) {
+                    float sum_sq = 0.0f;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumLoadUint4PerLane * kNumF32PairsPerLoadUint4; ++ i) {
+                        if constexpr (not kIsOutputFP32)
+                            reduced[i] = __bfloat1622float2(__float22bfloat162_rn(reduced[i]));
+                        sum_sq = __fmaf_rn(reduced[i].x, reduced[i].x, __fmaf_rn(reduced[i].y, reduced[i].y, sum_sq));
+                    }
+                    sum_sq = math::warp_reduce_sum(sum_sq);
+                    if constexpr (kNumChunks == 2) {
+                        // The next token's barrier orders the partner's read before this stage is rewritten
+                        const auto stage = rms_sum_sq + rms_stage_idx * kNumEpilogueWarps;
+                        if (lane_idx == 0)
+                            ptx::st_shared(stage + epilogue_warp_idx, sum_sq);
+                        ptx::sync_unaligned(64, kRMSNormBarrierStartIdx + epilogue_warp_idx / 2);
+                        sum_sq += ptx::ld_shared(stage + (epilogue_warp_idx ^ 1));
+                        rms_stage_idx ^= 1;
+                    }
+                    const float inv_rms = rsqrtf(sum_sq / static_cast<float>(kHidden) + rms_eps);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
+                        const uint32_t base_elem_idx = chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumF32PairsPerLoadUint4; ++ l) {
+                            float2 w;
+                            if constexpr (kIsOutputFP32)
+                                w = __ldg(reinterpret_cast<const float2*>(rms_weights) + base_elem_idx / 2 + l);
+                            else
+                                w = __bfloat1622float2(__ldg(reinterpret_cast<const nv_bfloat162*>(rms_weights) + base_elem_idx / 2 + l));
+                            auto& acc = reduced[j * kNumF32PairsPerLoadUint4 + l];
+                            acc = __fmul2_rn(__fmul2_rn(acc, make_float2(inv_rms, inv_rms)), w);
+                        }
+                    }
+                }
+
+                // FP32 `y`: every lane stores its own contiguous elements
+                if constexpr (kIsOutputFP32) {
+                    const auto y_row = reinterpret_cast<float*>(y) + static_cast<uint64_t>(token_idx) * kHidden;
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
+                        const uint32_t base_elem_idx = chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumF32PairsPerLoadUint4; l += 4) {
+                            const auto v = reduced + j * kNumF32PairsPerLoadUint4 + l;
+                            ptx::st_evict_first(y_row + base_elem_idx + l * 2, v[0], v[1], v[2], v[3]);
+                        }
+                    }
+                    continue;
                 }
 
                 // Cast & write to smem store-buffer.
